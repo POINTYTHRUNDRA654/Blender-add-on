@@ -4,6 +4,30 @@ Complete checklist for publishing a new version of the add-on.
 
 ---
 
+## Ongoing Development (between releases)
+
+You can push as many commits to `main` as you like — there is no need to tag
+every commit.  Tags only matter when you are ready to publish a release.
+
+**Do NOT use version suffixes like `-alpha` or `-dev` in `blender_manifest.toml`.**
+The Blender Extensions platform requires a strict `X.Y.Z` format and will reject
+any zip that contains a non-standard version string.
+
+If you want to signal "work in progress" to contributors, do it in the `tagline`
+or description fields of the manifest — not in the `version` field.
+
+**Suggested workflow:**
+```
+1. Develop freely on main (push commits anytime)
+2. When ready to release: bump version in __init__.py + blender_manifest.toml
+3. Commit, push, then create a new tag (e.g. v5.2.0) on GitHub
+4. CI builds and attaches the zips to the release automatically
+5. After release: bump to the next version in both files so the next
+   development cycle starts cleanly (e.g. 5.2.0 → 5.3.0)
+```
+
+---
+
 ## 0 — Pre-flight checks
 
 - [ ] All 120 integrity tests pass: `python3 test_addon_integrity.py`
