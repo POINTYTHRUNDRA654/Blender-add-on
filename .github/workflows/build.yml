@@ -26,8 +26,15 @@ on:
       - "build_addon.py"
       - ".github/workflows/build.yml"
 
-  # Also allow a manual trigger from the Actions tab
+  # Also allow a manual trigger from the Actions tab.
+  # When triggered manually, you can optionally specify a release tag to publish
+  # zips to a GitHub Release (e.g. "v5.2.1"). Leave blank to skip the release step.
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to publish a GitHub Release for (e.g. v5.2.1). Leave blank to skip.'
+        required: false
+        default: ''
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Permissions
@@ -66,12 +73,24 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      # ── 4. On a version tag push: create / update a GitHub Release ─────────
+      # ── 4. On a version tag push OR a manual dispatch with a tag: publish ──
       #       Testers can then download directly from the Releases page.
+      - name: Resolve release tag
+        id: resolve_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.resolve_tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
           files: |
             dist/mossy-fo4-blender-addon-v*-blender*.zip
             dist/mossy-fo4-blender-addon-v*-nexus-bundle.zip
