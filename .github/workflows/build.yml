@@ -32,9 +32,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag to publish a GitHub Release for (e.g. v5.2.1). Leave blank to skip.'
+        description: 'Tag to publish a GitHub Release for. Leave blank to skip.'
         required: false
-        default: ''
+        default: 'v5.2.1'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Permissions
