@@ -140,10 +140,11 @@ The root panel. Always visible at the top of the tab.
   decimated to *simplify* the shape). Use this instead of Generate
   Collision Mesh whenever the mesh has an opening that must stay passable
   — heavier at runtime than a convex hull, so keep the source mesh's poly
-  count reasonable. If the exact copy would exceed FO4's real 255-vertex
-  Havok collision limit (confirmed via a real export crash), it's
-  automatically decimated down just enough to fit — still far better at
-  preserving real openings than falling back to a sealed hull.
+  count reasonable. If the exact copy would exceed FO4's real Havok
+  collision limits — 255 vertices AND 255 triangles, two separate
+  constraints (confirmed via real export crashes) — it's automatically
+  decimated down just enough to fit both, still far better at preserving
+  real openings than falling back to a sealed hull.
 - Collision type dropdown: STATIC (immovable), DYNAMIC (can be picked up)
 - All collision objects (both buttons above) render as a see-through
   wireframe overlay in the viewport, never as a solid/textured mesh —

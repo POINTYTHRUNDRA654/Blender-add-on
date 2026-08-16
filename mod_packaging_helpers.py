@@ -877,7 +877,10 @@ def register():
     )
 
     # ── Armor / Clothing properties ──────────────────────────────────────────
-    bpy.utils.register_class(FO4_OT_PackBA2)
+    try:
+        bpy.utils.register_class(FO4_OT_PackBA2)
+    except Exception as e:
+        print(f"⚠ Failed to register FO4_OT_PackBA2 (fo4.pack_ba2): {e}")
 
     bpy.types.Scene.fo4_armor_body_slot = bpy.props.IntProperty(
         name="Body Slot",

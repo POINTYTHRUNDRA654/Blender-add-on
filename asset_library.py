@@ -854,10 +854,24 @@ _SCENE_PROPS: list[tuple[str, object]] = [
 
 
 def register() -> None:
+    # Each class/prop is isolated in its own try/except (previously a bare
+    # loop with no exception handling at all) -- a single class raising
+    # during registration used to abort the ENTIRE REST of this module
+    # silently, including every class and scene property after it in the
+    # list, with no diagnostic trace pointing at which one actually failed.
+    # A real user hit this: fo4.scan_asset_library and other operators from
+    # this file went missing together with only a generic "unknown
+    # operator" UI warning and no indication why.
     for cls in _CLASSES:
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"⚠ Failed to register {cls.__name__} ({getattr(cls, 'bl_idname', cls.__name__)}): {e}")
     for name, prop in _SCENE_PROPS:
-        setattr(bpy.types.Scene, name, prop)
+        try:
+            setattr(bpy.types.Scene, name, prop)
+        except Exception as e:
+            print(f"⚠ Failed to register Scene.{name}: {e}")
 
 
 def unregister() -> None:

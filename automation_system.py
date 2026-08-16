@@ -399,8 +399,11 @@ class WorkflowTemplate:
 
 def register():
     """Register automation system classes"""
-    bpy.utils.register_class(RecordedAction)
-    bpy.utils.register_class(MacroDefinition)
+    for cls in (RecordedAction, MacroDefinition):
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"⚠ Failed to register {cls.__name__} ({getattr(cls, 'bl_idname', cls.__name__)}): {e}")
     
     # Add properties to scene
     bpy.types.Scene.fo4_recorded_actions = CollectionProperty(type=RecordedAction)

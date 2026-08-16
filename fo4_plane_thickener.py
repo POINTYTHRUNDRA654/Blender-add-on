@@ -624,7 +624,10 @@ def register():
             bpy.utils.unregister_class(cls)
         except Exception:
             pass
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"⚠ Failed to register {cls.__name__} ({getattr(cls, 'bl_idname', cls.__name__)}): {e}")
 
 
 def unregister():

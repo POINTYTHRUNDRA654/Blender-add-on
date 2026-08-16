@@ -357,7 +357,10 @@ class PresetLibrary:
 
 def register():
     """Register preset library classes"""
-    bpy.utils.register_class(PresetItem)
+    try:
+        bpy.utils.register_class(PresetItem)
+    except Exception as e:
+        print(f"⚠ Failed to register PresetItem: {e}")
     
     # Add preset collection to scene
     bpy.types.Scene.fo4_preset_library = CollectionProperty(type=PresetItem)

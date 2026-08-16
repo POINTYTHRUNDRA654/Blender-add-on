@@ -212,8 +212,11 @@ class TORCH_OT_install_custom_path(bpy.types.Operator):
 
 
 def register():
-    bpy.utils.register_class(TORCH_OT_recheck_status)
-    bpy.utils.register_class(TORCH_OT_install_custom_path)
+    for cls in (TORCH_OT_recheck_status, TORCH_OT_install_custom_path):
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"⚠ Failed to register {cls.__name__} ({getattr(cls, 'bl_idname', cls.__name__)}): {e}")
 
 
 def unregister():

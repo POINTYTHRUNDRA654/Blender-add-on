@@ -200,10 +200,11 @@ EndEvent
 
 def register():
     """Register quest-related property groups"""
-    bpy.utils.register_class(FO4_QuestStage)
-    bpy.utils.register_class(FO4_QuestObjective)
-    bpy.utils.register_class(FO4_DialogueLine)
-    bpy.utils.register_class(FO4_NPCData)
+    for cls in (FO4_QuestStage, FO4_QuestObjective, FO4_DialogueLine, FO4_NPCData):
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"⚠ Failed to register {cls.__name__} ({getattr(cls, 'bl_idname', cls.__name__)}): {e}")
     
     # Add properties to Scene
     bpy.types.Scene.fo4_quest_stages = CollectionProperty(type=FO4_QuestStage)

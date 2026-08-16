@@ -1164,7 +1164,10 @@ class FO4AddonPreferences(bpy.types.AddonPreferences):
 
 
 def register():
-    bpy.utils.register_class(FO4AddonPreferences)
+    try:
+        bpy.utils.register_class(FO4AddonPreferences)
+    except Exception as e:
+        print(f"⚠ Failed to register FO4AddonPreferences: {e}")
 
 
 def unregister():

@@ -115,32 +115,53 @@ class MeshHelpers:
             pass
 
     @staticmethod
-    def _enforce_vert_limit(collision_obj, limit: int = 255) -> None:
-        """Decimate *collision_obj* in place until its vertex count is at
-        or below *limit*, verifying after each pass rather than trusting a
-        single ratio-based Decimate to land under a hard limit.
+    def _decimate_ratio_for_limits(collision_obj, limit: int, target: int) -> float:
+        """Return a Decimate ratio that pushes BOTH vertex and triangle
+        count toward *target*, driven by whichever is further over
+        *limit*.
 
-        Confirmed via a real PyNifly export crash that FO4's
-        compressed_mesh Havok shape hard-asserts a maximum of 255 verts
-        ("pack_compressed_mesh: max 255 verts per section"); a mesh-shape
-        bhkConvexVerticesShape's own real limit is 256, so 255 is used
-        uniformly here as the always-safe value for either.
+        Confirmed by reading PyNifly's own bhk_autopack.py source directly
+        (_build_cm_data_section): FO4's compressed_mesh Havok shape
+        hard-asserts BOTH ``nv <= 255`` (vertex count) AND ``nt <= 255``
+        (triangle count) independently -- two separate constraints, not
+        one. A first fix attempt that only drove vertex count down still
+        crashed a real export with "max 255 quads per section (got 464)":
+        a well-connected manifold mesh naturally has roughly 2x as many
+        triangles as vertices, so landing comfortably under the vertex
+        limit does not remotely guarantee landing under the triangle one.
+        """
+        current_v = len(collision_obj.data.vertices)
+        current_t = len(collision_obj.data.polygons)
+        ratio_v = target / current_v if current_v > limit else 1.0
+        ratio_t = target / current_t if current_t > limit else 1.0
+        return max(0.01, min(0.95, min(ratio_v, ratio_t)))
+
+    @staticmethod
+    def _enforce_vert_limit(collision_obj, limit: int = 255) -> None:
+        """Decimate *collision_obj* in place until BOTH its vertex count
+        and its triangle count are at or below *limit*, verifying after
+        each pass rather than trusting a single ratio-based Decimate to
+        land under a hard limit.
+
+        A mesh-shape bhkConvexVerticesShape's own real vertex limit is
+        256; 255 is used uniformly here as the always-safe value for both
+        that and compressed_mesh's own real 255/255 limits (see
+        _decimate_ratio_for_limits).
 
         Blender's Decimate modifier targets an approximate face-reduction
-        *ratio*, not an exact vertex count, and can overshoot the target by
-        a handful of vertices on a single pass (confirmed empirically: a
-        single pass aimed at exactly 255 landed at 256, still over the
-        hard limit) -- so this aims comfortably under the limit and loops
-        a bounded number of times, verifying the real count each time,
-        rather than assuming one pass was enough.
+        *ratio*, not an exact vertex/triangle count, and can overshoot the
+        target by a handful on a single pass (confirmed empirically: a
+        single pass aimed at exactly 255 verts landed at 256) -- so this
+        aims comfortably under the limit and loops a bounded number of
+        times, verifying the real counts each time, rather than assuming
+        one pass was enough.
         """
         margin = max(1, limit // 25)  # ~4% headroom absorbs decimate overshoot
         target = max(4, limit - margin)
-        for _ in range(5):
-            current = len(collision_obj.data.vertices)
-            if current <= limit:
+        for _ in range(6):
+            if len(collision_obj.data.vertices) <= limit and len(collision_obj.data.polygons) <= limit:
                 return
-            ratio = max(0.01, min(0.95, target / current))
+            ratio = MeshHelpers._decimate_ratio_for_limits(collision_obj, limit, target)
             trim_mod = collision_obj.modifiers.new(name="Decimate_Limit", type='DECIMATE')
             trim_mod.ratio = ratio
             bpy.ops.object.select_all(action='DESELECT')
@@ -157,19 +178,18 @@ class MeshHelpers:
 
     @staticmethod
     def _enforce_vert_limit_hull(collision_obj, limit: int = 255) -> None:
-        """Same verified-iterative approach as _enforce_vert_limit, but for
-        the convex-hull collision path (add_collision_mesh /
-        collision_from_lod_mesh) -- decimating a hull's points and then
-        NOT rebuilding the hull can leave a non-convex/non-manifold shape,
-        so each pass rebuilds the hull from the decimated point set rather
-        than just triangulating in place."""
+        """Same verified-iterative, both-constraints approach as
+        _enforce_vert_limit, but for the convex-hull collision path
+        (add_collision_mesh / collision_from_lod_mesh) -- decimating a
+        hull's points and then NOT rebuilding the hull can leave a
+        non-convex/non-manifold shape, so each pass rebuilds the hull from
+        the decimated point set rather than just triangulating in place."""
         margin = max(1, limit // 25)
         target = max(4, limit - margin)
-        for _ in range(5):
-            current = len(collision_obj.data.vertices)
-            if current <= limit:
+        for _ in range(6):
+            if len(collision_obj.data.vertices) <= limit and len(collision_obj.data.polygons) <= limit:
                 return
-            ratio = max(0.01, min(0.95, target / current))
+            ratio = MeshHelpers._decimate_ratio_for_limits(collision_obj, limit, target)
             trim_mod = collision_obj.modifiers.new(name="Decimate_Limit", type='DECIMATE')
             trim_mod.ratio = ratio
             bpy.ops.object.select_all(action='DESELECT')
