@@ -1141,11 +1141,17 @@ class FO4_OT_PipelineFullMod(Operator):
             for obj in mesh_objects:
                 context.view_layer.objects.active = obj
                 obj.select_set(True)
-                nif_path = os.path.join(fo4_paths["meshes"], f"{obj.name}.nif")
+                # obj.name is not filesystem-safe as-is -- PyNifly's own
+                # "ShapeName:Index" convention (e.g. "Body:0") embeds a
+                # literal colon, which NTFS treats as the Alternate Data
+                # Stream separator, silently hiding the real NIF inside a
+                # 0-byte visible file. Confirmed on a real vanilla FO4 export.
+                _safe_obj_name = export_helpers.ExportHelpers.safe_export_filename(obj.name)
+                nif_path = os.path.join(fo4_paths["meshes"], f"{_safe_obj_name}.nif")
                 ok, exporter, msg = _do_nif_export(obj, nif_path)
                 if ok:
                     exported_nifs.append(nif_path)
-                    steps.append(f"  NIF: {obj.name}.nif ({exporter})")
+                    steps.append(f"  NIF: {_safe_obj_name}.nif ({exporter})")
                     # BGSM
                     ok2, msg2 = _do_bgsm_export(obj, fo4_paths["materials"])
                     if ok2:

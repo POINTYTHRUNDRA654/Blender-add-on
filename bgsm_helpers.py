@@ -1529,6 +1529,20 @@ def export_textures_for_object(
                 if os.path.normcase(os.path.normpath(dest_path)) == src_norm:
                     results.append((True, f"'{os.path.basename(src_path)}' already at destination"))
                     continue
+                # Refuse to blindly clobber an existing, higher-resolution
+                # texture with whatever is currently loaded in this material
+                # -- confirmed real incident: a correct 2K texture already
+                # sitting in a mod folder got silently overwritten by a 512
+                # one during export, because this copy only ever checked
+                # whether source == destination, never what was already there.
+                if os.path.exists(dest_path) and _nvtt and _nvtt.is_texture_size_downgrade(dest_path, src_path):
+                    results.append((False, (
+                        f"Skipped '{os.path.basename(src_path)}': the file already at "
+                        f"{dest_path} is higher resolution than the texture currently "
+                        f"loaded in Blender. Not overwriting it -- delete the existing "
+                        f"file first if replacing it with a smaller one is intentional."
+                    )))
+                    continue
                 try:
                     import shutil as _shutil
                     _shutil.copy2(src_path, dest_path)

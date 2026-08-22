@@ -601,12 +601,24 @@ class FO4_OT_ImportLibraryAsset(Operator):
 
             elif filetype == 'NIF':
                 if hasattr(bpy.ops, 'import_scene') and hasattr(bpy.ops.import_scene, 'pynifly'):
-                    bpy.ops.import_scene.pynifly(filepath=filepath)
+                    _before_objs = set(context.scene.objects)
+                    _nif_result = bpy.ops.import_scene.pynifly(filepath=filepath)
+                    _new_objs = [o for o in context.scene.objects if o not in _before_objs]
+                    if 'CANCELLED' in _nif_result or not _new_objs:
+                        self.report(
+                            {'ERROR'},
+                            f"PyNifly did not import anything from {name} "
+                            f"(result={_nif_result!r})",
+                        )
+                        return {'CANCELLED'}
                     # Scale imported objects from FO4 game units to Blender metres (÷70)
-                    # and tag each for the ×70 round-trip on export.
+                    # and tag each for the ×70 round-trip on export. Uses the real
+                    # before/after diff above, not context.selected_objects -- a
+                    # stale selection left over from before this call could
+                    # otherwise get mis-scaled if the import silently no-op'd.
                     _fo4_scale = 1.0 / 69.99125
                     _scalable = {'MESH', 'ARMATURE', 'CURVE', 'SURFACE'}
-                    _imported = [o for o in context.selected_objects if o.type in _scalable]
+                    _imported = [o for o in _new_objs if o.type in _scalable]
                     bpy.ops.object.select_all(action='DESELECT')
                     for _obj in _imported:
                         context.view_layer.objects.active = _obj

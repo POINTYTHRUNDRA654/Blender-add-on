@@ -158,12 +158,68 @@ class MeshHelpers:
         """
         margin = max(1, limit // 25)  # ~4% headroom absorbs decimate overshoot
         target = max(4, limit - margin)
-        for _ in range(6):
-            if len(collision_obj.data.vertices) <= limit and len(collision_obj.data.polygons) <= limit:
-                return
+        _VG_NAME = "_FO4_CollisionBoundaryProtect"
+        max_attempts = 6
+        # Whether boundary-vertex protection is still worth attempting this
+        # call. Starts True; gets permanently switched off the moment it
+        # demonstrably isn't working (see the reactive bailout below) --
+        # this is NOT the same as "only skip on the last attempt" (an
+        # earlier version of this fix did that and had a real regression: a
+        # dense organic mesh where 90.6% of vertices are boundary-adjacent
+        # left almost nothing decimatable while "protected", so 5 of 6
+        # attempts made near-zero progress and the mesh never reached the
+        # hard 255 limit at all -- reproducing the exact
+        # "pack_compressed_mesh: max 255 verts" export crash this whole
+        # function exists to prevent). The hard limit must always win.
+        protection_active = True
+        for attempt in range(max_attempts):
+            v_before = len(collision_obj.data.vertices)
+            p_before = len(collision_obj.data.polygons)
+            if v_before <= limit and p_before <= limit:
+                break
             ratio = MeshHelpers._decimate_ratio_for_limits(collision_obj, limit, target)
+
+            # Protect open-boundary vertices (real openings: doorways,
+            # windows, trim cutouts -- any edge with 0 or 1 linked faces)
+            # from collapse wherever possible. Plain ratio-based Decimate
+            # has no concept of "this edge loop matters" and empirically
+            # strips thin boundary detail first -- confirmed directly on a
+            # real FO4 window-wall mesh: 79 distinct boundary loops
+            # collapsed to 8 with no protection. Direction confirmed
+            # empirically too (Blender's vertex-group decimate weighting is
+            # not obviously documented which way protects): weight 0.0 +
+            # vertex_group_factor=1000 + invert_vertex_group=False fully
+            # protected boundary verts in a controlled test (56/56 survived
+            # a 0.15-ratio pass vs 18/56 unprotected).
+            vg_name = None
+            if protection_active and attempt < max_attempts - 1:
+                _bm = bmesh.new()
+                _bm.from_mesh(collision_obj.data)
+                _bm.edges.ensure_lookup_table()
+                boundary = {
+                    vi for e in _bm.edges if len(e.link_faces) <= 1
+                    for vi in (e.verts[0].index, e.verts[1].index)
+                }
+                _bm.free()
+                # If boundary vertices dominate the mesh (dense organic
+                # geometry -- bark, foliage -- rather than a few clean
+                # openings in mostly-solid architecture), protecting them
+                # leaves almost nothing left to decimate. Skip protection
+                # up front rather than wasting an attempt discovering that.
+                if boundary and len(boundary) < v_before and (len(boundary) / v_before) <= 0.6:
+                    vg = (collision_obj.vertex_groups.get(_VG_NAME)
+                          or collision_obj.vertex_groups.new(name=_VG_NAME))
+                    vg.add(list(boundary), 0.0, 'REPLACE')
+                    others = [i for i in range(v_before) if i not in boundary]
+                    vg.add(others, 1.0, 'REPLACE')
+                    vg_name = _VG_NAME
+
             trim_mod = collision_obj.modifiers.new(name="Decimate_Limit", type='DECIMATE')
             trim_mod.ratio = ratio
+            if vg_name:
+                trim_mod.vertex_group = vg_name
+                trim_mod.vertex_group_factor = 1000.0
+                trim_mod.invert_vertex_group = False
             bpy.ops.object.select_all(action='DESELECT')
             collision_obj.select_set(True)
             bpy.context.view_layer.objects.active = collision_obj
@@ -175,6 +231,41 @@ class MeshHelpers:
             bm.to_mesh(collision_obj.data)
             bm.free()
             collision_obj.data.update()
+
+            # Reactive bailout: a protected pass that barely reduced the
+            # count while still over the limit means protection is starving
+            # this mesh of convergence. Disable it for every remaining
+            # attempt (not just this one) so there's still real headroom
+            # left to actually reach the hard limit.
+            if vg_name and (len(collision_obj.data.vertices) > limit
+                             or len(collision_obj.data.polygons) > limit):
+                reduction = 1.0 - (len(collision_obj.data.vertices) / v_before if v_before else 1.0)
+                if reduction < 0.15:
+                    protection_active = False
+
+        # Collision meshes carry no vertex groups -- purely physics (see the
+        # matching cleanup in add_custom_collision).
+        if _VG_NAME in collision_obj.vertex_groups:
+            collision_obj.vertex_groups.remove(collision_obj.vertex_groups[_VG_NAME])
+
+        # Final safety net: some meshes -- deeply fragmented ones especially,
+        # e.g. foliage built from thousands of disconnected leaf-card/bark
+        # islands -- can never reach the hard limit via ratio-based Decimate
+        # at all, protected or not. Collapse can simplify within a connected
+        # island but can't delete a whole island outright, so the real floor
+        # is set by how many separate islands exist, not by triangle
+        # density. Confirmed on a real 18785-vert asset: decimation reduced
+        # triangles to 88 (well under the limit) but stalled at 4651 verts
+        # across every further attempt with zero progress -- this is
+        # unrelated to (and predates) the boundary-protection logic above,
+        # reproduced identically with protection fully disabled. Rather than
+        # leave a mesh that guarantees a crash at export
+        # (pack_compressed_mesh's hard assert), fall back to a convex hull
+        # of whatever geometry remains -- loses exact-shape fidelity for
+        # this pathological case specifically, but an exported hull beats
+        # an exact copy that can't export at all.
+        if len(collision_obj.data.vertices) > limit or len(collision_obj.data.polygons) > limit:
+            MeshHelpers._enforce_vert_limit_hull(collision_obj, limit=limit)
 
     @staticmethod
     def _enforce_vert_limit_hull(collision_obj, limit: int = 255) -> None:
@@ -2451,7 +2542,20 @@ class SmartPresets:
 
         if import_scene is not None and hasattr(import_scene, 'pynifly'):
             try:
-                bpy.ops.import_scene.pynifly(filepath=filepath)
+                _before = set(bpy.context.scene.objects)
+                result = bpy.ops.import_scene.pynifly(filepath=filepath)
+                _new = [o for o in bpy.context.scene.objects if o not in _before]
+                # PyNifly returns an empty set() on success (never 'FINISHED')
+                # and only ever adds 'CANCELLED' on failure -- see
+                # export_helpers.py's _call_nif_export note. Neither alone is
+                # proof anything was actually imported, so also require at
+                # least one new scene object rather than trusting the call
+                # simply didn't raise.
+                if 'CANCELLED' in result or not _new:
+                    return False, (
+                        f"PyNifly did not import anything from {filename} "
+                        f"(result={result!r})"
+                    )
                 return True, f"Imported game mesh via PyNifly: {filename}"
             except Exception as e:
                 return False, f"PyNifly NIF import error: {e}"

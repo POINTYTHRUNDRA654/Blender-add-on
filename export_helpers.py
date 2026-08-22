@@ -1503,6 +1503,28 @@ class ExportHelpers:
                 pass
 
     @staticmethod
+    def safe_export_filename(name: str) -> str:
+        """Sanitize an object name for use as a filesystem filename.
+
+        PyNifly's own shape-naming convention embeds a literal colon (e.g.
+        "BaseMaleBody_Fitted:0", "Body:0") -- a real, common case on
+        ordinary vanilla FO4 NIFs, not an edge case. On NTFS a colon in a
+        path is the Alternate Data Stream separator, so an unsanitized
+        f"{name}.nif" silently writes into a hidden ADS on a 0-byte visible
+        file instead of a real, discoverable .nif. Confirmed directly on a
+        real export: PyNifly reported "successfully exported" and the
+        calling code reported "Exported N meshes" while every affected
+        file was an empty 0-byte placeholder with the real NIF data hidden
+        in an invisible alternate stream -- a fabricated-success shape
+        indistinguishable from success unless someone checks with
+        Get-Item -Stream. Replaces every character illegal in a Windows
+        filename with '_'.
+        """
+        illegal = '<>:"/\\|?*'
+        cleaned = "".join('_' if c in illegal else c for c in name).strip()
+        return cleaned or "unnamed"
+
+    @staticmethod
     def _export_output_written(filepath, since_seconds: float = 300.0, after_time: float = None,
                                retry_window: float = 2.0, retry_interval: float = 0.2):
         """Return True when a NIF that looks like this export was written to disk
@@ -2056,7 +2078,7 @@ class ExportHelpers:
                     results['skipped'].append(obj.name)
                     continue
 
-                mesh_path = os.path.join(mesh_dir, f"{obj.name}.nif")
+                mesh_path = os.path.join(mesh_dir, f"{ExportHelpers.safe_export_filename(obj.name)}.nif")
                 success, message = ExportHelpers.export_mesh_to_nif(obj, mesh_path)
 
                 if success:

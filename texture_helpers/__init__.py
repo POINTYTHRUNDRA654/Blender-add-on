@@ -288,6 +288,26 @@ class TextureHelpers:
         if os.path.normcase(os.path.normpath(dest_path)) == os.path.normcase(norm_src):
             return texture_path  # already the destination
 
+        # Refuse to blindly clobber an existing, higher-resolution texture at
+        # the destination with whatever this call is installing -- confirmed
+        # real incident: a correct 2K texture already sitting in a mod
+        # folder got silently overwritten by a 512 one, because this copy
+        # only ever checked whether source == destination, never what was
+        # already there.
+        if os.path.exists(dest_path):
+            try:
+                from . import nvtt_helpers as _nvtt_mod
+            except ImportError:
+                from .. import nvtt_helpers as _nvtt_mod
+            if _nvtt_mod.is_texture_size_downgrade(dest_path, texture_path):
+                print(
+                    f"[FO4 Add-on] Not installing '{texture_path}' over "
+                    f"'{dest_path}' -- the existing file is higher resolution. "
+                    f"Delete it first if replacing it with a smaller texture "
+                    f"is intentional."
+                )
+                return texture_path  # keep the original, don't touch dest
+
         try:
             os.makedirs(dest_dir, exist_ok=True)
             import shutil

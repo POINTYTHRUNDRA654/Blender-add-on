@@ -2184,6 +2184,32 @@ class FO4_OT_AutoWeightArmor(Operator):
     bl_label   = "Auto-Weight Armor"
     bl_options = {'REGISTER', 'UNDO'}
 
+    def invoke(self, context, event):
+        # This operator replaces any existing vertex groups outright --
+        # confirmed on a real, already-correctly-skinned Daz/G3 import: it
+        # silently dropped weighting on 46 verts that were previously fully
+        # weighted. Only prompt when there's real weight data to lose; a
+        # mesh with no groups yet (or empty ones) proceeds immediately.
+        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        already_weighted = [
+            m for m in meshes
+            if m.vertex_groups and any(v.groups for v in m.data.vertices)
+        ]
+        if already_weighted:
+            names = ", ".join(m.name for m in already_weighted[:3])
+            if len(already_weighted) > 3:
+                names += f", +{len(already_weighted) - 3} more"
+            return context.window_manager.invoke_confirm(
+                self, event,
+                title="Replace Existing Weights?",
+                message=f"{names} already {'has' if len(already_weighted) == 1 else 'have'} "
+                        f"weight data. Auto-Weight will replace it with Blender's "
+                        f"automatic result.",
+                confirm_text="Replace Weights",
+                icon='ERROR',
+            )
+        return self.execute(context)
+
     def execute(self, context):
         meshes = [o for o in context.selected_objects if o.type == 'MESH']
         armature = context.active_object if (context.active_object and
@@ -2224,7 +2250,17 @@ class FO4_OT_MirrorArmorWeights(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         try:
-            bpy.ops.object.vertex_group_mirror(mirror_topology=False)
+            # all_groups=True is required to actually mirror every vertex
+            # group on the mesh (this operator's own docstring says "the
+            # mesh's vertex group weights", plural) -- the real Blender
+            # default is False, which only mirrors whichever single group
+            # happens to be active, silently leaving the other 40+ bone
+            # groups on a real armor mesh untouched. use_topology=False (not
+            # mirror_topology, which doesn't exist on this Blender's
+            # vertex_group_mirror -- confirmed via a real crash: "keyword
+            # 'mirror_topology' unrecognized") uses coordinate-based L/R
+            # mirroring, which is correct for skinned meshes.
+            bpy.ops.object.vertex_group_mirror(use_topology=False, all_groups=True)
         except Exception as exc:
             self.report({'ERROR'}, f"Mirror weights failed: {exc}")
             return {'CANCELLED'}
@@ -7904,7 +7940,15 @@ class FO4_OT_BatchExportMeshes(Operator):
 
         for obj in selected_objects:
             try:
-                filepath = f"{self.directory}/{obj.name}.nif"
+                # obj.name is not sanitized against NTFS-illegal characters --
+                # PyNifly's own "ShapeName:Index" naming convention (a real,
+                # common case, e.g. "Body:0") contains a literal colon, which
+                # NTFS treats as the Alternate Data Stream separator. An
+                # unsanitized name here silently wrote into a hidden ADS on a
+                # 0-byte visible file instead of a real .nif -- confirmed
+                # directly on a real vanilla FO4 armor export.
+                safe_name = export_helpers.ExportHelpers.safe_export_filename(obj.name)
+                filepath = f"{self.directory}/{safe_name}.nif"
                 success, message = export_helpers.ExportHelpers.export_mesh_to_nif(obj, filepath)
                 if success:
                     success_count += 1
