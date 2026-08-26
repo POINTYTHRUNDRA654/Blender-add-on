@@ -814,7 +814,16 @@ def start_server() -> tuple:
     try:
         import bpy
         if not bpy.app.timers.is_registered(_process_command_queue):
-            bpy.app.timers.register(_process_command_queue, first_interval=0.1)
+            # persistent=True -- bpy.app.timers.register() defaults to
+            # non-persistent, and Blender clears every non-persistent timer
+            # on file load (New/Open/Open Recent). Without this, the TCP
+            # server thread keeps accepting connections and queuing commands
+            # after any file load in the same session, but nothing is left
+            # running on the main thread to drain that queue -- every
+            # subsequent Mossy command silently times out. See
+            # advisor_helpers.py's start_auto_monitor() for the same fix
+            # applied to its own timer.
+            bpy.app.timers.register(_process_command_queue, first_interval=0.1, persistent=True)
     except Exception:
         pass
 
@@ -1830,7 +1839,11 @@ def register() -> None:
     try:
         import bpy as _bpy
         if not _bpy.app.timers.is_registered(_health_monitor):
-            _bpy.app.timers.register(_health_monitor, first_interval=5.0)
+            # persistent=True for the same reason as _process_command_queue's
+            # registration above -- otherwise this stops running after any
+            # file load and the auto-reconnect/online-status sync silently
+            # goes stale while the UI keeps showing the last cached status.
+            _bpy.app.timers.register(_health_monitor, first_interval=5.0, persistent=True)
             print("[Mossy Link] Health monitor started (15 s interval)")
     except Exception as exc:
         print(f"[Mossy Link] Could not start health monitor: {exc}")

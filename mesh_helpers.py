@@ -1889,13 +1889,14 @@ class MeshHelpers:
         texture_type : str
             ``'DIFFUSE'``, ``'NORMAL'``, ``'SPECULAR'``, or ``'GLOW'``.
         unwrap_method : str
-            ``'MIN_STRETCH'`` **(default)** - Minimum Stretch: CONFORMAL
-            (LSCM) initial layout followed by ``uv.minimize_stretch`` run to
-            convergence (100 iterations).  Produces the lowest UV distortion
-            of any available method.
+            ``'MIN_STRETCH'`` **(default)** - Minimum Stretch: Smart UV
+            Project initial island layout, relaxed in place with
+            ``uv.minimize_stretch`` run to convergence (100 iterations).
+            Produces the lowest UV distortion of any available method.
             ``'SMART'``      - Smart UV Project (fast, good general purpose).
-            ``'ANGLE'``      - Angle-Based conformal unwrap with stretch-
-                               minimize refinement pass.
+            ``'ANGLE'``      - Smart UV Project initial layout with a
+                               lighter (10-iteration) minimize_stretch
+                               refinement pass.
             ``'CUBE'``       - Cube/box projection.
             ``'EXISTING'``   - Keep current UV map; only bind the texture.
         island_margin : float
@@ -1936,18 +1937,35 @@ class MeshHelpers:
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
 
+            # BUG FIX: every non-CUBE/SMART branch here used to run
+            # `bpy.ops.uv.smart_project(...)` and then IMMEDIATELY call
+            # `bpy.ops.uv.unwrap(method=...)` on the same selection before
+            # doing any relaxation. Smart UV Project computes its island cuts
+            # internally -- it does not write them to the mesh's real
+            # edge.use_seam data. `uv.unwrap()`, on the other hand, only
+            # respects *real* seam edges; with none present (the normal case
+            # for a mesh that's never been manually seamed) it re-unwraps the
+            # whole selection as one/few islands from scratch, silently
+            # throwing away everything Smart UV Project just produced. The
+            # comments here claimed Smart UV Project was "seeding" the
+            # CONFORMAL/ANGLE_BASED pass -- it wasn't; that pass was
+            # discarding it. The result was the opposite of what MIN_STRETCH
+            # promises ("lowest UV distortion of any available method"),
+            # especially for organic/closed meshes where an unseamed
+            # single-island LSCM unwrap distorts badly.
+            # Fix: let Smart UV Project produce the actual island layout, and
+            # run minimize_stretch directly on THAT layout to relax it --
+            # minimize_stretch refines whatever UV coordinates already exist,
+            # it does not need or use seam data, so nothing gets discarded.
             skip_unwrap = (unwrap_method == 'EXISTING' and uv_already_exists)
             if not skip_unwrap:
                 if unwrap_method == 'MIN_STRETCH':
-                    # Best-quality pipeline: CONFORMAL (LSCM) initial layout
-                    # + minimize_stretch convergence pass (100 iterations).
-                    # Smart UV Project seeds the seam boundaries first so
-                    # CONFORMAL has a clean starting topology to work with.
+                    # Best-quality pipeline: Smart UV Project for the initial
+                    # island layout + minimize_stretch convergence pass
+                    # (100 iterations) to relax it in place.
                     bpy.ops.uv.smart_project(
                         angle_limit=66.0, island_margin=island_margin
                     )
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.uv.unwrap(method='CONFORMAL', margin=island_margin)
                     bpy.ops.mesh.select_all(action='SELECT')
                     try:
                         bpy.ops.uv.minimize_stretch(fill_holes=True, iterations=100)
@@ -1958,17 +1976,15 @@ class MeshHelpers:
                         angle_limit=66.0, island_margin=island_margin
                     )
                 elif unwrap_method == 'ANGLE':
-                    # Angle-based conformal unwrap with a seam-priming pass.
-                    # Running Smart UV Project first populates the UV layer so
-                    # the angle-based solver has a starting layout to refine;
-                    # this prevents the "no UV data" edge case and produces
-                    # significantly better initial island placement.
+                    # Smart UV Project initial layout + a lighter
+                    # minimize_stretch refinement pass (10 iterations) --
+                    # faster / less aggressive relaxation than MIN_STRETCH,
+                    # good for organic shapes that don't need full
+                    # convergence.
                     bpy.ops.uv.smart_project(
                         angle_limit=66.0, island_margin=island_margin
                     )
                     bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=island_margin)
-                    # Conformal smoothing pass - reduces rubber-band stretch.
                     try:
                         bpy.ops.uv.minimize_stretch(fill_holes=True, iterations=10)
                     except Exception:
@@ -1980,8 +1996,6 @@ class MeshHelpers:
                     bpy.ops.uv.smart_project(
                         angle_limit=66.0, island_margin=island_margin
                     )
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.uv.unwrap(method='CONFORMAL', margin=island_margin)
                     bpy.ops.mesh.select_all(action='SELECT')
                     try:
                         bpy.ops.uv.minimize_stretch(fill_holes=True, iterations=100)

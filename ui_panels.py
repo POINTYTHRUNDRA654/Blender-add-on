@@ -990,26 +990,25 @@ class FO4_PT_MeshPanel(_FO4SubPanel):
             box.separator()
 
             # ── LOD Meshes ─────────────────────────────────────────────
+            # LOD generation lives in exactly one place in this addon: the
+            # "FO4: LOD + Collision Pipeline" subpanel under Setup, driven
+            # by fo4.generate_lods. That operator already generates LOD1-3,
+            # the billboard, AND the UCX_ collision, then exports every NIF
+            # with the verified real FO4 naming/folder convention in one
+            # step -- so this panel used to duplicate it with three
+            # different, inconsistent generators (fo4.generate_lod,
+            # fo4.generate_lod_and_collision, fo4.collision_from_lowest_lod)
+            # plus an export step (fo4.export_lod_chain_as_nif) that used
+            # the WRONG file-naming convention. Having several separate LOD
+            # tools scattered across panels was confusing and error-prone,
+            # so this box now just points at the one correct tool instead
+            # of re-implementing it.
             box.label(text="LOD Meshes (Level of Detail)", icon='OUTLINER_OB_MESH')
             sub = box.column(align=True)
             sub.scale_y = 0.75
-            sub.label(text="FO4 uses LOD0 (close) → LOD4 (far) as separate NIFs", icon='INFO')
-            sub.label(text="Source object = LOD0 · Generates LOD1–LOD4 copies", icon='INFO')
-            sub.label(text="Tip: 'Collision from Lowest LOD' uses LOD4 as collision base", icon='INFO')
-            box.separator()
-            row = box.row()
-            row.enabled = bool(has_mesh)
-            row.scale_y = 1.3
-            row.operator("fo4.generate_lod", text="Generate LOD Chain", icon='OUTLINER_OB_MESH')
-            row = box.row()
-            row.enabled = bool(has_mesh)
-            row.operator("fo4.generate_lod_and_collision", text="Generate LOD + Collision", icon='SHADERFX')
-            row = box.row()
-            row.enabled = bool(has_mesh)
-            row.operator("fo4.collision_from_lowest_lod", text="Collision from Lowest LOD", icon='MESH_ICOSPHERE')
-            row = box.row()
-            row.enabled = bool(has_mesh)
-            row.operator("fo4.export_lod_chain_as_nif", text="Export LOD Chain as NIF", icon='EXPORT')
+            sub.label(text="Generated in Setup → FO4: LOD + Collision", icon='INFO')
+            sub.label(text="Pipeline — handles LOD1–3, billboard, collision,", icon='INFO')
+            sub.label(text="and NIF export together in one step.", icon='INFO')
             box.separator()
 
             # ── Advanced Mesh Tools ─────────────────────────────────────
@@ -1086,6 +1085,37 @@ class FO4_PT_MeshPanel(_FO4SubPanel):
                 text="Hybrid Unwrap",
                 icon='UV_SYNC_SELECT',
             )
+
+            # Branch / Part Seam Tools — click-driven seam authoring for
+            # organic, branching meshes (plants, tentacles, pipes, limbs).
+            # Distinct from the global auto-seamer above: these are manual,
+            # per-branch clicks so the modder controls exactly where each
+            # UV island boundary goes.
+            uv_box.separator()
+            uv_box.label(
+                text="Branch / Part Seam Tools (click-driven) →",
+                icon='RESTRICT_SELECT_OFF',
+            )
+            row = uv_box.row(align=True)
+            row.enabled = bool(has_mesh)
+            row.operator(
+                "fo4.ring_seam_at_point",
+                text="Ring Seam (click branch)",
+                icon='MESH_CIRCLE',
+            )
+            row.operator(
+                "fo4.split_seam_between_points",
+                text="Split Seam (click 2 ends)",
+                icon='EDGESEL',
+            )
+            row = uv_box.row()
+            row.enabled = bool(has_mesh)
+            row.operator(
+                "fo4.finish_branch_seams_and_unwrap",
+                text="Finish Seaming → Unwrap",
+                icon='CHECKMARK',
+            )
+
             obj = context.active_object
             has_bake_src = (
                 obj and obj.type == 'MESH'
@@ -1153,6 +1183,26 @@ class FO4_PT_MeshPanel(_FO4SubPanel):
                 icon='LIGHT_HEMI',
             )
 
+            # Wrap a reference photo onto the mesh, then hand-paint fixes
+            uv_box.separator()
+            uv_box.label(text="Wrap a Photo onto the Mesh:", icon='FORWARD')
+            sub = uv_box.column(align=True)
+            sub.scale_y = 0.75
+            sub.label(text="Frame the mesh in the 3-D viewport first --", icon='INFO')
+            sub.label(text="the photo projects from whatever angle you're looking from.")
+            row = uv_box.row(align=True)
+            row.enabled = bool(has_mesh)
+            row.operator(
+                "fo4.wrap_image_onto_mesh",
+                text="Wrap Image onto Mesh",
+                icon='IMAGE_DATA',
+            )
+            row.operator(
+                "fo4.retouch_wrapped_texture",
+                text="Retouch Texture",
+                icon='BRUSH_DATA',
+            )
+
             # Step 5 - export
             uv_box.separator()
             uv_box.label(text="Step 5 - Export as Fallout 4 NIF:", icon='FORWARD')
@@ -1216,27 +1266,18 @@ class FO4_PT_MeshPanel(_FO4SubPanel):
             row.enabled = bool(has_mesh)
             row.operator("fo4.export_mesh_with_collision", text="Generate + Export NIF", icon='EXPORT')
 
+            # LOD generation lives in exactly one place in this addon -- see
+            # the matching comment in the `unified` branch above for why
+            # this box was trimmed down to a pointer instead of duplicating
+            # fo4.generate_lods here with a second, inconsistent set of
+            # generator/export operators.
             lod_box = layout.box()
             lod_box.label(text="LOD Meshes (Level of Detail)", icon='OUTLINER_OB_MESH')
             sub = lod_box.column(align=True)
             sub.scale_y = 0.75
-            sub.label(text="FO4: LOD0 (close) → LOD4 (far), each a separate NIF", icon='INFO')
-            sub.label(text="Source object = LOD0. LOD1–LOD4 copies are created.", icon='INFO')
-            sub.label(text="Tip: 'Collision from Lowest LOD' uses LOD4 as collision base", icon='INFO')
-            lod_box.separator()
-            row = lod_box.row()
-            row.enabled = bool(has_mesh)
-            row.scale_y = 1.3
-            row.operator("fo4.generate_lod", text="Generate LOD Chain", icon='OUTLINER_OB_MESH')
-            row = lod_box.row()
-            row.enabled = bool(has_mesh)
-            row.operator("fo4.generate_lod_and_collision", text="Generate LOD + Collision", icon='SHADERFX')
-            row = lod_box.row()
-            row.enabled = bool(has_mesh)
-            row.operator("fo4.collision_from_lowest_lod", text="Collision from Lowest LOD", icon='MESH_ICOSPHERE')
-            row = lod_box.row()
-            row.enabled = bool(has_mesh)
-            row.operator("fo4.export_lod_chain_as_nif", text="Export LOD Chain as NIF", icon='EXPORT')
+            sub.label(text="Generated in Setup → FO4: LOD + Collision", icon='INFO')
+            sub.label(text="Pipeline — handles LOD1–3, billboard, collision,", icon='INFO')
+            sub.label(text="and NIF export together in one step.", icon='INFO')
 
             adv_box = layout.box()
             adv_box.label(text="Advanced Mesh Tools", icon='MODIFIER')
@@ -3177,13 +3218,22 @@ class FO4_PT_ExportPanel(_FO4SubPanel):
         opt_box = nif_box.box()
         opt_box.label(text="Pre-Export Mesh Preparation", icon='MODIFIER')
         opt_col = opt_box.column(align=True)
-        opt_col.prop(context.scene, "fo4_opt_apply_transforms")
+        # Apply Transforms is always performed before NIF export regardless of
+        # this checkbox -- leaving scale unapplied previously caused exports to
+        # silently land at the wrong (÷70) in-game size. Shown disabled so the
+        # UI doesn't imply it's optional; Remove Doubles and Preserve UVs are
+        # genuinely read by the export prep pass (see export_helpers.py
+        # _prepare_mesh_for_nif) and share the same setting the "Optimize for
+        # FO4" button uses, so changing it here also affects that button.
+        apply_row = opt_col.row()
+        apply_row.enabled = False
+        apply_row.prop(context.scene, "fo4_opt_apply_transforms", text="Apply Transforms (always on for export)")
         opt_col.prop(context.scene, "fo4_opt_preserve_uvs")
         opt_col.prop(context.scene, "fo4_opt_doubles")
 
         opt_hint = opt_box.column(align=True)
         opt_hint.scale_y = 0.75
-        opt_hint.label(text="These run automatically before every NIF export.", icon='INFO')
+        opt_hint.label(text="Remove Doubles + Preserve UVs run automatically before every NIF export.", icon='INFO')
         opt_hint.label(text="Triangulate modifier is always added then removed.", icon='INFO')
 
         # ── Active object status ─────────────────────────────────────────────
@@ -3794,6 +3844,40 @@ class FO4_PT_ArmorClothingPanel(_FO4SubPanel):
         slot_row.enabled = bool(has_mesh)
         slot_row.operator_menu_enum("fo4.assign_biped_slot", "armor_type",
                                      text="Assign Biped Slot", icon='ARMATURE_DATA')
+
+        # ── Auto-Detect Armor Type + Cloth Physics (fo4_armor_animation.py) ────
+        # This entire module (armor-type auto-detection from mesh name/shape,
+        # description-based setup, and Blender cloth-modifier physics for
+        # Cape/Robe/Skirt pieces) was implemented and registered but had no
+        # panel entry anywhere -- reachable only via Blender's F3 operator
+        # search. The wired-up "Quick FBX Armor Setup" flow above is a
+        # separate, simpler weight-transfer path that never calls
+        # setup_cloth_physics(), so cloth pieces had no reachable way to get
+        # jiggle/flow physics at all. Same class of gap the creature-rig
+        # pipeline audit found and fixed earlier this session.
+        auto_box = layout.box()
+        auto_box.label(text="Auto-Detect Type + Cloth Physics", icon='PHYSICS')
+        acol = auto_box.column(align=True)
+        acol.scale_y = 0.72
+        acol.label(text="Detects Helmet/Chest/Boot/Gauntlet/Pauldron/Full Body,")
+        acol.label(text="or Cape/Robe/Skirt (these get cloth-sim physics too).")
+        arow = auto_box.row(align=True)
+        arow.enabled = bool(has_mesh)
+        arow.scale_y = 1.3
+        arow.operator("fo4.auto_setup_armor", text="Auto-Setup Armor / Clothing", icon='AUTO')
+        auto_box.operator("fo4.build_fo4_skeleton", text="Build Reference Skeleton",
+                           icon='ARMATURE_DATA')
+
+        auto_box.separator(factor=0.4)
+        desc_row = auto_box.row(align=True)
+        desc_row.prop(scene, "fo4_armor_description", text="")
+        desc_btn = auto_box.row(align=True)
+        desc_btn.enabled = bool(has_mesh)
+        desc_btn.operator("fo4.setup_armor_from_description", text="Setup from Description", icon='OUTLINER_OB_FONT')
+        preset_row = auto_box.row(align=True)
+        preset_row.scale_y = 0.85
+        for _preset_text in ("flowing cape", "long robe", "leather skirt", "chest plate armor"):
+            preset_row.operator("fo4.set_armor_preset", text=_preset_text).preset = _preset_text
 
         layout.separator()
 

@@ -318,8 +318,10 @@ class FO4_OT_PipelineStaticMesh(Operator):
     mod_folder: StringProperty(
         name="Mod Output Folder",
         description=(
-            "Your mod's root staging folder (e.g. C:/MO2/mods/MyMod). "
-            "NIF exports to [folder]/Data/Meshes/ — never into the game folder directly."
+            "Your mod's root staging folder (e.g. C:/MO2/mods/MyMod), which "
+            "holds Meshes/Materials/Textures directly (MO2 mod folders have "
+            "no Data\\ wrapper). NIF exports to [folder]/Meshes/ — never "
+            "into the game folder directly."
         ),
         default="",
         subtype='DIR_PATH',
@@ -355,8 +357,13 @@ class FO4_OT_PipelineStaticMesh(Operator):
         if not self.filepath:
             obj = context.active_object
             name = obj.name if obj else "mesh"
+            # No "Data" segment: mod_folder is the MO2 mod folder itself,
+            # which holds Meshes/Materials/Textures directly (no Data\
+            # wrapper) -- inserting "Data" here sent NIFs to a path MO2/the
+            # game would never look at. Confirmed as a real bug from a user
+            # report.
             self.filepath = os.path.join(
-                self.mod_folder, "Data", "Meshes", f"{name}.nif"
+                self.mod_folder, "Meshes", f"{name}.nif"
             )
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
@@ -467,9 +474,12 @@ class FO4_OT_PipelineStaticMesh(Operator):
         # ── Step 12: Export BGSM ──────────────────────────────────────────────
             if self.export_bgsm:
                 try:
+                    # No "Data" segment -- same MO2-mod-folder convention as
+                    # the NIF path above (mod_folder holds Materials/
+                    # directly, no Data\ wrapper).
                     out_dir = os.path.normpath(os.path.join(
                         getattr(self, "mod_folder", "") or os.path.dirname(os.path.abspath(self.filepath)),
-                        "Data", "Materials"
+                        "Materials"
                     ))
                     os.makedirs(out_dir, exist_ok=True)
                     ok, msg = _do_bgsm_export(obj, out_dir)
@@ -875,7 +885,11 @@ class FO4_OT_PipelineNavMesh(Operator):
                 if not filepath.lower().endswith(".fbx"):
                     filepath += ".fbx"
                 os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-                bpy.ops.export_scene.fbx(
+                # bpy.ops calls don't raise when the operator declines to
+                # run -- they return {'CANCELLED'}, never an exception.
+                # Check the result and confirm the file actually landed on
+                # disk before reporting it as exported.
+                _fbx_result = bpy.ops.export_scene.fbx(
                     filepath=filepath,
                     use_selection=True,
                     apply_unit_scale=True,
@@ -886,10 +900,13 @@ class FO4_OT_PipelineNavMesh(Operator):
                     axis_forward='-Z',
                     axis_up='Y',
                 )
-                steps.append(
-                    f"NavMesh exported as FBX: {os.path.basename(filepath)}\n"
-                    "  → Import in CK: NavMesh > Import NavMesh FBX"
-                )
+                if 'CANCELLED' in set(_fbx_result or ()) or not os.path.isfile(filepath):
+                    errors.append(f"FBX export did not complete (result={_fbx_result!r})")
+                else:
+                    steps.append(
+                        f"NavMesh exported as FBX: {os.path.basename(filepath)}\n"
+                        "  → Import in CK: NavMesh > Import NavMesh FBX"
+                    )
             except Exception as e:
                 errors.append(f"FBX export failed: {e}")
 
