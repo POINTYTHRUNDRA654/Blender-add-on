@@ -2184,6 +2184,59 @@ class FO4_OT_AutoWeightArmor(Operator):
     bl_label   = "Auto-Weight Armor"
     bl_options = {'REGISTER', 'UNDO'}
 
+    # Set by invoke() once the user has clicked through the confirm dialog,
+    # or passed explicitly (confirm_replace=True) by a caller that already
+    # knows it's replacing weight data on purpose -- e.g. Mossy, which
+    # dispatches operators via bpy.ops.<id>(**params) using Blender's default
+    # EXEC_DEFAULT context. THAT PATH NEVER CALLS invoke() -- it goes
+    # straight to execute() -- so the confirm dialog below never protected
+    # commands sent from Mossy. Moving the already-weighted check into
+    # execute() itself (gated on this property) closes that gap: an
+    # unattended/scripted call without confirm_replace=True now safely
+    # refuses instead of silently clobbering weight data.
+    confirm_replace: BoolProperty(
+        name="Confirm Replace",
+        description="Internal: set once the user (or an explicit caller) has "
+                    "confirmed replacing existing weight data",
+        default=False,
+        options={'SKIP_SAVE', 'HIDDEN'},
+    )
+
+    @staticmethod
+    def _already_weighted(meshes):
+        return [
+            m for m in meshes
+            if m.vertex_groups and any(v.groups for v in m.data.vertices)
+        ]
+
+    def invoke(self, context, event):
+        # This operator replaces any existing vertex groups outright --
+        # confirmed on a real, already-correctly-skinned Daz/G3 import: it
+        # silently dropped weighting on 46 verts that were previously fully
+        # weighted. Only prompt when there's real weight data to lose; a
+        # mesh with no groups yet (or empty ones) proceeds immediately.
+        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        already_weighted = self._already_weighted(meshes)
+        if already_weighted and not self.confirm_replace:
+            names = ", ".join(m.name for m in already_weighted[:3])
+            if len(already_weighted) > 3:
+                names += f", +{len(already_weighted) - 3} more"
+            # Speculatively mark this confirmed *before* showing the dialog:
+            # invoke_confirm calls execute() directly if the user clicks
+            # through, with no chance to set properties in between. If the
+            # user cancels instead, execute() simply never runs.
+            self.confirm_replace = True
+            return context.window_manager.invoke_confirm(
+                self, event,
+                title="Replace Existing Weights?",
+                message=f"{names} already {'has' if len(already_weighted) == 1 else 'have'} "
+                        f"weight data. Auto-Weight will replace it with Blender's "
+                        f"automatic result.",
+                confirm_text="Replace Weights",
+                icon='ERROR',
+            )
+        return self.execute(context)
+
     def execute(self, context):
         meshes = [o for o in context.selected_objects if o.type == 'MESH']
         armature = context.active_object if (context.active_object and
@@ -2193,6 +2246,21 @@ class FO4_OT_AutoWeightArmor(Operator):
         if not meshes or not armature:
             self.report({'ERROR'},
                 "Select the mesh(es) plus an armature, with the armature active")
+            return {'CANCELLED'}
+
+        # Re-check here (not just in invoke()) so a caller that reaches
+        # execute() directly -- e.g. Mossy's operator dispatcher, which uses
+        # EXEC_DEFAULT and never calls invoke() -- can't bypass the guard.
+        already_weighted = self._already_weighted(meshes)
+        if already_weighted and not self.confirm_replace:
+            names = ", ".join(m.name for m in already_weighted[:3])
+            if len(already_weighted) > 3:
+                names += f", +{len(already_weighted) - 3} more"
+            self.report({'ERROR'},
+                f"Refusing to auto-weight: {names} already "
+                f"{'has' if len(already_weighted) == 1 else 'have'} weight data that "
+                f"would be replaced. Re-run with confirm_replace=True to proceed "
+                f"(e.g. params={{'confirm_replace': True}} from Mossy).")
             return {'CANCELLED'}
 
         bpy.ops.object.select_all(action='DESELECT')
@@ -2224,7 +2292,17 @@ class FO4_OT_MirrorArmorWeights(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         try:
-            bpy.ops.object.vertex_group_mirror(mirror_topology=False)
+            # all_groups=True is required to actually mirror every vertex
+            # group on the mesh (this operator's own docstring says "the
+            # mesh's vertex group weights", plural) -- the real Blender
+            # default is False, which only mirrors whichever single group
+            # happens to be active, silently leaving the other 40+ bone
+            # groups on a real armor mesh untouched. use_topology=False (not
+            # mirror_topology, which doesn't exist on this Blender's
+            # vertex_group_mirror -- confirmed via a real crash: "keyword
+            # 'mirror_topology' unrecognized") uses coordinate-based L/R
+            # mirroring, which is correct for skinned meshes.
+            bpy.ops.object.vertex_group_mirror(use_topology=False, all_groups=True)
         except Exception as exc:
             self.report({'ERROR'}, f"Mirror weights failed: {exc}")
             return {'CANCELLED'}
@@ -4458,8 +4536,27 @@ class FO4_OT_ExportCKAssetBundle(Operator):
                         if not _os.path.isfile(src):
                             warns.append(f"{obj.name}: texture missing ({src})")
                             continue
+                        dst = _os.path.join(tex_dir, _os.path.basename(src))
+                        # Refuse to blindly clobber an existing, higher-
+                        # resolution texture already sitting in the Data
+                        # folder -- same real incident bgsm_helpers.py's
+                        # export_bgsm_for_object() was already hardened
+                        # against (a correct 2K texture silently overwritten
+                        # by a 512 one on re-export). This copy path went
+                        # through a plain shutil.copy2 with no such check.
+                        if (_os.path.exists(dst)
+                                and _os.path.normcase(_os.path.normpath(dst)) != src_norm
+                                and nvtt_helpers
+                                and nvtt_helpers.is_texture_size_downgrade(dst, src)):
+                            warns.append(
+                                f"{obj.name}: skipped '{_os.path.basename(src)}' — the file "
+                                f"already at {dst} is higher resolution than the texture "
+                                f"currently loaded in Blender. Not overwriting it; delete "
+                                f"the existing file first if replacing it with a smaller "
+                                f"one is intentional."
+                            )
+                            continue
                         try:
-                            dst = _os.path.join(tex_dir, _os.path.basename(src))
                             shutil.copy2(src, dst)
                             copied_src.add(src_norm)
                             n_tex_ok += 1
@@ -4703,7 +4800,11 @@ class FO4_OT_ExportAnimationHavok2FBX(Operator):
             export_obj.select_set(True)
             context.view_layer.objects.active = export_obj
 
-            bpy.ops.export_scene.fbx(
+            # bpy.ops calls don't raise when the operator declines to run --
+            # they return {'CANCELLED'}, never an exception. Capture the
+            # result so it can be checked once the finally block below has
+            # restored scene state.
+            _fbx_result = bpy.ops.export_scene.fbx(
                 filepath=fbx_path,
                 use_selection=True,
                 apply_scale_options='FBX_SCALE_ALL',
@@ -4738,6 +4839,12 @@ class FO4_OT_ExportAnimationHavok2FBX(Operator):
                     bpy.data.objects.remove(temp_copy, do_unlink=True)
                 except Exception:
                     pass
+
+        if 'CANCELLED' in set(_fbx_result or ()) or not os.path.isfile(fbx_path):
+            self.report({'ERROR'},
+                f"FBX export did not complete (result={_fbx_result!r}); "
+                f"nothing was written to {fbx_path}. Skipping HKX conversion.")
+            return {'CANCELLED'}
 
         self.report({'INFO'}, f"FBX exported: {fbx_path}")
 
@@ -5474,7 +5581,12 @@ class FO4_OT_DecimateToFO4(Operator):
             self.report({'ERROR'}, "advanced_mesh_helpers unavailable - restart Blender")
             return {'CANCELLED'}
 
-        current = len(obj.data.polygons)
+        # Use the real triangle count (not face count -- a quad/ngon mesh
+        # under-reports its actual export triangle total) so the early-exit
+        # check and the "Decimated: X -> Y tris" report below are both
+        # measuring what FO4's 65,535-triangle limit actually measures.
+        obj.data.calc_loop_triangles()
+        current = len(obj.data.loop_triangles)
         if current <= target:
             self.report({'INFO'}, f"Already at or below target ({current:,} tris ≤ {target:,})")
             return {'FINISHED'}
@@ -5483,14 +5595,25 @@ class FO4_OT_DecimateToFO4(Operator):
             obj, target_poly_count=target, preserve_uvs=True
         )
         if success:
-            after = stats.get('poly_count_after', '?')
+            # tri_count_after is the real post-decimate triangle count
+            # (quads/ngons counted as their actual triangle contribution),
+            # which is what FO4's 65,535 export limit actually measures --
+            # 'poly_count_after' is face count and can undercount a
+            # quad-heavy mesh's real triangle total.
+            after_tris = stats.get('tri_count_after', stats.get('poly_count_after', '?'))
             pct = stats.get('reduction_percent', 0)
             self.report(
                 {'INFO'},
-                f"Decimated: {current:,} → {after:,} tris ({pct:.1f}% reduction)",
+                f"Decimated: {current:,} → {after_tris:,} tris ({pct:.1f}% reduction)",
             )
+            if isinstance(after_tris, int) and after_tris > 65535:
+                self.report(
+                    {'WARNING'},
+                    f"Still over FO4's 65,535-triangle limit ({after_tris:,} tris) -- "
+                    "run again with a lower target or split the mesh."
+                )
             _notify(
-                f"Mesh ready for FO4: {after:,} tris", 'INFO'
+                f"Mesh ready for FO4: {after_tris:,} tris", 'INFO'
             )
         else:
             self.report({'ERROR'}, message)
@@ -5506,7 +5629,8 @@ class FO4_OT_DecimateToFO4(Operator):
         col = layout.column(align=True)
 
         if obj and obj.type == 'MESH':
-            current = len(obj.data.polygons)
+            obj.data.calc_loop_triangles()
+            current = len(obj.data.loop_triangles)
             target = context.scene.fo4_imageto3d_target_poly
             budget_ok = current <= 65535
             col.label(
@@ -6025,13 +6149,13 @@ class FO4_OT_OptimizeUVs(Operator):
         name="Method",
         items=[
             ('MIN_STRETCH', "Minimum Stretch",
-             "CONFORMAL (LSCM) initial layout + minimize_stretch to convergence "
-             "(100 iterations) - lowest distortion, best texture match; "
-             "Blender's recommended method for accuracy"),
+             "Smart UV Project layout + minimize_stretch relaxation to "
+             "convergence (100 iterations) - lowest distortion, best "
+             "texture match"),
             ('SMART', "Smart UV Project",
              "Automatic seam detection – recommended for most meshes"),
-            ('ANGLE', "Angle-Based + Stretch Minimize",
-             "Conformal unwrap with stretch-minimize pass – "
+            ('ANGLE', "Smart Project + Light Stretch Minimize",
+             "Smart UV Project layout with a lighter stretch-minimize pass – "
              "best for organic shapes where low distortion matters"),
             ('CUBE',  "Cube Projection",
              "Box projection – fastest; ideal for architecture"),
@@ -6046,14 +6170,14 @@ class FO4_OT_OptimizeUVs(Operator):
         min=0.0,
         max=0.1,
     )
-    
+
     def execute(self, context):
         obj = context.active_object
-        
-        if not obj:
-            self.report({'ERROR'}, "No object selected")
+
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "No mesh object selected")
             return {'CANCELLED'}
-        
+
         # Optimize UVs
         success, message = advanced_mesh_helpers.AdvancedMeshHelpers.optimize_uvs(
             obj, self.method, self.margin
@@ -6123,12 +6247,12 @@ class FO4_OT_SetupUVWithTexture(Operator):
              "Per-component flat projection optimised for leaf-card meshes — "
              "each connected leaf becomes one clean island, similar leaves are stacked"),
             ('MIN_STRETCH', "Minimum Stretch",
-             "CONFORMAL (LSCM) + minimize_stretch (100 iterations) — "
+             "Smart UV Project + minimize_stretch relaxation (100 iterations) — "
              "lowest distortion for hard-surface / character meshes"),
             ('SMART',    "Smart UV Project",
              "Automatic seam detection — good general-purpose fallback"),
-            ('ANGLE',    "Angle-Based + Stretch Minimize",
-             "Angle-based conformal with stretch-minimize refinement — "
+            ('ANGLE',    "Smart Project + Light Stretch Minimize",
+             "Smart UV Project + a lighter stretch-minimize refinement — "
              "good for organic shapes"),
             ('CUBE',     "Cube Projection",
              "Box projection — fastest, best for architecture"),
@@ -6229,13 +6353,13 @@ class FO4_OT_ReUnwrapUV(Operator):
         description="UV unwrapping algorithm",
         items=[
             ('MIN_STRETCH', "Minimum Stretch",
-             "CONFORMAL (LSCM) initial layout + minimize_stretch to convergence "
-             "(100 iterations) - lowest distortion, best texture match; "
-             "Blender's recommended method for accuracy"),
+             "Smart UV Project layout + minimize_stretch relaxation to "
+             "convergence (100 iterations) - lowest distortion, best "
+             "texture match"),
             ('SMART', "Smart UV Project",
              "Automatic seam detection – recommended for most meshes"),
-            ('ANGLE', "Angle-Based + Stretch Minimize",
-             "Conformal unwrap with stretch-minimize pass – "
+            ('ANGLE', "Smart Project + Light Stretch Minimize",
+             "Smart UV Project layout with a lighter stretch-minimize pass – "
              "best for organic shapes where low distortion matters"),
             ('CUBE',  "Cube Projection",
              "Box projection – fastest; ideal for architecture"),
@@ -6759,8 +6883,17 @@ class FO4_OT_SmartSeamMark(Operator):
 
         # Drop the user into Edge Select edit mode so they can refine seams
         # immediately without a separate step.
+        # NOTE: this operator is designed to chain directly after the
+        # interactive Ring Seam / Split Seam tools, both of which leave the
+        # object in Edit Mode. bpy.ops.object.mode_set(mode='EDIT') called
+        # while ALREADY in Edit Mode acts as a toggle in Blender (it logs as
+        # editmode_toggle() and switches BACK to Object Mode instead of
+        # staying put) -- the opposite of what this operator promises in its
+        # own docstring/report message. Only call mode_set when we actually
+        # need to enter Edit Mode.
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
+        if obj.mode != 'EDIT':
+            bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='DESELECT')
 
         # Switch to edge-select mode - the natural mode for seam editing
@@ -7234,6 +7367,25 @@ class FO4_OT_UnwrapSelectedFaces(Operator):
         # Ensure Face Select so the unwrap operates on the visible selection
         bpy.context.tool_settings.mesh_select_mode = (False, False, True)
 
+        # BUG FIX: this used to call uv.unwrap() unconditionally, with no
+        # check that the user had actually selected any faces first. With
+        # zero faces selected, uv.unwrap() and minimize_stretch() are both
+        # legal no-ops (they don't raise), so the operator fell through to
+        # its success report and told the user "Unwrapped selected faces"
+        # even though nothing was touched -- easy to trigger by clicking
+        # this button right after 'Pick Faces to Unwrap' without actually
+        # picking anything. Verify there's a real selection first.
+        import bmesh as _bmesh_sel
+        _bm_check = _bmesh_sel.from_edit_mesh(obj.data)
+        _selected_face_count = sum(1 for f in _bm_check.faces if f.select)
+        if _selected_face_count == 0:
+            self.report(
+                {'ERROR'},
+                "No faces selected. Use 'Pick Faces to Unwrap' and click "
+                "the faces you want first."
+            )
+            return {'CANCELLED'}
+
         # Create a UV layer if needed - the unwrap operator requires one
         if not obj.data.uv_layers:
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -7267,6 +7419,293 @@ class FO4_OT_UnwrapSelectedFaces(Operator):
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
+
+
+def _find_view3d_area_region(context):
+    """Return (area, region) for the first VIEW_3D window region, or
+    (None, None) if none is open. Several project-paint / viewport-only
+    operators (e.g. paint.project_image) require a real 3-D viewport in
+    their execution context to know which camera angle to project from --
+    calling them from an Object-mode button click has no such context by
+    default, so callers must wrap the call in
+    ``context.temp_override(area=area, region=region)`` using the result."""
+    for area in context.screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if region is not None:
+            return area, region
+    return None, None
+
+
+class FO4_OT_WrapImageOntoMesh(Operator):
+    """Project an uploaded image onto the active mesh from the current
+    3-D viewport angle, baking the result into a new diffuse texture.
+
+    Frame the mesh in the 3-D viewport the way you want the photo to line
+    up *before* clicking this button -- the image is projected from
+    whatever angle the viewport is currently looking from, the same way
+    wrapping a photo onto whatever's facing the camera would work. Areas
+    of the mesh not visible from that angle (the back, grazing-angle
+    edges, self-occluded folds) are left blank on the new texture; use
+    'Retouch Texture' afterwards to hand-paint those areas."""
+    bl_idname = "fo4.wrap_image_onto_mesh"
+    bl_label = "Wrap Image onto Mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(
+        name="Image File",
+        description="Photo/texture to project onto the mesh",
+        subtype='FILE_PATH',
+    )
+    filter_glob: StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.tga;*.tiff;*.bmp;*.exr",
+        options={'HIDDEN'},
+    )
+    canvas_size: EnumProperty(
+        name="Canvas Size",
+        description="Resolution of the new diffuse texture that receives the projection",
+        items=[
+            ('1024', "1024 x 1024", "Smaller texture, faster to paint"),
+            ('2048', "2048 x 2048", "Good default for most meshes"),
+            ('4096', "4096 x 4096", "Highest detail, largest file"),
+        ],
+        default='2048',
+    )
+
+    def execute(self, context):
+        import os
+
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Select a mesh object first")
+            return {'CANCELLED'}
+
+        if not self.filepath or not os.path.exists(self.filepath):
+            self.report({'ERROR'}, f"Image file not found: {self.filepath}")
+            return {'CANCELLED'}
+
+        area, region = _find_view3d_area_region(context)
+        if area is None:
+            self.report(
+                {'ERROR'},
+                "No 3-D viewport is open. Open a 3-D Viewport, frame the mesh "
+                "from the angle you want, then try again."
+            )
+            return {'CANCELLED'}
+
+        from . import texture_helpers
+
+        # A UV map is required for the paint system to know where on the
+        # canvas each part of the mesh writes to. Keep an existing unwrap
+        # untouched (respect prior manual/tool work); only create one via
+        # Smart UV Project if the mesh genuinely has none yet.
+        mesh = obj.data
+        if not mesh.uv_layers:
+            prev_active = context.view_layer.objects.active
+            context.view_layer.objects.active = obj
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+            except Exception as exc:
+                self.report({'ERROR'}, f"Could not create a UV map: {exc}")
+                return {'CANCELLED'}
+            finally:
+                try:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception:
+                    pass
+                context.view_layer.objects.active = prev_active
+
+        # Load the source photo (what gets projected) separately from the
+        # blank canvas (what receives the projection) -- these must be two
+        # distinct image data-blocks.
+        try:
+            source_img = bpy.data.images.load(self.filepath, check_existing=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to load image: {exc}")
+            return {'CANCELLED'}
+        # Keep the source photo alive even though nothing wires it into a
+        # material node -- it's only referenced by name from
+        # paint.project_image and from 'Retouch Texture's clone setup, and
+        # would otherwise be silently purged as orphan data on file save.
+        source_img.use_fake_user = True
+
+        size = int(self.canvas_size)
+        canvas_name = f"{obj.name}_WrappedTexture"
+        # Reuse an existing canvas of the same name (e.g. re-running this
+        # operator to re-project from a new angle) rather than piling up
+        # duplicate '_WrappedTexture.001' images every click.
+        canvas_img = bpy.data.images.get(canvas_name)
+        if canvas_img is None or tuple(canvas_img.size) != (size, size):
+            canvas_img = bpy.data.images.new(
+                canvas_name, width=size, height=size, alpha=True
+            )
+        # Fully transparent start so anything the projection doesn't reach
+        # stays obviously blank -- a clear visual signal of what still
+        # needs a manual retouch pass, rather than silently leaving stale
+        # paint from a previous projection underneath the new one.
+        # Built as a numpy array rather than a plain Python list -- at
+        # 4096x4096 a Python list of size*size*4 float objects is on the
+        # order of a gigabyte and needlessly slow; numpy stores it as packed
+        # float32 (matches the pixel-buffer pattern already used elsewhere
+        # in this file, e.g. the vegetation AO bake's diffuse multiply).
+        import numpy as np
+        canvas_img.generated_color = (0.0, 0.0, 0.0, 0.0)
+        blank_px = np.zeros(size * size * 4, dtype=np.float32)
+        canvas_img.pixels.foreach_set(blank_px)
+        canvas_img.update()
+
+        # Ensure a FO4-compatible material with a "Diffuse" node exists,
+        # then wire the blank canvas into it -- matches the same
+        # node-name convention setup_uv_with_texture relies on.
+        if not (obj.data.materials and obj.data.materials[0] is not None
+                and obj.data.materials[0].use_nodes
+                and obj.data.materials[0].node_tree.nodes.get("Diffuse")):
+            texture_helpers.TextureHelpers.setup_fo4_material(obj)
+        mat = obj.data.materials[0]
+        diffuse_node = mat.node_tree.nodes.get("Diffuse")
+        if diffuse_node is None:
+            diffuse_node = texture_helpers.TextureHelpers._ensure_texture_slot_node(mat, "Diffuse")
+        diffuse_node.image = canvas_img
+        diffuse_node.select = True
+        mat.node_tree.nodes.active = diffuse_node
+
+        # Tell Blender's paint system to target this exact image regardless
+        # of node-graph "active" heuristics.
+        try:
+            context.scene.tool_settings.image_paint.mode = 'IMAGE'
+            context.scene.tool_settings.image_paint.canvas = canvas_img
+        except Exception:
+            pass
+
+        prev_active = context.view_layer.objects.active
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+        prev_mode = obj.mode if hasattr(obj, 'mode') else 'OBJECT'
+        try:
+            bpy.ops.object.mode_set(mode='TEXTURE_PAINT')
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not enter Texture Paint mode: {exc}")
+            context.view_layer.objects.active = prev_active
+            return {'CANCELLED'}
+
+        try:
+            with context.temp_override(area=area, region=region):
+                bpy.ops.paint.project_image(image=source_img.name)
+        except Exception as exc:
+            self.report(
+                {'ERROR'},
+                f"Projection failed: {exc}. The image is still bound as the "
+                f"Diffuse texture -- try 'Retouch Texture' to paint manually."
+            )
+            return {'CANCELLED'}
+
+        # Remember the canvas/source pair on the object so 'Retouch
+        # Texture' can find them again later without guessing.
+        obj["fo4_wrap_canvas_image"] = canvas_img.name
+        obj["fo4_wrap_source_image"] = source_img.name
+
+        msg = (
+            f"Wrapped '{os.path.basename(self.filepath)}' onto {obj.name} "
+            f"({size}x{size} canvas) from the current view. Areas not "
+            "visible from this angle are still blank -- rotate the view and "
+            "run this again, or use 'Retouch Texture' to paint them by hand."
+        )
+        self.report({'INFO'}, msg)
+        _notify(msg, 'INFO')
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class FO4_OT_RetouchWrappedTexture(Operator):
+    """Enter Texture Paint mode on the active mesh's diffuse texture with a
+    clone/soften brush ready to go, so blank or badly-projected areas left
+    by 'Wrap Image onto Mesh' can be hand-painted.
+
+    If the mesh was wrapped with 'Wrap Image onto Mesh', the original photo
+    is set up as the Clone brush's source image so you can Ctrl+Click on the
+    photo's projected area to sample from it directly. Otherwise this just
+    opens Texture Paint on whatever Diffuse texture the mesh already has."""
+    bl_idname = "fo4.retouch_wrapped_texture"
+    bl_label = "Retouch Texture"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Select a mesh object first")
+            return {'CANCELLED'}
+
+        canvas_img = None
+        canvas_name = obj.get("fo4_wrap_canvas_image")
+        if canvas_name:
+            canvas_img = bpy.data.images.get(canvas_name)
+
+        # Fall back to whatever the material's Diffuse node currently
+        # points at -- keeps this usable even on a mesh that was never run
+        # through 'Wrap Image onto Mesh' (e.g. set up via 'Setup UV +
+        # Texture' instead), as long as SOME diffuse image exists to paint.
+        if canvas_img is None and obj.data.materials and obj.data.materials[0]:
+            mat = obj.data.materials[0]
+            if mat.use_nodes:
+                diffuse_node = mat.node_tree.nodes.get("Diffuse")
+                if diffuse_node and diffuse_node.image:
+                    canvas_img = diffuse_node.image
+
+        if canvas_img is None:
+            self.report(
+                {'ERROR'},
+                "No texture found to retouch. Run 'Wrap Image onto Mesh' "
+                "first, or set up a Diffuse texture with 'Setup UV + Texture'."
+            )
+            return {'CANCELLED'}
+
+        try:
+            context.scene.tool_settings.image_paint.mode = 'IMAGE'
+            context.scene.tool_settings.image_paint.canvas = canvas_img
+        except Exception:
+            pass
+
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+        try:
+            bpy.ops.object.mode_set(mode='TEXTURE_PAINT')
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not enter Texture Paint mode: {exc}")
+            return {'CANCELLED'}
+
+        # Best-effort brush setup -- never let a brush-naming mismatch on
+        # the user's particular Blender build break entry into paint mode,
+        # which is the part that actually matters.
+        try:
+            ip = context.scene.tool_settings.image_paint
+            clone_brush = bpy.data.brushes.get("Clone")
+            if clone_brush is not None:
+                ip.brush = clone_brush
+                source_name = obj.get("fo4_wrap_source_image")
+                source_img = bpy.data.images.get(source_name) if source_name else None
+                if source_img is not None:
+                    try:
+                        ip.clone_image = source_img
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        msg = (
+            f"Texture Paint active on {obj.name} ('{canvas_img.name}'). "
+            "Clone brush selected -- Ctrl+Click to set a clone source, then "
+            "paint over blank/bad areas. Switch brushes (Soften, Smear, "
+            "Draw) from the Texture Paint tool shelf as needed."
+        )
+        self.report({'INFO'}, msg)
+        _notify(msg, 'INFO')
+        return {'FINISHED'}
 
 
 class FO4_OT_FoliageUVUnwrap(Operator):
@@ -7629,8 +8068,94 @@ class FO4_OT_VegetationAtlasUV(Operator):
         return components
 
     @staticmethod
+    def _uv_islands(bm, uv_layer, restrict_face_indices=None):
+        """Group bmesh faces into real UV islands.
+
+        BUG FIX CONTEXT: this exists because ``_orient_components_vertical``
+        used to be handed the 3-D *mesh* components (disconnected geometry,
+        from ``_mesh_components``) and treat each one as if it were exactly
+        one UV island. Those are not the same thing: Smart UV Project (Step 2,
+        when ``re_unwrap`` is on) is explicitly allowed to cut a single
+        connected 3-D piece into several separate UV islands whenever its
+        faces span more than ``angle_limit`` -- which is common for
+        retopologized/organic vegetation meshes (branches + leaves as one
+        connected piece), not just simple leaf-card billboards. Rotating by a
+        bounding box computed across *all* of a 3-D component's loops when
+        that component actually contains multiple real UV islands mixes
+        unrelated islands' UV footprints into one bogus centroid/box and
+        "rotates" a shape that was never a single island to begin with --
+        directly contradicting this operator's own docstring ("Rotates every
+        island..."). Detecting real UV islands means walking face adjacency
+        the way Smart UV Project's own cuts actually manifest: two faces
+        sharing a 3-D edge are only in the same UV island if the UV
+        coordinates at both ends of that edge agree between them (i.e. no
+        seam/cut runs along it in UV space), not just because they touch in
+        3-D.
+
+        Parameters
+        ----------
+        bm : bmesh.types.BMesh
+        uv_layer : bmesh UV loop layer
+        restrict_face_indices : iterable[int] or None
+            Only consider these faces (still correctly stops at UV cuts
+            within them); ``None`` walks the whole mesh.
+
+        Returns
+        -------
+        list[list[int]] -- one list of face indices per real UV island.
+        """
+        EPS = 1e-5
+        allowed = None if restrict_face_indices is None else set(restrict_face_indices)
+
+        def _face_vert_uv(face, vert_index):
+            for loop in face.loops:
+                if loop.vert.index == vert_index:
+                    return loop[uv_layer].uv
+            return None
+
+        faces = bm.faces if allowed is None else [bm.faces[i] for i in allowed]
+        visited = set()
+        islands = []
+        for start_face in faces:
+            if start_face.index in visited:
+                continue
+            stack = [start_face]
+            group = []
+            while stack:
+                f = stack.pop()
+                if f.index in visited:
+                    continue
+                visited.add(f.index)
+                group.append(f.index)
+                for edge in f.edges:
+                    v0, v1 = edge.verts[0].index, edge.verts[1].index
+                    uv0_f = _face_vert_uv(f, v0)
+                    uv1_f = _face_vert_uv(f, v1)
+                    if uv0_f is None or uv1_f is None:
+                        continue
+                    for other in edge.link_faces:
+                        if other.index == f.index or other.index in visited:
+                            continue
+                        if allowed is not None and other.index not in allowed:
+                            continue
+                        uv0_o = _face_vert_uv(other, v0)
+                        uv1_o = _face_vert_uv(other, v1)
+                        if uv0_o is None or uv1_o is None:
+                            continue
+                        if (uv0_f - uv0_o).length < EPS and (uv1_f - uv1_o).length < EPS:
+                            stack.append(other)
+            islands.append(group)
+        return islands
+
+    @staticmethod
     def _orient_components_vertical(mesh, components):
-        """Rotate each component's UV region 90° CCW if it is wider than tall."""
+        """Rotate each real UV island 90° CCW if it is wider than tall.
+
+        *components* (3-D connectivity groups) is only used to scope the
+        island search; the actual island membership used for the bounding
+        box / rotation comes from real UV continuity via ``_uv_islands`` --
+        see the bug-fix note there.
+        """
         import bmesh as _bmesh
         bm = _bmesh.new()
         bm.from_mesh(mesh)
@@ -7638,33 +8163,37 @@ class FO4_OT_VegetationAtlasUV(Operator):
         uv_layer = bm.loops.layers.uv.verify()
 
         rotated = 0
+        island_count = 0
         for comp_faces in components:
-            loops = [loop for fi in comp_faces for loop in bm.faces[fi].loops]
-            if not loops:
-                continue
+            islands = FO4_OT_VegetationAtlasUV._uv_islands(bm, uv_layer, comp_faces)
+            for island_faces in islands:
+                island_count += 1
+                loops = [loop for fi in island_faces for loop in bm.faces[fi].loops]
+                if not loops:
+                    continue
 
-            us = [l[uv_layer].uv.x for l in loops]
-            vs = [l[uv_layer].uv.y for l in loops]
-            min_u, max_u = min(us), max(us)
-            min_v, max_v = min(vs), max(vs)
-            width  = max_u - min_u
-            height = max_v - min_v
+                us = [l[uv_layer].uv.x for l in loops]
+                vs = [l[uv_layer].uv.y for l in loops]
+                min_u, max_u = min(us), max(us)
+                min_v, max_v = min(vs), max(vs)
+                width  = max_u - min_u
+                height = max_v - min_v
 
-            if width > height + 1e-5:
-                # Rotate 90° CCW around the island centre
-                cx = (min_u + max_u) * 0.5
-                cy = (min_v + max_v) * 0.5
-                for loop in loops:
-                    uv = loop[uv_layer].uv
-                    du = uv.x - cx
-                    dv = uv.y - cy
-                    uv.x = cx - dv
-                    uv.y = cy + du
-                rotated += 1
+                if width > height + 1e-5:
+                    # Rotate 90° CCW around the island centre
+                    cx = (min_u + max_u) * 0.5
+                    cy = (min_v + max_v) * 0.5
+                    for loop in loops:
+                        uv = loop[uv_layer].uv
+                        du = uv.x - cx
+                        dv = uv.y - cy
+                        uv.x = cx - dv
+                        uv.y = cy + du
+                    rotated += 1
 
         bm.to_mesh(mesh)
         bm.free()
-        return rotated
+        return rotated, island_count
 
     # ------------------------------------------------------------------
     # execute
@@ -7723,8 +8252,11 @@ class FO4_OT_VegetationAtlasUV(Operator):
                             pass
                     bpy.ops.object.mode_set(mode='OBJECT')
 
-            # ── Step 3: orient each component's UV region vertically ─────
-            rotated = self._orient_components_vertical(mesh, components)
+            # ── Step 3: orient each real UV island vertically ────────────
+            # (island_count may differ from `total` 3-D components -- Smart
+            # UV Project can cut one connected component into several real
+            # UV islands; see _uv_islands' bug-fix note.)
+            rotated, island_count = self._orient_components_vertical(mesh, components)
 
             # ── Step 4: normalise scale + pack ───────────────────────────
             bpy.ops.object.mode_set(mode='EDIT')
@@ -7746,7 +8278,7 @@ class FO4_OT_VegetationAtlasUV(Operator):
             context.view_layer.objects.active = prev_active
 
         msg = (
-            f"Vegetation Atlas UV: {total} islands, "
+            f"Vegetation Atlas UV: {total} mesh piece(s), {island_count} UV island(s), "
             f"{rotated} rotated vertical, packed (margin={self.margin:.3f})"
         )
         self.report({'INFO'}, msg)
@@ -7812,6 +8344,14 @@ class FO4_OT_BatchPrepareSelected(Operator):
             self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
 
+        # Remember the object that was active before this batch loop
+        # reassigns it repeatedly below -- previously only the selection was
+        # restored afterward, leaving whatever mesh happened to be last in
+        # the list as the active object regardless of what the user actually
+        # had active going in (e.g. breaking a follow-up single-object
+        # operator that reads context.active_object).
+        original_active = context.view_layer.objects.active
+
         success_count, failed_count = 0, 0
         for obj in selected_objects:
             # Isolate before calling the single-object operator so its
@@ -7833,6 +8373,11 @@ class FO4_OT_BatchPrepareSelected(Operator):
 
         for obj in selected_objects:
             obj.select_set(True)
+        if original_active is not None:
+            try:
+                context.view_layer.objects.active = original_active
+            except Exception:
+                pass
 
         self.report({'INFO'}, f"Batch prepared {success_count} object(s), {failed_count} failed")
         return {'FINISHED'}
@@ -7887,11 +8432,33 @@ class FO4_OT_BatchExportMeshes(Operator):
     )
 
     def execute(self, context):
+        import os
         if not export_helpers:
             self.report({'ERROR'}, "export_helpers module not available")
             return {'CANCELLED'}
         if not self.directory:
-            self.report({'ERROR'}, "No export directory specified")
+            # Called with no directory -- e.g. from an automation/workflow
+            # preset that invokes this operator with params={} rather than
+            # through invoke()'s file browser (see automation_system.py's
+            # 'batch_export' template). Previously this always hard-failed
+            # with "No export directory specified", so that one-click preset
+            # could never actually export anything. Fall back to
+            # <FO4 Data Folder>/Meshes, matching the prefs-then-scene lookup
+            # pattern used elsewhere in this file (e.g. NIF import's texture
+            # resolver), so the preset produces real output by default.
+            try:
+                from . import preferences as _prefs_mod
+                _p = _prefs_mod.get_preferences()
+                _gdata = (getattr(_p, "fo4_game_data_path", "") or "") if _p else ""
+                if not _gdata:
+                    _gdata = getattr(context.scene, "fo4_game_data_path", "") or ""
+            except Exception:
+                _gdata = ""
+            if _gdata:
+                self.directory = os.path.join(bpy.path.abspath(_gdata), "Meshes") + os.sep
+        if not self.directory:
+            self.report({'ERROR'}, "No export directory specified, and no FO4 Data Folder is "
+                                    "configured to fall back to (set one in the Mesh Helpers panel)")
             return {'CANCELLED'}
 
         selected_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
@@ -7904,7 +8471,15 @@ class FO4_OT_BatchExportMeshes(Operator):
 
         for obj in selected_objects:
             try:
-                filepath = f"{self.directory}/{obj.name}.nif"
+                # obj.name is not sanitized against NTFS-illegal characters --
+                # PyNifly's own "ShapeName:Index" naming convention (a real,
+                # common case, e.g. "Body:0") contains a literal colon, which
+                # NTFS treats as the Alternate Data Stream separator. An
+                # unsanitized name here silently wrote into a hidden ADS on a
+                # 0-byte visible file instead of a real .nif -- confirmed
+                # directly on a real vanilla FO4 armor export.
+                safe_name = export_helpers.ExportHelpers.safe_export_filename(obj.name)
+                filepath = f"{self.directory}/{safe_name}.nif"
                 success, message = export_helpers.ExportHelpers.export_mesh_to_nif(obj, filepath)
                 if success:
                     success_count += 1
@@ -8226,9 +8801,25 @@ class FO4_OT_ImportFO4AssetFile(Operator):
         # ~1.4% size (confirmed: a source FBX exported cleanly from Blender,
         # re-imported here, ended up ~70x too small next to its skeleton).
 
+        # bpy.ops calls don't raise when an operator declines to run -- a
+        # failed poll(), corrupt/unsupported file content, etc. all come
+        # back as {'CANCELLED'} (or even a result that isn't 'CANCELLED'
+        # either), never an exception. The three branches below used to
+        # only catch Python exceptions and otherwise unconditionally report
+        # "Imported ...: filename" + FINISHED, even when nothing was
+        # actually added to the scene -- the same silent-success trap the
+        # .nif branch just below is already hardened against via a real
+        # before/after object-count diff. Apply the same check here.
         if ext == '.fbx':
             try:
-                bpy.ops.import_scene.fbx(filepath=filepath)
+                _before = set(context.scene.objects)
+                _result = bpy.ops.import_scene.fbx(filepath=filepath)
+                _new = [o for o in context.scene.objects if o not in _before]
+                if 'CANCELLED' in set(_result or ()) or not _new:
+                    self.report({'ERROR'},
+                        f"FBX import did not add anything from {filename} "
+                        f"(result={_result!r})")
+                    return {'CANCELLED'}
                 self.report({'INFO'}, f"Imported FBX: {filename}")
                 _notify(f"Imported {filename}", 'INFO')
                 return {'FINISHED'}
@@ -8238,11 +8829,18 @@ class FO4_OT_ImportFO4AssetFile(Operator):
 
         if ext == '.obj':
             try:
+                _before = set(context.scene.objects)
                 # Blender 3.3+ uses wm.obj_import; older uses import_scene.obj
                 if hasattr(bpy.ops.wm, 'obj_import'):
-                    bpy.ops.wm.obj_import(filepath=filepath)
+                    _result = bpy.ops.wm.obj_import(filepath=filepath)
                 else:
-                    bpy.ops.import_scene.obj(filepath=filepath)
+                    _result = bpy.ops.import_scene.obj(filepath=filepath)
+                _new = [o for o in context.scene.objects if o not in _before]
+                if 'CANCELLED' in set(_result or ()) or not _new:
+                    self.report({'ERROR'},
+                        f"OBJ import did not add anything from {filename} "
+                        f"(result={_result!r})")
+                    return {'CANCELLED'}
                 self.report({'INFO'}, f"Imported OBJ: {filename}")
                 _notify(f"Imported {filename}", 'INFO')
                 return {'FINISHED'}
@@ -8253,7 +8851,14 @@ class FO4_OT_ImportFO4AssetFile(Operator):
         if ext in {'.glb', '.gltf'}:
             try:
                 if hasattr(bpy.ops.import_scene, 'gltf'):
-                    bpy.ops.import_scene.gltf(filepath=filepath)
+                    _before = set(context.scene.objects)
+                    _result = bpy.ops.import_scene.gltf(filepath=filepath)
+                    _new = [o for o in context.scene.objects if o not in _before]
+                    if 'CANCELLED' in set(_result or ()) or not _new:
+                        self.report({'ERROR'},
+                            f"GLB/GLTF import did not add anything from {filename} "
+                            f"(result={_result!r})")
+                        return {'CANCELLED'}
                     self.report({'INFO'}, f"Imported GLB/GLTF: {filename}")
                     _notify(f"Imported {filename}", 'INFO')
                     return {'FINISHED'}
@@ -8269,9 +8874,24 @@ class FO4_OT_ImportFO4AssetFile(Operator):
             if hasattr(bpy.ops, 'import_scene') and hasattr(bpy.ops.import_scene, 'pynifly'):
                 try:
                     _before = set(context.scene.objects)
-                    bpy.ops.import_scene.pynifly(filepath=filepath)
+                    _nif_result = bpy.ops.import_scene.pynifly(filepath=filepath)
                     # Collect everything PyNifly added, regardless of selection.
                     _new = [o for o in context.scene.objects if o not in _before]
+
+                    # bpy.ops calls don't raise when the operator declines to
+                    # run -- a bad/corrupt file, wrong context, etc. come
+                    # back as {'CANCELLED'}, never an exception. This was
+                    # the one branch of this operator's import formats that
+                    # never checked for that (the FBX/OBJ/GLB branches
+                    # above, and this exact PyNifly call in asset_library.py
+                    # and fo4_skeleton_helpers.py, already do) -- so a
+                    # silently declined NIF import here still reported
+                    # "Imported NIF: filename" as success.
+                    if 'CANCELLED' in set(_nif_result or ()) or not _new:
+                        self.report({'ERROR'},
+                            f"PyNifly did not import anything from {filename} "
+                            f"(result={_nif_result!r})")
+                        return {'CANCELLED'}
 
                     # PyNifly honours NIF visibility flags and may hide objects
                     # (hide_viewport / hide_set) that are tagged as initially
@@ -8782,18 +9402,38 @@ class FO4_OT_ImportUnityAsset(Operator):
         return results[0], None
 
     def _import_asset_file(self, path):
+        # bpy.ops calls don't raise when the operator declines to run (bad
+        # file, wrong context) -- they return {'CANCELLED'}, never an
+        # exception. These branches used to return True unconditionally as
+        # long as the call itself didn't throw, which would report a
+        # declined import as successful. Use a before/after object-count
+        # diff (same pattern as FO4_OT_ImportFO4AssetFile's NIF branch) to
+        # confirm something actually landed in the scene.
         ext = path.suffix.lower()
+        before = set(bpy.context.scene.objects)
+
+        def _added():
+            return [o for o in bpy.context.scene.objects if o not in before]
+
         if ext == ".fbx" and hasattr(bpy.ops.import_scene, "fbx"):
-            bpy.ops.import_scene.fbx(filepath=str(path))
+            result = bpy.ops.import_scene.fbx(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"FBX import did not add anything (result={result!r})"
             return True, "Imported FBX via Blender importer"
         if ext == ".obj" and hasattr(bpy.ops.import_scene, "obj"):
-            bpy.ops.import_scene.obj(filepath=str(path))
+            result = bpy.ops.import_scene.obj(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"OBJ import did not add anything (result={result!r})"
             return True, "Imported OBJ via Blender importer"
         if ext in (".gltf", ".glb") and hasattr(bpy.ops.import_scene, "gltf"):
-            bpy.ops.import_scene.gltf(filepath=str(path))
+            result = bpy.ops.import_scene.gltf(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"GLTF import did not add anything (result={result!r})"
             return True, "Imported GLTF via Blender importer"
         if ext == ".dae" and hasattr(bpy.ops.wm, "collada_import"):
-            bpy.ops.wm.collada_import(filepath=str(path))
+            result = bpy.ops.wm.collada_import(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"DAE import did not add anything (result={result!r})"
             return True, "Imported DAE via Blender importer"
         return False, f"Unsupported format {ext}; import manually from {path}"
 
@@ -8918,20 +9558,35 @@ class FO4_OT_ImportUnrealAsset(Operator):
         return results[0], None
 
     def _import_asset_file(self, path, asset_type: str):
+        # See FO4_OT_ImportUnityAsset._import_asset_file -- same fix, same
+        # reason: bpy.ops calls don't raise on a declined import, they
+        # return {'CANCELLED'}, so these used to report success unconditionally.
         ext = path.suffix.lower()
+        before = set(bpy.context.scene.objects)
+
+        def _added():
+            return [o for o in bpy.context.scene.objects if o not in before]
 
         # Common mesh formats
         if ext == ".fbx" and hasattr(bpy.ops.import_scene, "fbx"):
-            bpy.ops.import_scene.fbx(filepath=str(path))
+            result = bpy.ops.import_scene.fbx(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"FBX import did not add anything (result={result!r})"
             return True, "Imported FBX via Blender importer"
         if ext == ".obj" and hasattr(bpy.ops.import_scene, "obj"):
-            bpy.ops.import_scene.obj(filepath=str(path))
+            result = bpy.ops.import_scene.obj(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"OBJ import did not add anything (result={result!r})"
             return True, "Imported OBJ via Blender importer"
         if ext in (".gltf", ".glb") and hasattr(bpy.ops.import_scene, "gltf"):
-            bpy.ops.import_scene.gltf(filepath=str(path))
+            result = bpy.ops.import_scene.gltf(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"GLTF import did not add anything (result={result!r})"
             return True, "Imported GLTF via Blender importer"
         if ext == ".dae" and hasattr(bpy.ops.wm, "collada_import"):
-            bpy.ops.wm.collada_import(filepath=str(path))
+            result = bpy.ops.wm.collada_import(filepath=str(path))
+            if 'CANCELLED' in set(result or ()) or not _added():
+                return False, f"DAE import did not add anything (result={result!r})"
             return True, "Imported DAE via Blender importer"
 
         # UE-specific formats: inform user to extract first
@@ -10135,48 +10790,84 @@ class FO4_OT_ScatterVegetation(Operator):
     
     def execute(self, context):
         source_obj = context.active_object
-        
+
         if not source_obj or source_obj.type != 'MESH':
             self.report({'ERROR'}, "Select a vegetation mesh to scatter")
             return {'CANCELLED'}
-        
+
         try:
             import random
             import math
-            
+            import mathutils
+
             instances = []
-            
+
+            # BUG FIX: the original implementation placed every scattered
+            # instance in a flat disc centered on the *world origin* at a
+            # hardcoded Z=0, completely ignoring where the source object
+            # actually sits in the scene. On any real level (i.e. not a
+            # single vegetation mesh sitting exactly at 0,0,0) this made the
+            # "scattered" copies jump away from the object the user selected
+            # instead of surrounding it. Anchor the disc on the source
+            # object's own location instead.
+            origin = source_obj.location.copy()
+
+            # BUG FIX: despite the operator's own label/docstring promising
+            # to "scatter... across a surface", no surface was ever
+            # consulted -- every instance landed at a fixed height with no
+            # regard for terrain. Raycast straight down from above each
+            # scatter point and snap to whatever is hit (landscape, rocks,
+            # etc.), excluding the source object and the instances we're in
+            # the middle of creating so they can't snap onto each other.
+            # If nothing is hit, fall back to the source object's own height
+            # so behavior on a flat/empty scene is unchanged.
+            depsgraph = context.evaluated_depsgraph_get()
+            ray_height = 10000.0
+
             for i in range(self.count):
                 # Duplicate the object
                 new_obj = source_obj.copy()
                 new_obj.data = source_obj.data.copy()
                 context.collection.objects.link(new_obj)
-                
-                # Random position within radius
+
+                # Random position within radius, centered on the source object
                 angle = random.uniform(0, 2 * math.pi)
                 distance = random.uniform(0, self.radius)
-                x = math.cos(angle) * distance
-                y = math.sin(angle) * distance
-                new_obj.location = (x, y, 0)
-                
+                x = origin.x + math.cos(angle) * distance
+                y = origin.y + math.sin(angle) * distance
+                z = origin.z
+
+                ray_start = mathutils.Vector((x, y, origin.z + ray_height))
+                ray_dir = mathutils.Vector((0.0, 0.0, -1.0))
+                try:
+                    hit, hit_loc, hit_normal, hit_index, hit_obj, hit_matrix = \
+                        context.scene.ray_cast(depsgraph, ray_start, ray_dir)
+                except (RuntimeError, AttributeError):
+                    hit = False
+                if hit and hit_obj is not None and hit_obj != source_obj \
+                        and hit_obj not in instances:
+                    z = hit_loc.z
+
+                new_obj.location = (x, y, z)
+
                 # Random scale
                 if self.random_scale:
                     scale_factor = random.uniform(0.7, 1.3)
                     new_obj.scale = (scale_factor, scale_factor, scale_factor)
-                
+
                 # Random rotation (Z-axis)
                 if self.random_rotation:
                     new_obj.rotation_euler[2] = random.uniform(0, 2 * math.pi)
-                
+
                 instances.append(new_obj)
-            
+
             self.report({'INFO'}, f"Scattered {self.count} vegetation instances")
             _notify(
                 f"Scattered {self.count} instances", 'INFO'
             )
-            
+
             return {'FINISHED'}
-            
+
         except Exception as e:
             self.report({'ERROR'}, f"Failed to scatter vegetation: {str(e)}")
             return {'CANCELLED'}
@@ -10199,25 +10890,46 @@ class FO4_OT_OptimizeVegetationForFPS(Operator):
         max=65000
     )
     
+    # BUG FIX: this deletes every polygon whose normal points mostly downward
+    # on the (unrotated) assumption that "downward-facing = never seen, since
+    # the player looks down at it from above." That assumption is backwards
+    # for Fallout 4 -- an over-the-shoulder/first-person game where the
+    # camera is very often *below* foliage looking up (walking under a tree
+    # canopy, standing beneath a bush, etc). Left on by default, this punched
+    # visible holes in the underside of any vegetation mesh that has real
+    # volume (tree canopies, AI-generated/retopologized meshes), not just
+    # flat top-down billboards. It's also inert for genuinely flat leaf-card
+    # planes, since those render two-sided from a single-sided quad and have
+    # no true "downward" face to remove. Defaulted to off so the plain
+    # poly-count decimation (which is safe and always correct) is what runs
+    # unless the user explicitly opts into a heuristic that only makes sense
+    # for meshes it has actually verified are never viewed from below.
     remove_hidden_faces: BoolProperty(
-        name="Remove Hidden Faces",
-        description="Remove faces that won't be visible",
-        default=True
+        name="Remove Hidden Faces (top-down only)",
+        description=(
+            "Delete downward-facing polygons. Only safe for meshes that are "
+            "never seen from below in-game (e.g. flat overhead canopy caps) "
+            "-- for anything with real volume this creates visible holes "
+            "since Fallout 4's camera frequently looks up at foliage from "
+            "underneath"
+        ),
+        default=False
     )
-    
+
     def execute(self, context):
         obj = context.active_object
-        
+
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "No mesh object selected")
             return {'CANCELLED'}
-        
+
         try:
             import bmesh
-            
+
             original_poly_count = len(obj.data.polygons)
-            
-            # Remove hidden faces (faces pointing down for vegetation)
+
+            # Remove hidden faces (faces pointing down for vegetation) --
+            # opt-in only, see BUG FIX note on the property above.
             if self.remove_hidden_faces:
                 bpy.ops.object.mode_set(mode='EDIT')
                 bpy.ops.mesh.select_all(action='DESELECT')
@@ -10538,6 +11250,33 @@ class FO4_OT_BakeVegetationAO(Operator):
         default=True
     )
 
+    # FO4's BGSM format (version 2, confirmed empirically against the whole
+    # reference library elsewhere in this addon) has no dedicated ambient-
+    # occlusion texture slot -- there is nowhere in the exported material
+    # for a standalone AO map to go. This operator used to just bake AO into
+    # a fresh image, leave it unconnected in the shader, and never reference
+    # it from anywhere else in the codebase (confirmed by grep -- nothing
+    # else in the addon touches "AO_Bake_Target" or an "<obj>_AO" image).
+    # It "succeeded" every time while doing nothing that could ever reach
+    # the game: not wired into the viewport preview, not read by the BGSM
+    # exporter (which only looks at nodes named Diffuse/Normal/Specular/
+    # Glow/EnvMap), not applied to the diffuse texture on disk. The only
+    # way AO actually affects FO4 rendering is baked directly into the
+    # diffuse/albedo texture at the pixel level -- the standard vanilla
+    # workflow for static foliage. This applies that multiply automatically
+    # onto a new, non-destructive copy of the diffuse texture and rewires
+    # the Diffuse node to it, so both the Blender preview and the exported
+    # BGSM actually reflect the bake.
+    apply_to_diffuse: BoolProperty(
+        name="Multiply into Diffuse Texture",
+        description="FO4's material format has no separate AO texture slot -- "
+                    "without this, the bake has no effect on the game at all. "
+                    "Creates a new AO-multiplied copy of the Diffuse texture "
+                    "(the original file is left untouched) and switches the "
+                    "material to use it",
+        default=True,
+    )
+
     def execute(self, context):
         obj = context.active_object
 
@@ -10600,23 +11339,43 @@ class FO4_OT_BakeVegetationAO(Operator):
             # Restore render engine
             context.scene.render.engine = original_engine
 
-            # Optionally save the image
+            # Optionally save the raw AO image itself (useful for inspection,
+            # but see apply_to_diffuse below for what actually reaches FO4)
+            ao_save_path = None
             if self.save_image:
                 import os
                 blend_path = bpy.data.filepath
                 if blend_path:
                     save_dir = os.path.dirname(blend_path)
-                    save_path = os.path.join(save_dir, f"{image_name}.png")
-                    image.filepath_raw = save_path
+                    ao_save_path = os.path.join(save_dir, f"{image_name}.png")
+                    image.filepath_raw = ao_save_path
                     image.file_format = 'PNG'
                     image.save()
-                    self.report({'INFO'}, f"AO baked and saved: {save_path}")
                 else:
                     image.pack()
-                    self.report({'INFO'}, "AO baked and packed into .blend (save the file to keep it)")
             else:
                 image.pack()
-                self.report({'INFO'}, f"AO baked to image '{image_name}'")
+
+            applied_msg = ""
+            if self.apply_to_diffuse:
+                applied, ao_msg, new_diff_img = self._apply_ao_to_diffuse(mat, image)
+                if applied and new_diff_img is not None and self.save_image:
+                    import os as _os2
+                    blend_path = bpy.data.filepath
+                    if blend_path:
+                        save_dir = _os2.path.dirname(blend_path)
+                        diff_save_path = _os2.path.join(save_dir, f"{new_diff_img.name}.png")
+                        new_diff_img.filepath_raw = diff_save_path
+                        new_diff_img.file_format = 'PNG'
+                        new_diff_img.save()
+                    else:
+                        new_diff_img.pack()
+                applied_msg = " | " + ao_msg
+
+            if ao_save_path:
+                self.report({'INFO'}, f"AO baked and saved: {ao_save_path}{applied_msg}")
+            else:
+                self.report({'INFO'}, f"AO baked to image '{image_name}'{applied_msg}")
 
             _notify(
                 f"Ambient occlusion baked: {image_name}", 'INFO'
@@ -10635,6 +11394,80 @@ class FO4_OT_BakeVegetationAO(Operator):
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
+
+    @staticmethod
+    def _apply_ao_to_diffuse(mat, ao_image) -> tuple:
+        """Multiply *ao_image* into a new, non-destructive copy of *mat*'s
+        Diffuse texture and rewire the Diffuse node to use it.
+
+        Returns (applied: bool, message: str, new_image_or_None). This is
+        the only step that makes an AO bake actually reach FO4 -- the BGSM
+        format has no AO texture slot, so without this the bake has zero
+        effect on the exported material or the game.
+        """
+        diffuse_node = None
+        for node in mat.node_tree.nodes:
+            if (node.type == 'TEX_IMAGE' and node.image is not None
+                    and (node.name == 'Diffuse' or node.label == 'Diffuse')):
+                diffuse_node = node
+                break
+        if diffuse_node is None:
+            return False, (
+                "no 'Diffuse' texture node with a loaded image found -- "
+                "the bake was NOT applied to anything and has no effect on "
+                "export. Load a diffuse texture first, or set up the "
+                "material with 'Setup Vegetation Material'."
+            ), None
+
+        diff_img = diffuse_node.image
+        dw, dh = diff_img.size[0], diff_img.size[1]
+        if dw == 0 or dh == 0:
+            return False, (
+                "Diffuse image has no pixel data (0x0) -- bake NOT applied."
+            ), None
+
+        try:
+            import numpy as np
+        except ImportError:
+            return False, (
+                "numpy unavailable in this Blender's Python -- bake NOT "
+                "applied to the Diffuse texture (raw AO image was still "
+                "saved separately)."
+            ), None
+
+        # Pixel-align the AO bake to the diffuse texture's resolution --
+        # they're independent images (AO bake resolution is a separate
+        # dropdown from whatever size the diffuse texture actually is).
+        if (ao_image.size[0], ao_image.size[1]) != (dw, dh):
+            ao_image.scale(dw, dh)
+
+        diff_px = np.empty(dw * dh * 4, dtype=np.float32)
+        diff_img.pixels.foreach_get(diff_px)
+        ao_px = np.empty(dw * dh * 4, dtype=np.float32)
+        ao_image.pixels.foreach_get(ao_px)
+
+        diff_px = diff_px.reshape((-1, 4))
+        ao_px = ao_px.reshape((-1, 4))
+        out_px = diff_px.copy()
+        # AO bake is a grayscale value replicated across R/G/B -- use the R
+        # channel as the multiplier. Deliberately leave the diffuse alpha
+        # channel untouched: alpha drives the alpha-clip cutout on leaf
+        # cards (see FO4_OT_SetupLeafCard), and darkening it by occlusion
+        # would eat into the leaf silhouette instead of just shading it.
+        out_px[:, 0:3] = diff_px[:, 0:3] * ao_px[:, 0:1]
+
+        new_name = f"{diff_img.name}_AO"
+        if new_name in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[new_name])
+        new_img = bpy.data.images.new(new_name, width=dw, height=dh, alpha=True)
+        new_img.pixels.foreach_set(out_px.reshape(-1))
+        new_img.colorspace_settings.name = diff_img.colorspace_settings.name
+
+        diffuse_node.image = new_img
+        return True, (
+            f"AO multiplied into a new Diffuse copy '{new_name}' and wired "
+            f"into the material (original Diffuse texture file untouched)."
+        ), new_img
 
 
 class FO4_OT_SetupVegetationMaterial(Operator):
@@ -11047,7 +11880,13 @@ class FO4_OT_QuestGeneratePapyrusScript(Operator):
 
     def execute(self, context):
         try:
-            script = quest_helpers.QuestHelpers.generate_papyrus_script(self.quest_id, self.quest_name)
+            # Pass the actual stages authored in the Quest panel -- see
+            # generate_papyrus_script's docstring; previously this call
+            # site never read scene.fo4_quest_stages at all, so any stage
+            # data the user entered had zero effect on the generated script.
+            stages = getattr(context.scene, "fo4_quest_stages", None)
+            script = quest_helpers.QuestHelpers.generate_papyrus_script(
+                self.quest_id, self.quest_name, stages=stages)
 
             # Create text block in Blender
             text = bpy.data.texts.new(f"{self.quest_id}Script.psc")
@@ -11774,7 +12613,20 @@ class FO4_OT_DeletePreset(Operator):
         description="Path to preset file",
         subtype='FILE_PATH'
     )
-    
+    # The invoke_confirm dialog below only protects a manual UI click --
+    # Mossy's operator dispatcher calls bpy.ops.<id>(**params) using
+    # Blender's default EXEC_DEFAULT context, which never calls invoke() and
+    # goes straight to execute(). Gate the actual deletion on this flag too,
+    # same pattern as FO4_OT_AutoWeightArmor, so a scripted/AI call can't
+    # delete a preset with zero confirmation.
+    confirm: BoolProperty(
+        name="Confirm Delete",
+        description="Internal: set once the user (or an explicit caller) has "
+                    "confirmed the deletion",
+        default=False,
+        options={'SKIP_SAVE', 'HIDDEN'},
+    )
+
     def execute(self, context):
         if not preset_library:
             self.report({'ERROR'}, "preset_library module unavailable")
@@ -11782,18 +12634,24 @@ class FO4_OT_DeletePreset(Operator):
         if not self.filepath:
             self.report({'ERROR'}, "No preset file specified")
             return {'CANCELLED'}
+        if not self.confirm:
+            self.report({'ERROR'},
+                f"Refusing to delete '{self.filepath}' without confirmation. "
+                f"Re-run with confirm=True to proceed (e.g. params={{'confirm': True}} from Mossy).")
+            return {'CANCELLED'}
 
         success, message = preset_library.PresetLibrary.delete_preset(self.filepath)
-        
+
         if success:
             self.report({'INFO'}, message)
             _notify("Preset deleted", 'INFO')
         else:
             self.report({'ERROR'}, message)
-        
+
         return {'FINISHED'} if success else {'CANCELLED'}
-    
+
     def invoke(self, context, event):
+        self.confirm = True
         return context.window_manager.invoke_confirm(self, event)
 
 
@@ -12107,7 +12965,15 @@ class FO4_OT_DeleteMacro(Operator):
         description="Path to macro file",
         subtype='FILE_PATH'
     )
-    
+    # See FO4_OT_DeletePreset.confirm -- same Mossy-bypass gap, same fix.
+    confirm: BoolProperty(
+        name="Confirm Delete",
+        description="Internal: set once the user (or an explicit caller) has "
+                    "confirmed the deletion",
+        default=False,
+        options={'SKIP_SAVE', 'HIDDEN'},
+    )
+
     def execute(self, context):
         if not automation_system:
             self.report({'ERROR'}, "automation_system module not available")
@@ -12115,17 +12981,23 @@ class FO4_OT_DeleteMacro(Operator):
         if not self.filepath:
             self.report({'ERROR'}, "No macro file specified")
             return {'CANCELLED'}
+        if not self.confirm:
+            self.report({'ERROR'},
+                f"Refusing to delete '{self.filepath}' without confirmation. "
+                f"Re-run with confirm=True to proceed (e.g. params={{'confirm': True}} from Mossy).")
+            return {'CANCELLED'}
         success, message = automation_system.AutomationSystem.delete_macro(self.filepath)
-        
+
         if success:
             self.report({'INFO'}, message)
             _notify("Macro deleted", 'INFO')
         else:
             self.report({'ERROR'}, message)
-        
+
         return {'FINISHED'} if success else {'CANCELLED'}
-    
+
     def invoke(self, context, event):
+        self.confirm = True
         return context.window_manager.invoke_confirm(self, event)
 
 
@@ -12188,8 +13060,12 @@ class FO4_OT_ConnectDesktopApp(Operator):
             scene.fo4_desktop_server_port
         )
         
-        # Attempt connection
-        success, message = desktop_tutorial_client.DesktopTutorialClient.connect()
+        # Attempt connection. Passing context lets connect() add the
+        # user-configured port to test_connection()'s candidate list --
+        # set_server_url() above only ever set the *host* half; the port
+        # was previously always ignored since test_connection() only tried
+        # the hardcoded 21337/8080 defaults.
+        success, message = desktop_tutorial_client.DesktopTutorialClient.connect(context)
         
         if success:
             scene.fo4_desktop_connected = True
@@ -12455,15 +13331,30 @@ class FO4_OT_ClearOperationLog(Operator):
     bl_label = "Clear Operation Log"
     bl_options = {'REGISTER'}
 
+    # See FO4_OT_DeletePreset.confirm -- same Mossy-bypass gap, same fix.
+    confirm: BoolProperty(
+        name="Confirm Clear",
+        description="Internal: set once the user (or an explicit caller) has "
+                    "confirmed clearing the log",
+        default=False,
+        options={'SKIP_SAVE', 'HIDDEN'},
+    )
+
     def execute(self, context):
         if not notification_system:
             self.report({'ERROR'}, "notification_system module not available")
+            return {'CANCELLED'}
+        if not self.confirm:
+            self.report({'ERROR'},
+                "Refusing to clear the operation log without confirmation. "
+                "Re-run with confirm=True to proceed (e.g. params={'confirm': True} from Mossy).")
             return {'CANCELLED'}
         notification_system.OperationLog.clear()
         self.report({'INFO'}, "Operation log cleared")
         return {'FINISHED'}
 
     def invoke(self, context, event):
+        self.confirm = True
         return context.window_manager.invoke_confirm(self, event)
 
 
@@ -12579,7 +13470,7 @@ class FO4_OT_ImportModFolder(Operator):
                 before_objects = set(context.scene.objects)
 
                 try:
-                    bpy.ops.import_scene.pynifly(filepath=str(nif_path))
+                    _batch_nif_result = bpy.ops.import_scene.pynifly(filepath=str(nif_path))
                 except Exception as import_error:
                     self.report({'WARNING'}, f"Failed to import {nif_path.name}: {import_error}")
                     failed_count += 1
@@ -12588,6 +13479,20 @@ class FO4_OT_ImportModFolder(Operator):
                 # Find newly imported objects
                 after_objects = set(context.scene.objects)
                 new_objects = after_objects - before_objects
+
+                # bpy.ops calls don't raise when the operator declines to
+                # run -- a bad/corrupt NIF, wrong context, etc. come back as
+                # {'CANCELLED'}, never an exception, so the try/except above
+                # never caught it. Without this check, a silently declined
+                # file here still incremented imported_count below, over-
+                # reporting the "N files imported" summary for a batch that
+                # actually skipped some files.
+                if 'CANCELLED' in set(_batch_nif_result or ()) or not new_objects:
+                    self.report({'WARNING'},
+                        f"PyNifly did not import anything from {nif_path.name} "
+                        f"(result={_batch_nif_result!r})")
+                    failed_count += 1
+                    continue
 
                 # FO4 NIFs are in Havok game units (~70/metre); the single-file
                 # importer (fo4.import_fo4_asset_file) applies the same ÷70
@@ -13372,7 +14277,7 @@ class FO4_OT_SetupHDMaterial(Operator):
 
         # Build the material.
         if texture_helpers:
-            mat = texture_helpers.TextureHelpers.setup_fo4_material(obj)
+            mat = texture_helpers.TextureHelpers.setup_fo4_material(obj, force=self.replace_existing)
         else:
             # Minimal fallback – create a plain Principled BSDF material.
             mat_name = f"{obj.name}_HD_Material"
@@ -14672,14 +15577,31 @@ def _find_islands(mesh_data) -> list:
     return islands
 
 
-def _grid_decompose(obj, grid_res: int, max_pieces: int) -> list:
-    """Decompose a single-island mesh into cells of a bounding-box grid.
+def _kdtree_decompose(obj, max_pieces: int, min_verts_per_cell: int = 4) -> list:
+    """Decompose a single-island mesh into spatially tight vertex clusters.
 
-    Divides the object's bounding box into ``grid_res × grid_res × grid_res``
-    cells and returns up to ``max_pieces`` non-empty cell vertex sets.
+    Recursively bisects the LARGEST remaining cluster along its own longest
+    axis, at the MEDIAN of that cluster's vertices (not the raw bounding-box
+    midpoint), and repeats until *max_pieces* clusters exist or a cluster is
+    too small to usefully split further.
+
+    This replaces an earlier fixed-resolution bounding-box voxel grid, which
+    produced badly wrong results on sparse/organic meshes -- e.g. a cluster
+    of a few thin fungus stalks/fronds spread across a wide bounding box, with
+    mostly empty space between them. A uniform grid sized to the *whole*
+    bounding box put nearly all of those vertices in one or two cells (most
+    of the box is empty air the grid still has to allocate cells to), so
+    "decomposition" produced almost the same single oversized/loose hull as
+    no decomposition at all -- confirmed from a user screenshot showing one
+    huge hull draped loosely across an entire fungus cluster instead of
+    hugging each stalk. Splitting by median vertex position instead of raw
+    bounding-box geometry keeps every cell's *content* balanced regardless of
+    how sparsely the mesh fills its bounding box, which is the actual shape
+    of the problem for foliage/coral-type clusters.
+
+    Returns a list of vertex-index sets.
     """
     import bmesh as _bm
-    from mathutils import Vector as _V
 
     bm = _bm.new()
     bm.from_mesh(obj.data)
@@ -14689,31 +15611,31 @@ def _grid_decompose(obj, grid_res: int, max_pieces: int) -> list:
         bm.free()
         return []
 
-    # Bounding box
-    xs = [v.co.x for v in bm.verts]
-    ys = [v.co.y for v in bm.verts]
-    zs = [v.co.z for v in bm.verts]
-    bb_min = _V((min(xs), min(ys), min(zs)))
-    bb_max = _V((max(xs), max(ys), max(zs)))
-    bb_size = bb_max - bb_min
-    # Avoid division by zero on flat dimensions
-    size_x = max(bb_size.x, 1e-6)
-    size_y = max(bb_size.y, 1e-6)
-    size_z = max(bb_size.z, 1e-6)
-
-    cells: dict = {}
-    for v in bm.verts:
-        cx = min(grid_res - 1, int((v.co.x - bb_min.x) / size_x * grid_res))
-        cy = min(grid_res - 1, int((v.co.y - bb_min.y) / size_y * grid_res))
-        cz = min(grid_res - 1, int((v.co.z - bb_min.z) / size_z * grid_res))
-        key = (cx, cy, cz)
-        cells.setdefault(key, set()).add(v.index)
-
+    points = [(v.index, v.co.copy()) for v in bm.verts]
     bm.free()
 
-    # Sort by size descending, keep top max_pieces
-    sorted_cells = sorted(cells.values(), key=len, reverse=True)
-    return sorted_cells[:max_pieces]
+    def _split(cluster):
+        xs = [co.x for _, co in cluster]
+        ys = [co.y for _, co in cluster]
+        zs = [co.z for _, co in cluster]
+        spread = (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+        axis = spread.index(max(spread))
+        cluster_sorted = sorted(cluster, key=lambda t: t[1][axis])
+        mid = len(cluster_sorted) // 2
+        return cluster_sorted[:mid], cluster_sorted[mid:]
+
+    clusters = [points]
+    while len(clusters) < max_pieces:
+        clusters.sort(key=len, reverse=True)
+        largest = clusters[0]
+        if len(largest) <= min_verts_per_cell:
+            break  # every remaining cluster is already too small to split
+        left, right = _split(largest)
+        if not left or not right:
+            break  # degenerate split (e.g. many coincident verts) -- stop
+        clusters = [left, right] + clusters[1:]
+
+    return [set(idx for idx, _ in cluster) for cluster in clusters if cluster]
 
 
 class FO4_OT_GenerateMultiConvexCollision(Operator):
@@ -14725,9 +15647,11 @@ class FO4_OT_GenerateMultiConvexCollision(Operator):
     that is either too loose or blocks areas that should be walkable.
 
     This operator generates one convex-hull piece per disconnected mesh island.
-    For single-island meshes it optionally sub-divides the bounding box into a
-    grid and generates a hull per occupied cell, mimicking V-HACD decomposition
-    using only Blender's built-in bmesh tools (no external libraries required).
+    For single-island meshes (e.g. a foliage cluster whose stalks all share a
+    base mesh) it recursively splits the vertices by position -- see
+    _kdtree_decompose -- and generates a hull per resulting cluster, mimicking
+    V-HACD decomposition using only Blender's built-in bmesh tools (no
+    external libraries required).
 
     Each piece is named ``UCX_ObjectName_00``, ``UCX_ObjectName_01``, etc.,
     parented to the source object, and configured as a PASSIVE rigid body.
@@ -14741,22 +15665,15 @@ class FO4_OT_GenerateMultiConvexCollision(Operator):
         description=(
             "Maximum number of UCX_ pieces to generate. "
             "Each disconnected island produces one piece. "
-            "For single-island meshes the bounding box is divided into a grid "
-            "to produce multiple sub-hulls."
+            "For single-island meshes (e.g. a foliage/coral cluster whose "
+            "stalks all share a base mesh), the vertices are recursively "
+            "split by position -- not by the object's raw bounding box -- so "
+            "sparse, spread-out clusters still get tight per-stalk hulls "
+            "instead of one loose hull draped over the whole thing."
         ),
-        default=4,
+        default=8,
         min=1,
         max=32,
-    )
-    grid_resolution: IntProperty(
-        name="Grid Resolution",
-        description=(
-            "Grid subdivisions used when the mesh is a single island. "
-            "A resolution of 2 divides the bounding box into up to 8 cells (2×2×2)."
-        ),
-        default=2,
-        min=1,
-        max=8,
     )
 
     def execute(self, context):
@@ -14778,9 +15695,11 @@ class FO4_OT_GenerateMultiConvexCollision(Operator):
         # Find disconnected islands
         islands = _find_islands(obj.data)
 
-        # For single-island meshes use grid decomposition
+        # For single-island meshes, recursively split by vertex position
+        # (see _kdtree_decompose's docstring for why a fixed bounding-box
+        # grid produced one oversized hull on sparse/organic clusters).
         if len(islands) == 1 and self.max_pieces > 1:
-            islands = _grid_decompose(obj, self.grid_resolution, self.max_pieces)
+            islands = _kdtree_decompose(obj, self.max_pieces)
 
         # Cap at max_pieces (keep largest islands)
         if len(islands) > self.max_pieces:
@@ -15766,6 +16685,9 @@ classes = (
     # Face-selective UV unwrap
     FO4_OT_PickFacesForUnwrap,
     FO4_OT_UnwrapSelectedFaces,
+    # Image wrap + retouch (project a photo onto a mesh, then hand-paint fixes)
+    FO4_OT_WrapImageOntoMesh,
+    FO4_OT_RetouchWrappedTexture,
     # AI upscaler one-click installer
     # One-click installers for AI tools
     FO4_OT_ShowQuickReference,

@@ -6,7 +6,7 @@ A comprehensive tutorial and helper system for creating Fallout 4 mods in Blende
 bl_info = {
     "name": "Mossy Industries blender addon",
     "author": "Mossy Industries",
-    "version": (5, 3, 1),
+    "version": (5, 3, 3),
     "blender": (2, 90, 0),  # Compatible with Blender 2.90+ through 5.x
     "location": "View3D > Sidebar > Fallout 4",
     "description": (
@@ -239,6 +239,9 @@ fo4_lod_generator = _try_import("fo4_lod_generator")
 # UV validation and repair tools (flipped-island detection, pre-export fix)
 fo4_uv_tools = _try_import("fo4_uv_tools")
 
+# Interactive click-driven UV seam authoring (branch ring-seam / split-seam tools)
+fo4_seam_tools = _try_import("fo4_seam_tools")
+
 # Shared canonical bone-name constants (no operators, no register() needed)
 fo4_bone_names = _try_import("fo4_bone_names")
 
@@ -312,6 +315,7 @@ _PHASE1_MODULES = list(filter(_filter, [
     fo4_pipeline,
     fo4_lod_generator,
     fo4_uv_tools,
+    fo4_seam_tools,
     fo4_advanced_materials,
     fo4_material_browser,
     fo4_plane_thickener,
