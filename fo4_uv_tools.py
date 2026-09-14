@@ -611,13 +611,30 @@ class FO4_OT_AlignUVToTexture(Operator):
 # ---------------------------------------------------------------------------
 
 def auto_fix_uv_before_export(obj) -> List[str]:
-    """Silently fix flipped UV islands before NIF export.
+    """Report (but no longer silently mutate) flipped-looking UV islands
+    before NIF export.
 
-    Called by export_helpers._prepare_mesh_for_nif so users don't have to
-    run the repair operator manually.
+    This USED TO call fix_flipped_uv_islands() here to silently mirror any
+    UV island whose faces were majority CW-in-UV-space, on every export, with
+    no way to review or undo it first. That heuristic has repeatedly produced
+    false positives on real, previously-correct FO4 content -- confirmed on
+    2026-09-04 flipping 22 islands on Billy's GSFungusGrassHalves01 grass
+    mesh on a plain re-import -> re-export with zero edits made, corrupting a
+    texture mapping that was never actually wrong. Foliage/vegetation meshes
+    routinely and intentionally use CW-in-UV-space islands to mirror texture
+    space across seam-separated leaves/blades (this file's own island-fix
+    docstring already warned about exactly this risk) -- signed-area-majority
+    voting cannot reliably tell "genuinely flipped" apart from "intentionally
+    mirrored" for this kind of content, and this is now the *second* distinct
+    way that guess has gone wrong (see TestUvAutoFixIsSeamAware for the
+    first). Mutating the user's mesh data automatically on every single
+    export is not an acceptable failure mode for a heuristic with this
+    track record.
 
-    Returns a list of warning strings for any issues that could NOT be
-    auto-fixed (zero-area faces, out-of-bounds UVs).
+    Called by export_helpers._prepare_mesh_for_nif. Returns a list of warning
+    strings (including any flipped-island count) for the user to act on --
+    via the manual, Ctrl+Z-able "Fix Flipped UV Islands" operator -- only if
+    they actually want it applied.
     """
     warnings: List[str] = []
 
@@ -625,20 +642,9 @@ def auto_fix_uv_before_export(obj) -> List[str]:
         # No UV at all — export_helpers will create one via smart_project
         return warnings
 
-    # Fix flipped islands silently
-    try:
-        n_fixed, _ = fix_flipped_uv_islands(obj)
-        if n_fixed:
-            print(f"[UV Tools] Auto-fixed {n_fixed} flipped UV island(s) on '{obj.name}'.")
-    except Exception as e:
-        warnings.append(f"UV flip repair failed: {e}")
-
-    # Run validation — report remaining issues as warnings (don't block export)
+    # Report issues (including flipped-island counts) without touching the mesh.
     _, issues = validate_uv_for_export(obj)
-    for issue in issues:
-        # Flipped-island issues would be fixed above; only other issues land here
-        if "flipped" not in issue.lower():
-            warnings.append(issue)
+    warnings.extend(issues)
 
     return warnings
 

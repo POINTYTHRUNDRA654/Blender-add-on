@@ -3557,6 +3557,14 @@ class FO4_OT_VegetationWindSetup(Operator):
             ('TREE',        'Tree',          'Slow, heavy sway(amp=0.30, period=120)'),
             ('SHRUB_STORM', 'Shrub (Storm)', 'Aggressive sway (amp=0.24, period=55)'),
             ('TREE_STORM',  'Tree (Storm)',  'Heavy storm sway(amp=0.42, period=85)'),
+            ('KELP',        'Kelp / Seaweed (Current)',
+             'Slow, broad underwater drift (amp=0.09, period=170) -- an '
+             'approximation of ocean current, NOT a true current sim tied to '
+             'wave direction'),
+            ('CORAL_SOFT',  'Soft Coral (Current)',
+             'Subtle, gentle underwater sway for flexible coral fronds '
+             '(amp=0.08, period=140) -- rigid/stony coral should stay '
+             'static with no wind setup at all'),
         ],
         default='NONE',
     )
@@ -3583,6 +3591,20 @@ class FO4_OT_VegetationWindSetup(Operator):
             'TREE':        (0.30, 120.0),
             'SHRUB_STORM': (0.24,  55.0),
             'TREE_STORM':  (0.42,  85.0),
+            # Underwater vegetation (kelp/seaweed/soft coral) does not use a
+            # different in-engine system -- FO4's ocean/water animation is the
+            # water material/effect itself (animated normals, foam, waves),
+            # completely separate from the vertex-wind system driving grass,
+            # shrubs, and trees. The only practical way to make underwater
+            # plants gently move is to reuse this same wind-vegetation
+            # plumbing and tune it to read as a slow current: much lower
+            # amplitude and a much longer period than any above-water preset,
+            # so the plant drifts and recovers gradually instead of gusting.
+            # This is an approximation only -- FO4's wind direction/strength
+            # is global above-water environmental wind, so it will NOT
+            # automatically match the ocean's visible wave direction.
+            'KELP':        (0.09, 170.0),
+            'CORAL_SOFT':  (0.08, 140.0),
         }
         if self.preset in preset_map:
             amp, per = preset_map[self.preset]
@@ -10160,10 +10182,35 @@ class FO4_OT_AddCustomCollision(Operator):
                 obj, collision_type=self.collision_type)
             if not collision_obj:
                 raise RuntimeError("helper failed to create collision mesh")
-            self.report({'INFO'},
-                f"Created exact-mesh collision: {collision_obj.name} "
-                f"({len(collision_obj.data.polygons)} tris)")
-            _notify(f"Custom collision generated: {collision_obj.name}", 'INFO')
+            if collision_obj.get("fo4_collision_used_hull_fallback"):
+                # The exact-mesh shape couldn't be decimated under FO4's
+                # hard 255-vertex Havok mesh-shape limit, so the helper
+                # silently sealed it into a convex hull instead -- exactly
+                # what this button exists to avoid. Report a warning
+                # (not a plain success) so the user knows why doors/
+                # windows/openings just vanished, and knows a better tool
+                # exists for this case.
+                self.report(
+                    {'WARNING'},
+                    f"'{obj.name}' is too detailed for an exact-mesh "
+                    f"collision (FO4's Havok mesh-shape limit is 255 "
+                    f"verts) -- fell back to a sealed convex hull, so any "
+                    f"doors/windows/openings are now closed. For a "
+                    f"building with multiple openings, try 'Generate "
+                    f"Multi-Convex Collision' instead: {collision_obj.name} "
+                    f"({len(collision_obj.data.polygons)} tris)",
+                )
+                _notify(
+                    f"Custom collision for {obj.name} fell back to a "
+                    f"convex hull (too detailed for exact-mesh) -- see "
+                    f"the report for details",
+                    'WARNING',
+                )
+            else:
+                self.report({'INFO'},
+                    f"Created exact-mesh collision: {collision_obj.name} "
+                    f"({len(collision_obj.data.polygons)} tris)")
+                _notify(f"Custom collision generated: {collision_obj.name}", 'INFO')
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Failed to generate custom collision: {str(e)}")
@@ -15514,7 +15561,11 @@ def _build_convex_piece(source_mesh, vert_indices, piece_name):
         return None
 
     result = _bm.ops.convex_hull(bm2, input=bm2.verts)
-    geom_del = result.get('geom_interior', []) + result.get('geom_unused', [])
+    # Not guaranteed disjoint -- de-dupe before the BMVert filter (same
+    # fix as mesh_helpers.py's convex-hull collision paths; real crash:
+    # "geom: found the same (BMVert/BMEdge/BMFace) used multiple times").
+    geom_del = list(dict.fromkeys(
+        result.get('geom_interior', []) + result.get('geom_unused', [])))
     v_del = [g for g in geom_del if isinstance(g, _bm.types.BMVert)]
     if v_del:
         _bm.ops.delete(bm2, geom=v_del, context='VERTS')
@@ -15541,7 +15592,8 @@ def _build_convex_piece(source_mesh, vert_indices, piece_name):
         if excess:
             _bm.ops.delete(bm2, geom=excess, context='VERTS')
         result2 = _bm.ops.convex_hull(bm2, input=bm2.verts)
-        g2 = result2.get('geom_interior', []) + result2.get('geom_unused', [])
+        g2 = list(dict.fromkeys(
+            result2.get('geom_interior', []) + result2.get('geom_unused', [])))
         v2 = [g for g in g2 if isinstance(g, _bm.types.BMVert)]
         if v2:
             _bm.ops.delete(bm2, geom=v2, context='VERTS')
@@ -17110,6 +17162,31 @@ def register():
             items=_coll_items,
             default='DEFAULT',
         )
+        # ── Kit / source-pack credit metadata ─────────────────────────────
+        # Lets a user record which purchased/downloaded Blender kit an asset
+        # came from, so exports can carry that attribution forward instead of
+        # it living only in the user's memory. Free-text on purpose: kit
+        # names, creator handles, and license terms vary too much (CC0,
+        # CC-BY 4.0, a marketplace's own EULA, "credit required, no
+        # redistribution", etc.) for a fixed enum to cover honestly.
+        bpy.types.Object.fo4_kit_name = bpy.props.StringProperty(
+            name="Kit / Pack Name",
+            description="Name of the asset kit/pack this mesh came from (e.g. "
+                        "a Blender Market nature kit). Left blank if this is "
+                        "your own original mesh.",
+            default="",
+        )
+        bpy.types.Object.fo4_kit_creator = bpy.props.StringProperty(
+            name="Creator / Author",
+            description="Name or handle of the kit's creator, for crediting in your mod",
+            default="",
+        )
+        bpy.types.Object.fo4_kit_license = bpy.props.StringProperty(
+            name="License",
+            description="License terms for this kit (e.g. 'CC-BY 4.0', 'CC0', "
+                        "or a marketplace EULA summary/URL) to include with the credit",
+            default="",
+        )
         bpy.types.Object.fo4_mesh_type = bpy.props.EnumProperty(
             name="Mesh Type",
             description="Override how this mesh is classified for NIF export. "
@@ -17470,7 +17547,8 @@ def unregister():
                 delattr(bpy.types.Scene, prop)
             except Exception:
                 pass
-    for prop in ("fo4_collision_type", "fo4_mesh_type"):
+    for prop in ("fo4_collision_type", "fo4_mesh_type",
+                 "fo4_kit_name", "fo4_kit_creator", "fo4_kit_license"):
         if hasattr(bpy.types.Object, prop):
             try:
                 delattr(bpy.types.Object, prop)

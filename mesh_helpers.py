@@ -137,7 +137,7 @@ class MeshHelpers:
         return max(0.01, min(0.95, min(ratio_v, ratio_t)))
 
     @staticmethod
-    def _enforce_vert_limit(collision_obj, limit: int = 255) -> None:
+    def _enforce_vert_limit(collision_obj, limit: int = 255) -> bool:
         """Decimate *collision_obj* in place until BOTH its vertex count
         and its triangle count are at or below *limit*, verifying after
         each pass rather than trusting a single ratio-based Decimate to
@@ -155,6 +155,15 @@ class MeshHelpers:
         aims comfortably under the limit and loops a bounded number of
         times, verifying the real counts each time, rather than assuming
         one pass was enough.
+
+        Returns True if the mesh still exceeded *limit* after every
+        decimation attempt and had to fall back to a sealed convex hull
+        (see the "Final safety net" below) -- False if the exact-copy
+        shape (openings intact) was kept throughout. Callers that promise
+        "no convex hull" (add_custom_collision's whole reason to exist)
+        need this to know their promise was silently broken for a given
+        mesh, rather than reporting success while quietly handing back a
+        sealed hull with every doorway/window closed.
         """
         margin = max(1, limit // 25)  # ~4% headroom absorbs decimate overshoot
         target = max(4, limit - margin)
@@ -266,6 +275,8 @@ class MeshHelpers:
         # an exact copy that can't export at all.
         if len(collision_obj.data.vertices) > limit or len(collision_obj.data.polygons) > limit:
             MeshHelpers._enforce_vert_limit_hull(collision_obj, limit=limit)
+            return True
+        return False
 
     @staticmethod
     def _enforce_vert_limit_hull(collision_obj, limit: int = 255) -> None:
@@ -293,7 +304,14 @@ class MeshHelpers:
             bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
             bm.verts.ensure_lookup_table()
             hull = bmesh.ops.convex_hull(bm, input=bm.verts)
-            to_del = hull.get('geom_interior', []) + hull.get('geom_unused', [])
+            # geom_interior and geom_unused are not guaranteed disjoint --
+            # confirmed via a real crash report ("geom: found the same
+            # (BMVert/BMEdge/BMFace) used multiple times") once an element
+            # showed up in both. dict.fromkeys() de-dupes while preserving
+            # order (BMesh elements are hashable by identity) before the
+            # BMVert filter, so bmesh.ops.delete never sees a repeat.
+            to_del = list(dict.fromkeys(
+                hull.get('geom_interior', []) + hull.get('geom_unused', [])))
             v_del = [g for g in to_del if isinstance(g, bmesh.types.BMVert)]
             if v_del:
                 bmesh.ops.delete(bm, geom=v_del, context='VERTS')
@@ -1320,7 +1338,13 @@ class MeshHelpers:
         # bmesh.ops.delete with context='VERTS' only processes BMVert objects
         # and silently ignores BMEdge/BMFace entries, so filter explicitly to
         # avoid leaving orphaned interior faces that would corrupt the shape.
-        geom_to_delete = result.get('geom_interior', []) + result.get('geom_unused', [])
+        # The two lists are not guaranteed disjoint -- confirmed via a real
+        # crash ("geom: found the same (BMVert/BMEdge/BMFace) used multiple
+        # times") once an element appeared in both -- so de-dupe with
+        # dict.fromkeys() (order-preserving, BMesh elements hash by
+        # identity) before filtering to BMVert.
+        geom_to_delete = list(dict.fromkeys(
+            result.get('geom_interior', []) + result.get('geom_unused', [])))
         verts_to_del = [g for g in geom_to_delete if isinstance(g, bmesh.types.BMVert)]
         if verts_to_del:
             bmesh.ops.delete(bm, geom=verts_to_del, context='VERTS')
@@ -1547,8 +1571,18 @@ class MeshHelpers:
         # real openings (cave mouths, doorways -- the whole reason to use
         # this function over add_collision_mesh) than falling back to a
         # sealed convex hull would be, and this only engages for meshes
-        # detailed enough to actually need it.
-        MeshHelpers._enforce_vert_limit(collision_obj, limit=255)
+        # detailed enough to actually need it. IMPORTANT: for anything as
+        # detailed as a real building (multiple doors/windows/trim pieces),
+        # "detailed enough to actually need it" is the common case, not an
+        # edge case -- 255 verts is a very low ceiling. When decimation
+        # can't converge under it in time, this silently falls back to a
+        # sealed convex hull (see _enforce_vert_limit_hull), which defeats
+        # the entire point of this function (exact shape, openings kept
+        # open) with nothing telling the caller it happened. Recorded here
+        # so FO4_OT_AddCustomCollision can warn the user instead of
+        # reporting a plain success for what is now just a hull.
+        used_hull_fallback = MeshHelpers._enforce_vert_limit(collision_obj, limit=255)
+        collision_obj["fo4_collision_used_hull_fallback"] = used_hull_fallback
 
         collision_obj.parent = obj
         collision_obj.matrix_parent_inverse = obj.matrix_world.inverted()
@@ -1713,7 +1747,11 @@ class MeshHelpers:
 
         # Build convex hull – always produces a closed, manifold surface.
         result = bmesh.ops.convex_hull(bm, input=bm.verts)
-        geom_to_delete = result.get('geom_interior', []) + result.get('geom_unused', [])
+        # Not guaranteed disjoint -- de-dupe before the BMVert filter (see
+        # the matching fix/comment above) to avoid a real crash:
+        # "geom: found the same (BMVert/BMEdge/BMFace) used multiple times".
+        geom_to_delete = list(dict.fromkeys(
+            result.get('geom_interior', []) + result.get('geom_unused', [])))
         verts_to_del = [g for g in geom_to_delete if isinstance(g, bmesh.types.BMVert)]
         if verts_to_del:
             bmesh.ops.delete(bm, geom=verts_to_del, context='VERTS')
@@ -2274,7 +2312,12 @@ class MeshHelpers:
             bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
             bm.verts.ensure_lookup_table()
             result = bmesh.ops.convex_hull(bm, input=bm.verts)
-            del_geom = result.get('geom_interior', []) + result.get('geom_unused', [])
+            # Not guaranteed disjoint -- de-dupe before the BMVert filter,
+            # same fix as the other convex-hull collision paths in this
+            # file (real crash: "geom: found the same (BMVert/BMEdge/
+            # BMFace) used multiple times").
+            del_geom = list(dict.fromkeys(
+                result.get('geom_interior', []) + result.get('geom_unused', [])))
             del_verts = [g for g in del_geom if isinstance(g, bmesh.types.BMVert)]
             if del_verts:
                 bmesh.ops.delete(bm, geom=del_verts, context='VERTS')
