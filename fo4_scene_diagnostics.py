@@ -701,85 +701,86 @@ class SceneDiagnostics:
             ))
             return results
 
-        mat = obj.data.materials[0]
-        if mat is None:
+        mats = [m for m in obj.data.materials if m is not None]
+        if not mats:
             results.append(CheckResult(
                 ERROR, "MATERIAL",
-                "First material slot is empty.",
+                "All material slots are empty.",
             ))
             return results
 
-        results.append(CheckResult(OK, "MATERIAL", f"Material '{mat.name}' assigned"))
+        for mat in mats:
+            results.append(CheckResult(OK, "MATERIAL", f"Material '{mat.name}' assigned"))
 
-        # Uses nodes?
-        if not mat.use_nodes:
-            results.append(CheckResult(
-                ERROR, "MATERIAL",
-                f"Material '{mat.name}' does not use nodes. "
-                "PyNifly requires node-based materials.",
-            ))
-            return results
-
-        results.append(CheckResult(OK, "MATERIAL", "Material uses nodes"))
-
-        # Standard texture nodes
-        # Check for both naming conventions:
-        # - Niftools format: Image Texture node with label/name "Diffuse" / "Normal" / etc.
-        # - PyNifly import format: Image Texture connected to Principled BSDF sockets
-        node_names = {n.label or n.name for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE'}
-
-        def _bsdf_socket_has_image(socket_name):
-            """Return True if a Principled BSDF input socket has an Image Texture wired to it."""
-            for node in mat.node_tree.nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    sock = node.inputs.get(socket_name)
-                    if sock and sock.links:
-                        from_node = sock.links[0].from_node
-                        if from_node.type == 'TEX_IMAGE':
-                            return True
-            return False
-
-        for slot_name, aliases, bsdf_socket, severity in [
-            ("Diffuse",  {"Diffuse", "Base"},  "Base Color", ERROR),
-            ("Normal",   {"Normal"},           "Normal",     WARNING),
-            ("Specular", {"Specular", "Spec"}, "Specular",   WARNING),
-        ]:
-            has_named = bool(node_names & aliases)
-            has_bsdf  = _bsdf_socket_has_image(bsdf_socket)
-            if has_named:
-                results.append(CheckResult(OK, "MATERIAL", f"'{slot_name}' texture node present"))
-            elif has_bsdf:
-                results.append(CheckResult(OK, "MATERIAL",
-                    f"'{slot_name}' texture connected to Principled BSDF (PyNifly format — OK)"))
-            else:
-                results.append(CheckResult(severity, "MATERIAL",
-                    f"'{slot_name}' texture not connected – will be missing in exported NIF"))
-
-        # Diffuse texture actually loaded? (supports both naming conventions)
-        diffuse_node = None
-        for node in mat.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and (
-                node.label in {"Diffuse", "Base"} or node.name in {"Diffuse", "Base"}
-            ):
-                diffuse_node = node
-                break
-        if diffuse_node is None:
-            # PyNifly format: Image Texture wired to BSDF Base Color
-            for node in mat.node_tree.nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    sock = node.inputs.get("Base Color")
-                    if sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE':
-                        diffuse_node = sock.links[0].from_node
-                        break
-        if diffuse_node is not None:
-            if diffuse_node.image:
-                results.append(CheckResult(OK, "MATERIAL", "Diffuse texture image loaded"))
-            else:
+            # Uses nodes?
+            if not mat.use_nodes:
                 results.append(CheckResult(
-                    WARNING, "MATERIAL",
-                    "Diffuse texture node has no image – "
-                    "object will be invisible in-game without a texture",
+                    ERROR, "MATERIAL",
+                    f"Material '{mat.name}' does not use nodes. "
+                    "PyNifly requires node-based materials.",
                 ))
+                continue
+
+            results.append(CheckResult(OK, "MATERIAL", f"Material '{mat.name}' uses nodes"))
+
+            # Standard texture nodes
+            # Check for both naming conventions:
+            # - Niftools format: Image Texture node with label/name "Diffuse" / "Normal" / etc.
+            # - PyNifly import format: Image Texture connected to Principled BSDF sockets
+            node_names = {n.label or n.name for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE'}
+
+            def _bsdf_socket_has_image(socket_name, mat=mat):
+                """Return True if a Principled BSDF input socket has an Image Texture wired to it."""
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        sock = node.inputs.get(socket_name)
+                        if sock and sock.links:
+                            from_node = sock.links[0].from_node
+                            if from_node.type == 'TEX_IMAGE':
+                                return True
+                return False
+
+            for slot_name, aliases, bsdf_socket, severity in [
+                ("Diffuse",  {"Diffuse", "Base"},  "Base Color", ERROR),
+                ("Normal",   {"Normal"},           "Normal",     WARNING),
+                ("Specular", {"Specular", "Spec"}, "Specular",   WARNING),
+            ]:
+                has_named = bool(node_names & aliases)
+                has_bsdf  = _bsdf_socket_has_image(bsdf_socket)
+                if has_named:
+                    results.append(CheckResult(OK, "MATERIAL", f"'{mat.name}': '{slot_name}' texture node present"))
+                elif has_bsdf:
+                    results.append(CheckResult(OK, "MATERIAL",
+                        f"'{mat.name}': '{slot_name}' texture connected to Principled BSDF (PyNifly format — OK)"))
+                else:
+                    results.append(CheckResult(severity, "MATERIAL",
+                        f"'{mat.name}': '{slot_name}' texture not connected – will be missing in exported NIF"))
+
+            # Diffuse texture actually loaded? (supports both naming conventions)
+            diffuse_node = None
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and (
+                    node.label in {"Diffuse", "Base"} or node.name in {"Diffuse", "Base"}
+                ):
+                    diffuse_node = node
+                    break
+            if diffuse_node is None:
+                # PyNifly format: Image Texture wired to BSDF Base Color
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        sock = node.inputs.get("Base Color")
+                        if sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE':
+                            diffuse_node = sock.links[0].from_node
+                            break
+            if diffuse_node is not None:
+                if diffuse_node.image:
+                    results.append(CheckResult(OK, "MATERIAL", f"'{mat.name}': Diffuse texture image loaded"))
+                else:
+                    results.append(CheckResult(
+                        WARNING, "MATERIAL",
+                        f"'{mat.name}': Diffuse texture node has no image – "
+                        "object will be invisible in-game without a texture",
+                    ))
 
         return results
 

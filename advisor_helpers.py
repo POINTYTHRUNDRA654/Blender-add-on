@@ -345,26 +345,30 @@ class AdvisorHelpers:
             from . import texture_helpers as _th
             fixed = 0
             for obj in objs:
-                if not obj.data.materials or not obj.data.materials[0].use_nodes:
+                mats = [m for m in obj.data.materials if m is not None]
+                if not mats or any(not m.use_nodes for m in mats):
                     _th.TextureHelpers.setup_fo4_material(obj)
                     fixed += 1
                 else:
-                    mat   = obj.data.materials[0]
-                    nodes = mat.node_tree.nodes
-                    # Check for PyNifly import format: Image Texture → BSDF Base Color.
-                    # These materials are valid for export even without named "Diffuse" nodes.
-                    has_pynifly_diffuse = any(
-                        n.type == 'BSDF_PRINCIPLED'
-                        and n.inputs.get('Base Color')
-                        and n.inputs['Base Color'].links
-                        and n.inputs['Base Color'].links[0].from_node.type == 'TEX_IMAGE'
-                        for n in nodes
-                    )
-                    if has_pynifly_diffuse:
-                        continue  # textures already connected — don't replace the material
-                    missing = [n for n in ("Diffuse", "Normal", "Specular")
-                               if not nodes.get(n)]
-                    if missing:
+                    needs_setup = False
+                    for mat in mats:
+                        nodes = mat.node_tree.nodes
+                        # Check for PyNifly import format: Image Texture → BSDF Base Color.
+                        # These materials are valid for export even without named "Diffuse" nodes.
+                        has_pynifly_diffuse = any(
+                            n.type == 'BSDF_PRINCIPLED'
+                            and n.inputs.get('Base Color')
+                            and n.inputs['Base Color'].links
+                            and n.inputs['Base Color'].links[0].from_node.type == 'TEX_IMAGE'
+                            for n in nodes
+                        )
+                        if has_pynifly_diffuse:
+                            continue  # textures already connected — don't replace this material
+                        missing = [n for n in ("Diffuse", "Normal", "Specular")
+                                   if not nodes.get(n)]
+                        if missing:
+                            needs_setup = True
+                    if needs_setup:
                         _th.TextureHelpers.setup_fo4_material(obj)
                         fixed += 1
             if fixed:
@@ -538,7 +542,7 @@ class AdvisorHelpers:
             result["suggestions"].append("Press Ctrl+A → Apply Scale before export.")
 
         # --- Material + texture status ----------------------------------------
-        if not obj.data.materials or obj.data.materials[0] is None:
+        if not obj.data.materials or obj.active_material is None:
             result["material_status"]["has_material"] = False
             result["issues"].append(
                 "No material assigned. FO4 meshes need a BGSM-compatible material with textures."
@@ -549,7 +553,7 @@ class AdvisorHelpers:
             )
             return result
 
-        mat = obj.data.materials[0]
+        mat = obj.active_material
         result["material_status"]["has_material"] = True
         result["material_status"]["name"] = mat.name
         result["material_status"]["uses_nodes"] = mat.use_nodes

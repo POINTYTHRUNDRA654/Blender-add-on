@@ -2059,21 +2059,22 @@ class MeshHelpers:
         # 4. Ensure the object has a FO4-compatible material
         # ------------------------------------------------------------------
         def _has_fo4_compatible_material(o):
-            if not (o.data.materials and o.data.materials[0] is not None):
+            mats = [m for m in o.data.materials if m is not None]
+            if not mats:
                 return False
-            m = o.data.materials[0]
-            if not m.use_nodes:
-                return False
-            nodes = m.node_tree.nodes
-            # Named-node format ("Diffuse" / "Base")
-            if nodes.get("Diffuse") or nodes.get("Base"):
-                return True
-            # PyNifly import format: Image Texture → Principled BSDF Base Color
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    sock = node.inputs.get('Base Color')
-                    if sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE':
-                        return True
+            for m in mats:
+                if not m.use_nodes:
+                    continue
+                nodes = m.node_tree.nodes
+                # Named-node format ("Diffuse" / "Base")
+                if nodes.get("Diffuse") or nodes.get("Base"):
+                    return True
+                # PyNifly import format: Image Texture → Principled BSDF Base Color
+                for node in nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        sock = node.inputs.get('Base Color')
+                        if sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE':
+                            return True
             return False
 
         if not _has_fo4_compatible_material(obj):

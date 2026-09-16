@@ -2411,7 +2411,11 @@ class FO4_OT_AutoConnectArmorTextures(Operator):
         if mat is None:
             mat = bpy.data.materials.new(name=obj.name + "_MAT")
             if obj.data.materials:
-                obj.data.materials[0] = mat
+                idx = obj.active_material_index
+                if not (0 <= idx < len(obj.data.materials)):
+                    idx = 0
+                obj.data.materials[idx] = mat
+                obj.active_material_index = idx
             else:
                 obj.data.materials.append(mat)
 
@@ -2866,26 +2870,28 @@ class FO4_OT_SetupTextures(Operator):
 
         # If the object already has a material with a diffuse texture wired up
         # (either PyNifly import format or named-node format) don't replace it.
-        existing = obj.data.materials[0] if obj.data.materials else None
-        if existing and existing.use_nodes:
-            nodes = existing.node_tree.nodes
-            has_texture = False
-            for node in nodes:
+        # Checked across ALL material slots, not just slot 0 -- a multi-material
+        # object may have its textured material in any slot.
+        def _slot_has_texture(mat):
+            if not (mat and mat.use_nodes and mat.node_tree):
+                return False
+            for node in mat.node_tree.nodes:
                 if node.type == 'BSDF_PRINCIPLED':
                     sock = node.inputs.get('Base Color')
                     if sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE':
-                        has_texture = True
-                        break
+                        return True
                 if node.type == 'TEX_IMAGE' and (
                     node.name in {'Diffuse', 'Base'} or node.label in {'Diffuse', 'Base'}
                 ):
-                    has_texture = True
-                    break
-            if has_texture:
-                self.report({'INFO'},
-                    f"'{existing.name}' already has a diffuse texture — skipped. "
-                    "Delete the existing material first if you want a fresh one.")
-                return {'FINISHED'}
+                    return True
+            return False
+
+        existing_mats = [m for m in obj.data.materials if m is not None]
+        if existing_mats and all(_slot_has_texture(m) for m in existing_mats):
+            self.report({'INFO'},
+                f"'{obj.name}' already has diffuse textures on all material slots — skipped. "
+                "Delete the existing material(s) first if you want fresh ones.")
+            return {'FINISHED'}
 
         try:
             mat = texture_helpers.TextureHelpers.setup_fo4_material(obj)
@@ -3885,7 +3891,11 @@ class FO4_OT_SetupLeafCard(Operator):
         links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
 
         if obj.data.materials:
-            obj.data.materials[0] = mat
+            idx = obj.active_material_index
+            if not (0 <= idx < len(obj.data.materials)):
+                idx = 0
+            obj.data.materials[idx] = mat
+            obj.active_material_index = idx
         else:
             obj.data.materials.append(mat)
         steps.append("Alpha-clip leaf material set up")
@@ -7010,13 +7020,14 @@ class FO4_OT_HybridUnwrap(Operator):
         # 'Rebake Texture to New UV' can project the old texture onto the
         # new layout.  Only do this when a texture is actually installed.
         has_texture = False
-        if obj.data.materials:
-            mat = obj.data.materials[0]
+        for mat in obj.data.materials:
             if mat and mat.use_nodes:
                 for node in mat.node_tree.nodes:
                     if node.type == 'TEX_IMAGE' and node.image:
                         has_texture = True
                         break
+            if has_texture:
+                break
 
         src_uv_name = None
         if has_texture and obj.data.uv_layers:
@@ -7155,7 +7166,7 @@ class FO4_OT_RebakeTextureToNewUV(Operator):
     def invoke(self, context, event):
         obj = context.active_object
         if obj and obj.data.materials:
-            mat = obj.data.materials[0]
+            mat = obj.active_material or obj.data.materials[0]
             if mat and mat.use_nodes:
                 for node in mat.node_tree.nodes:
                     if node.type == 'TEX_IMAGE' and node.image:
@@ -7197,7 +7208,7 @@ class FO4_OT_RebakeTextureToNewUV(Operator):
         if not obj.data.materials:
             self.report({'ERROR'}, "Object has no material.")
             return {'CANCELLED'}
-        mat = obj.data.materials[0]
+        mat = obj.active_material or obj.data.materials[0]
         if not mat or not mat.use_nodes:
             self.report({'ERROR'}, "Material does not use nodes.")
             return {'CANCELLED'}
@@ -7594,11 +7605,12 @@ class FO4_OT_WrapImageOntoMesh(Operator):
         # Ensure a FO4-compatible material with a "Diffuse" node exists,
         # then wire the blank canvas into it -- matches the same
         # node-name convention setup_uv_with_texture relies on.
-        if not (obj.data.materials and obj.data.materials[0] is not None
-                and obj.data.materials[0].use_nodes
-                and obj.data.materials[0].node_tree.nodes.get("Diffuse")):
+        active_mat = obj.active_material
+        if not (active_mat is not None
+                and active_mat.use_nodes
+                and active_mat.node_tree.nodes.get("Diffuse")):
             texture_helpers.TextureHelpers.setup_fo4_material(obj)
-        mat = obj.data.materials[0]
+        mat = obj.active_material or (obj.data.materials[0] if obj.data.materials else None)
         diffuse_node = mat.node_tree.nodes.get("Diffuse")
         if diffuse_node is None:
             diffuse_node = texture_helpers.TextureHelpers._ensure_texture_slot_node(mat, "Diffuse")
@@ -7684,8 +7696,8 @@ class FO4_OT_RetouchWrappedTexture(Operator):
         # points at -- keeps this usable even on a mesh that was never run
         # through 'Wrap Image onto Mesh' (e.g. set up via 'Setup UV +
         # Texture' instead), as long as SOME diffuse image exists to paint.
-        if canvas_img is None and obj.data.materials and obj.data.materials[0]:
-            mat = obj.data.materials[0]
+        if canvas_img is None and obj.active_material:
+            mat = obj.active_material
             if mat.use_nodes:
                 diffuse_node = mat.node_tree.nodes.get("Diffuse")
                 if diffuse_node and diffuse_node.image:
@@ -9005,7 +9017,7 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                 # Attach to the active object's material if one exists
                 obj = context.active_object
                 if obj and obj.type == 'MESH' and obj.data.materials:
-                    mat = obj.data.materials[0]
+                    mat = obj.active_material or obj.data.materials[0]
                     if mat and mat.use_nodes:
                         nodes = mat.node_tree.nodes
                         # Look for an existing Image Texture node to replace, or add one
@@ -11363,7 +11375,7 @@ class FO4_OT_BakeVegetationAO(Operator):
                 mat = bpy.data.materials.new(name=f"{obj.name}_AO_Material")
                 obj.data.materials.append(mat)
 
-            mat = obj.data.materials[0]
+            mat = obj.active_material or obj.data.materials[0]
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
 
@@ -13932,7 +13944,7 @@ class FO4_OT_ApplyCoreMaterialProfile(Operator):
                     if not ok:
                         errors.append(f"{obj.name}: failed to apply wet profile base")
                         continue
-                    mat = obj.data.materials[0] if obj.data.materials else None
+                    mat = obj.active_material
                     self._set_bsdf_defaults(mat, roughness=0.08, metallic=0.0, emission=0.0)
                     if mat:
                         mat["fo4_shader_type"] = "envmap"
@@ -13941,13 +13953,13 @@ class FO4_OT_ApplyCoreMaterialProfile(Operator):
                     if not ok:
                         errors.append(f"{obj.name}: failed to apply metal profile")
                         continue
-                    mat = obj.data.materials[0] if obj.data.materials else None
+                    mat = obj.active_material
                 else:  # SKIN
                     ok, _ = fo4_material_browser.MaterialBrowser.apply_preset(obj, "HUMAN_SKIN")
                     if not ok:
                         errors.append(f"{obj.name}: failed to apply skin profile")
                         continue
-                    mat = obj.data.materials[0] if obj.data.materials else None
+                    mat = obj.active_material
 
                 if mat:
                     mat["fo4_core_profile"] = self.profile.lower()
@@ -14343,7 +14355,11 @@ class FO4_OT_SetupHDMaterial(Operator):
             mat = bpy.data.materials.new(name=mat_name)
             mat.use_nodes = True
             if obj.data.materials:
-                obj.data.materials[0] = mat
+                idx = obj.active_material_index
+                if not (0 <= idx < len(obj.data.materials)):
+                    idx = 0
+                obj.data.materials[idx] = mat
+                obj.active_material_index = idx
             else:
                 obj.data.materials.append(mat)
 
@@ -16102,7 +16118,7 @@ class FO4_OT_SetupGlowingPlantMaterial(Operator):
             self.report({'ERROR'}, msg)
             return {'CANCELLED'}
 
-        mat = obj.data.materials[0] if obj.data.materials else None
+        mat = obj.active_material
         if mat and mat.use_nodes:
             pbsdf = next(
                 (n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'),
@@ -16229,7 +16245,7 @@ class FO4_OT_SetupGlowingPlantBGEM(Operator):
             self.report({'ERROR'}, msg)
             return {'CANCELLED'}
 
-        mat = obj.data.materials[0] if obj.data.materials else None
+        mat = obj.active_material
         if mat and mat.use_nodes:
             pbsdf = next(
                 (n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'),

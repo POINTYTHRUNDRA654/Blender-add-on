@@ -174,12 +174,18 @@ class TextureHelpers:
         if metallic_input:
             links.new(env_tex.outputs['Color'], metallic_input)
         
-        # Assign material to object
+        # Assign material to object (respect the active slot rather than
+        # always overwriting slot 0, so multi-material objects don't lose
+        # an unrelated material in another slot)
         if obj.data.materials:
-            obj.data.materials[0] = mat
+            idx = obj.active_material_index
+            if not (0 <= idx < len(obj.data.materials)):
+                idx = 0
+            obj.data.materials[idx] = mat
+            obj.active_material_index = idx
         else:
             obj.data.materials.append(mat)
-        
+
         return mat
     
     @staticmethod
@@ -211,7 +217,7 @@ class TextureHelpers:
                     return True
             return False
 
-        existing = obj.data.materials[0] if obj.data.materials else None
+        existing = obj.active_material
         if _has_diffuse(existing):
             mat = existing
         else:
@@ -418,7 +424,7 @@ class TextureHelpers:
         if not obj.data.materials:
             mat = bpy.data.materials.new(name=f"{obj.name}_FO4_Material")
             obj.data.materials.append(mat)
-        mat = obj.data.materials[0]
+        mat = obj.active_material or obj.data.materials[0]
         mat.use_nodes = True
 
         # Auto-detect type from filename suffix if caller left it at the default
@@ -555,11 +561,11 @@ class TextureHelpers:
         """Validate textures for Fallout 4 compatibility"""
         issues = []
 
-        if not obj.data.materials:
+        if not obj.data.materials or obj.active_material is None:
             issues.append("Object has no materials")
             return False, issues
 
-        mat = obj.data.materials[0]
+        mat = obj.active_material
 
         if not mat.use_nodes:
             issues.append("Material does not use nodes")

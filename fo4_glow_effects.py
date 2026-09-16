@@ -148,8 +148,11 @@ def _get_target_material(obj) -> bpy.types.Material:
 
     Only creates a new (empty) material if the object genuinely has none.
     """
-    if obj.material_slots and obj.material_slots[0].material:
-        mat = obj.material_slots[0].material
+    idx = obj.active_material_index
+    if not (0 <= idx < len(obj.material_slots)):
+        idx = 0
+    if obj.material_slots and obj.material_slots[idx].material:
+        mat = obj.material_slots[idx].material
         mat.use_nodes = True
         return mat
     mat = bpy.data.materials.new((obj.name or "FO4_Glow") + "_mat")
@@ -157,7 +160,7 @@ def _get_target_material(obj) -> bpy.types.Material:
     if not obj.data.materials:
         obj.data.materials.append(mat)
     else:
-        obj.material_slots[0].material = mat
+        obj.material_slots[idx].material = mat
     return mat
 
 
@@ -583,7 +586,10 @@ def bake_glow_map_sequence(obj, output_dir: str,
     img.file_format  = 'PNG'
 
     # Add image texture node to material for baking target
-    mat = obj.material_slots[0].material if obj.material_slots else None
+    idx = obj.active_material_index
+    if not (0 <= idx < len(obj.material_slots)):
+        idx = 0
+    mat = obj.material_slots[idx].material if obj.material_slots else None
     if not mat:
         return []
 

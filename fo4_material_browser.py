@@ -518,9 +518,15 @@ class MaterialBrowser:
         try:
             mat = MaterialBrowser._build_material(obj.name, preset, preset_id)
 
-            # Apply to the first material slot (or create one)
+            # Apply to the active material slot (or create one) so callers
+            # that read back via obj.active_material after apply_preset()
+            # see the material that was actually written.
             if obj.data.materials:
-                obj.data.materials[0] = mat
+                idx = obj.active_material_index
+                if not (0 <= idx < len(obj.data.materials)):
+                    idx = 0
+                obj.data.materials[idx] = mat
+                obj.active_material_index = idx
             else:
                 obj.data.materials.append(mat)
 
