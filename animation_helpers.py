@@ -1116,11 +1116,24 @@ class AnimationHelpers:
         except Exception as exc:
             print(f"[AnimationHelpers] Could not write 'VERTEX_ALPHA': {exc}")
 
-        # Also write attr_name ("Col") as a white tint + alpha=weight, kept for
-        # Blender-side preview and as PyNifly's fallback when VERTEX_ALPHA is
-        # absent entirely.
+        # Update attr_name ("Col")'s alpha = wind weight, kept for Blender-side
+        # preview and as PyNifly's fallback when VERTEX_ALPHA is absent
+        # entirely.
+        #
+        # IMPORTANT: "Col" is not always a blank wind-authoring channel -- on
+        # a mesh that already carries real per-vertex diffuse tinting (e.g. a
+        # stock/imported FO4 asset whose pink/green/etc. coloring comes from
+        # baked vertex colors, not the diffuse texture alone), "Col" already
+        # holds that RGB data. Earlier this function unconditionally stamped
+        # (1.0, 1.0, 1.0) into every vertex's RGB here, silently erasing any
+        # pre-existing tint and turning such a mesh solid white the moment
+        # Static/No-Wind was applied. Only write a fresh white RGB when the
+        # attribute is being created for the first time (a genuinely blank,
+        # freshly-authored mesh with no color data at all); otherwise leave
+        # each vertex's existing RGB untouched and only overwrite alpha.
         try:
             ca = mesh.color_attributes.get(attr_name)
+            is_new_attr = ca is None
             if ca is None:
                 ca = mesh.color_attributes.new(
                     name=attr_name, type='FLOAT_COLOR', domain='POINT'
@@ -1128,13 +1141,21 @@ class AnimationHelpers:
             if ca.domain == 'POINT':
                 for vi in range(len(mesh.vertices)):
                     w = weights.get(vi, 0.0)
-                    ca.data[vi].color = (1.0, 1.0, 1.0, w)
+                    if is_new_attr:
+                        ca.data[vi].color = (1.0, 1.0, 1.0, w)
+                    else:
+                        r, g, b, _old_a = ca.data[vi].color
+                        ca.data[vi].color = (r, g, b, w)
             else:
                 for poly in mesh.polygons:
                     for li in poly.loop_indices:
                         vi = mesh.loops[li].vertex_index
                         w = weights.get(vi, 0.0)
-                        ca.data[li].color = (1.0, 1.0, 1.0, w)
+                        if is_new_attr:
+                            ca.data[li].color = (1.0, 1.0, 1.0, w)
+                        else:
+                            r, g, b, _old_a = ca.data[li].color
+                            ca.data[li].color = (r, g, b, w)
         except Exception as exc:
             if not wrote_alpha_map:
                 return False, f"Could not write vertex colors: {exc}"

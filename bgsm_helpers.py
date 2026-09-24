@@ -1515,6 +1515,106 @@ def _bgsm_output_path(obj, output_dir: str, mat_name: str) -> str:
     return os.path.join(output_dir, safe_name + ".bgsm")
 
 
+def bgsm_targets_from_exported_nif(filepath, meshes):
+    """Figure out the *real* .bgsm output path for each mesh in *meshes* by
+    reading the materials\\...\\X.bgsm string(s) actually baked into the
+    just-exported NIF's own shader property, instead of guessing a filename
+    from the Blender material's (often auto-generated, e.g.
+    "Flower01.0.Mat") name.
+
+    Real-world bug this fixes: the old approach wrote files like
+    "Flower01_0.Mat.bgsm" into a flat "Materials/" folder, while the NIF
+    itself asks the game for "materials\\landscape\\plants\\flower01.bgsm"
+    -- so Creation Kit/FO4 could never find them no matter what folder they
+    landed in. Reading the reference back out of the exported NIF guarantees
+    the name (and the landscape\\plants\\... subfolder) is always exactly
+    what the shape's shader is actually going to ask for, regardless of
+    where the NIF itself happens to be sitting on disk (a flat test-export
+    folder, a proper Data-folder mirror, anywhere).
+
+    Matches each reference to a mesh positionally, in file order, against
+    `meshes` filtered down to those with a material -- this pipeline only
+    ever writes one material per shape (see all_slots=False everywhere this
+    is called), so the Nth "materials\\...\\X.bgsm" string in the file
+    corresponds to the Nth materialed mesh as PyNifly wrote it out.
+
+    Returns a list of (mesh_obj, bgsm_path, texture_dir) tuples, or None if
+    the extraction can't be trusted (no NIF to read, no references found, or
+    the count doesn't line up with the mesh list) -- callers should fall
+    back to the old name-guessing behaviour in that case rather than write
+    nothing.
+    """
+    import re as _re_bt
+    import pathlib as _pl_bt
+    try:
+        with open(filepath, "rb") as _fh_bt:
+            _data_bt = _fh_bt.read()
+    except Exception:
+        return None
+    _refs_bt = _re_bt.findall(rb'materials\\[ -~]+?\.bgsm', _data_bt, _re_bt.IGNORECASE)
+    _real_meshes_bt = [m for m in meshes if m.data.materials]
+    if not _refs_bt:
+        return None
+    if len(_refs_bt) == len(_real_meshes_bt):
+        # One reference per materialed mesh, in file order -- the common
+        # case (each shape has its own distinct material).
+        _pairs_bt = list(zip(_real_meshes_bt, _refs_bt))
+    elif len(set(_refs_bt)) == 1:
+        # PyNifly dedupes identical strings into one shared string-table
+        # entry, so several shapes that legitimately use the SAME material
+        # (e.g. three collision-adjacent copies of one bush, all pointing at
+        # "materials\\landscape\\plants\\deadshrubgs.bgsm") only show up
+        # once in a raw byte scan even though every one of them needs that
+        # file written out. Apply the one reference to every materialed
+        # mesh rather than bailing out just because the raw count doesn't
+        # match -- confirmed this is exactly what happens for deadshrubgs01/
+        # deadshrubgs03/glowplant-style combined exports.
+        _pairs_bt = [(_m_bt, _refs_bt[0]) for _m_bt in _real_meshes_bt]
+    else:
+        # Multiple DIFFERENT references but a count that doesn't line up
+        # with the mesh list -- can't safely guess which shape gets which,
+        # so let the caller fall back to the old name-guessing behaviour.
+        return None
+    _parts_bt = _pl_bt.Path(filepath).resolve().parts
+    _mesh_idx_bt = next(
+        (i for i, p in enumerate(_parts_bt) if p.lower() == "meshes"), None
+    )
+    _root_bt = (
+        _pl_bt.Path(*_parts_bt[:_mesh_idx_bt]) if _mesh_idx_bt is not None
+        else _pl_bt.Path(filepath).resolve().parent
+    )
+    out = []
+    for _wm_bt, _ref_bt in _pairs_bt:
+        _rel_bt = _ref_bt.decode("ascii", "ignore")
+        _rel_parts_bt = _rel_bt.split("\\")[1:]  # drop leading "materials"
+        _bgsm_path_bt = _root_bt / "Materials" / _pl_bt.Path(*_rel_parts_bt)
+        _tex_dir_bt = _root_bt / "Textures" / _pl_bt.Path(*_rel_parts_bt[:-1])
+        out.append((_wm_bt, _bgsm_path_bt, _tex_dir_bt))
+    return out
+
+
+def export_bgsm_to_path(obj, out_path, *, is_lod: bool = False) -> tuple[bool, str]:
+    """Write *obj*'s active material's BGSM straight to an explicit
+    *out_path*, bypassing the name-guessing in :func:`export_bgsm_for_object`
+    / :func:`_bgsm_output_path`. Used by :func:`bgsm_targets_from_exported_nif`
+    callers once the real target path is already known."""
+    if obj is None or obj.type != 'MESH' or not obj.data.materials:
+        return (False, f"'{getattr(obj, 'name', obj)}' has no material slots")
+    mat = obj.data.materials[0]
+    if mat is None:
+        return (False, "Empty material slot skipped")
+    try:
+        import os as _os_bt
+        _os_bt.makedirs(_os_bt.path.dirname(str(out_path)), exist_ok=True)
+        bgsm_data = blender_mat_to_bgsm(mat, is_lod=is_lod)
+        raw = write_bgsm(bgsm_data)
+        with open(out_path, "wb") as fh:
+            fh.write(raw)
+        return (True, f"Exported '{mat.name}' -> {out_path}")
+    except Exception as exc:
+        return (False, f"Failed to export '{mat.name}': {exc}")
+
+
 def export_bgsm_for_object(
     obj,
     output_dir: str,
@@ -1558,6 +1658,35 @@ def export_bgsm_for_object(
             results.append((False, f"Failed to export '{mat.name}': {exc}"))
 
     return results
+
+
+def _game_relative_texture_subdir(src_path: str) -> str:
+    """Return the subfolder path (e.g. ``landscape/plants``) between a
+    source texture's own ``Textures`` folder and its filename, so a
+    texture pulled from ``...\\textures\\landscape\\plants\\X.dds`` keeps
+    that same ``landscape\\plants`` nesting under whatever destination
+    Textures folder it's copied into.
+
+    Without this, every texture landed flat in one destination folder --
+    which silently breaks the NIF, since the mesh's internal texture path
+    (e.g. ``textures\\landscape\\plants\\X.dds``, baked in by the NIF
+    exporter from this same source path) no longer matches where the file
+    actually is. Confirmed real incident: exporting to a flat test folder
+    outside any ``Meshes\\`` tree produced meshes that render solid white
+    in NifSkope/game because the referenced textures aren't at the path
+    the mesh asks for.
+
+    Returns "" if *src_path* has no ``textures`` segment to key off of
+    (falls back to the old flat-copy behavior).
+    """
+    parts = os.path.normpath(src_path).split(os.sep)
+    for i, p in enumerate(parts):
+        if p.lower() == "textures":
+            sub_parts = parts[i + 1:-1]  # between 'textures' and the filename
+            if sub_parts:
+                return os.path.join(*sub_parts)
+            return ""
+    return ""
 
 
 def export_textures_for_object(
@@ -1640,12 +1769,16 @@ def export_textures_for_object(
                 continue
             seen_src.add(src_norm)
 
+            _subdir = _game_relative_texture_subdir(src_path)
+            _dest_dir = os.path.join(output_dir, _subdir) if _subdir else output_dir
+            os.makedirs(_dest_dir, exist_ok=True)
+
             src_ext = os.path.splitext(src_path)[1].lower()
             base_name = os.path.splitext(os.path.basename(src_path))[0]
-            dest_dds = os.path.join(output_dir, base_name + ".dds")
+            dest_dds = os.path.join(_dest_dir, base_name + ".dds")
 
             if src_ext == ".dds":
-                dest_path = os.path.join(output_dir, os.path.basename(src_path))
+                dest_path = os.path.join(_dest_dir, os.path.basename(src_path))
                 if os.path.normcase(os.path.normpath(dest_path)) == src_norm:
                     results.append((True, f"'{os.path.basename(src_path)}' already at destination"))
                     continue
@@ -1686,7 +1819,7 @@ def export_textures_for_object(
                 except Exception as exc:
                     results.append((False, f"DDS conversion failed for '{src_path}': {exc}"))
             if not converted:
-                dest_path = os.path.join(output_dir, os.path.basename(src_path))
+                dest_path = os.path.join(_dest_dir, os.path.basename(src_path))
                 dest_norm = os.path.normcase(os.path.normpath(dest_path))
                 # Same "don't blindly clobber a better file already there" rule
                 # as the .dds branch above -- is_texture_size_downgrade only

@@ -558,6 +558,136 @@ class ExportHelpers:
         return kwargs
 
     @staticmethod
+    def _snapshot_and_fix_emissive_for_export(objects):
+        """Work around PyNifly exporting Emissive Color/Multiple as flat white.
+
+        PyNifly's exporter (io_scene_nifly/nif/shader_io.py) reads a shape's
+        Emissive Color/Multiple straight from whichever node is linked into
+        the material's Material Output socket::
+
+            shape.shader.properties.Emissive_Mult = self.shader_node.inputs['Emission Strength'].default_value
+            shape.shader.properties.Emissive_Color[i] = self.shader_node.inputs[em].default_value[i]
+
+        For our materials that node is the outer Principled BSDF, not the
+        "Fallout 4 MTS" node group PyNifly itself builds on import. Our BSDF's
+        "Emission Color" input is wired to the Glow Map texture (a deliberate
+        repurposing for an in-Blender glow preview) and its "Emission
+        Strength" sits at Blender's plain default of 1.0 — neither carries the
+        mesh's real baked tint. That tint is still sitting untouched on the
+        "Fallout 4 MTS" group node's own unconnected "Emission Color"/
+        "Emission Strength" inputs (that's what PyNifly used to populate them
+        on import), but PyNifly's export never looks there.
+
+        This snapshots each exported material's current wiring, temporarily
+        unlinks/overwrites the outer node's Emission Color/Strength with the
+        group's true values so PyNifly's export reads the right numbers, and
+        returns a list of restore-info dicts. Always pair this with a
+        ``_restore_emissive_after_export`` call in a ``finally`` block so the
+        artist's actual node graph (Glow Map link included) is put back
+        exactly as it was, regardless of whether the export succeeded.
+        """
+        restore = []
+        seen_materials = set()
+        for obj in objects or []:
+            mat = getattr(obj, 'active_material', None)
+            if mat is None or not getattr(mat, 'use_nodes', False) or mat.node_tree is None:
+                continue
+            if mat.name in seen_materials:
+                continue
+            seen_materials.add(mat.name)
+            nt = mat.node_tree
+            try:
+                mo = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                if mo is None or not mo.inputs[0].is_linked:
+                    continue
+                shader_node = mo.inputs[0].links[0].from_node
+
+                # The "Fallout 4 MTS" (or "... - Face") group node holding the
+                # real, never-overwritten tint values.
+                grp = next(
+                    (n for n in nt.nodes
+                     if n.type == 'GROUP' and n.node_tree
+                     and 'Fallout 4 MTS' in n.node_tree.name),
+                    None)
+                if grp is None or grp is shader_node:
+                    continue  # nothing to copy from, or already the source of truth
+
+                if 'Emission Color' in shader_node.inputs:
+                    em_key = 'Emission Color'
+                elif 'Emission' in shader_node.inputs:
+                    em_key = 'Emission'
+                else:
+                    continue
+                if 'Emission Strength' not in shader_node.inputs:
+                    continue
+                if 'Emission Color' not in grp.inputs or 'Emission Strength' not in grp.inputs:
+                    continue
+
+                color_in = shader_node.inputs[em_key]
+                strength_in = shader_node.inputs['Emission Strength']
+
+                entry = {
+                    'material': mat,
+                    'color_input_name': em_key,
+                    'color_was_linked': color_in.is_linked,
+                    'color_link_from': None,
+                    'color_default': tuple(color_in.default_value[:]),
+                    'strength_was_linked': strength_in.is_linked,
+                    'strength_link_from': None,
+                    'strength_default': strength_in.default_value,
+                }
+                if color_in.is_linked:
+                    link = color_in.links[0]
+                    entry['color_link_from'] = (link.from_node.name, link.from_socket.name)
+                    nt.links.remove(link)
+                if strength_in.is_linked:
+                    link = strength_in.links[0]
+                    entry['strength_link_from'] = (link.from_node.name, link.from_socket.name)
+                    nt.links.remove(link)
+
+                color_in.default_value = tuple(grp.inputs['Emission Color'].default_value[:])
+                strength_in.default_value = grp.inputs['Emission Strength'].default_value
+
+                restore.append(entry)
+            except Exception as _e:
+                print(f"[FO4Export] Emissive pre-export fix skipped for "
+                      f"'{mat.name if mat else '?'}': {_e}")
+        return restore
+
+    @staticmethod
+    def _restore_emissive_after_export(restore):
+        """Undo ``_snapshot_and_fix_emissive_for_export``'s temporary rewiring."""
+        for entry in restore or []:
+            try:
+                mat = entry['material']
+                nt = mat.node_tree
+                mo = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                if mo is None or not mo.inputs[0].is_linked:
+                    continue
+                shader_node = mo.inputs[0].links[0].from_node
+                em_key = entry['color_input_name']
+                if em_key not in shader_node.inputs or 'Emission Strength' not in shader_node.inputs:
+                    continue
+                color_in = shader_node.inputs[em_key]
+                strength_in = shader_node.inputs['Emission Strength']
+
+                color_in.default_value = entry['color_default']
+                strength_in.default_value = entry['strength_default']
+
+                if entry['color_was_linked'] and entry['color_link_from']:
+                    from_node_name, from_socket_name = entry['color_link_from']
+                    from_node = nt.nodes.get(from_node_name)
+                    if from_node is not None and from_socket_name in from_node.outputs:
+                        nt.links.new(from_node.outputs[from_socket_name], color_in)
+                if entry['strength_was_linked'] and entry['strength_link_from']:
+                    from_node_name, from_socket_name = entry['strength_link_from']
+                    from_node = nt.nodes.get(from_node_name)
+                    if from_node is not None and from_socket_name in from_node.outputs:
+                        nt.links.new(from_node.outputs[from_socket_name], strength_in)
+            except Exception as _e:
+                print(f"[FO4Export] Emissive post-export restore failed: {_e}")
+
+    @staticmethod
     def _prepare_mesh_for_nif(obj):
         """Prepare a mesh object so it meets Fallout 4 / PyNifly / Niftools v0.1.1 requirements.
 
@@ -593,6 +723,30 @@ class ExportHelpers:
 
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
+
+        # Force single-user mesh data BEFORE any of the mutating steps below
+        # (unweighted-vertex fix, Remove Doubles, UV creation, etc.) -- not
+        # just before the scale/rotation apply, which used to be the only
+        # place this was checked (and only conditionally, inside `if
+        # needs_scale or needs_rot:`). Confirmed as a real, reproducible bug:
+        # when an object arrives here with scale/rotation already at
+        # identity (e.g. a mesh laid out via linked/Alt-D duplicates for
+        # variation, which deliberately share one mesh datablock across
+        # several objects), that scale/rotation branch never ran its own
+        # single-user copy, so the Remove Doubles step below rewrote the
+        # SHARED datablock in place via bmesh -- silently mutating every
+        # other object still pointing at that same data, not just this one.
+        # This reproduced independent of Blender version (it's not an
+        # engine bug, just a missing guard in our own code) and explains a
+        # real user report: a duplicated/rearranged mesh plus its
+        # separately-generated collision object ending up with corrupted/
+        # mismatched geometry after export, even though the collision
+        # generator's own code was already careful about single-user data.
+        try:
+            if obj.data and obj.data.users > 1:
+                obj.data = obj.data.copy()
+        except Exception:
+            pass
 
         # 0. Fix unweighted vertices ------------------------------------------
         #    Vertices with zero total bone weight cause NIF exporters to produce
@@ -1151,6 +1305,14 @@ class ExportHelpers:
             return False, "Object is not a mesh"
         # ...existing code...
 
+        try:
+            _diag_coll = ExportHelpers._find_collision_mesh(obj)
+            print(f"[FO4Export][ScaleDiag] ENTRY obj={obj.name} obj.scale={tuple(obj.scale)} "
+                  f"collision={_diag_coll.name if _diag_coll else None} "
+                  f"collision.scale={tuple(_diag_coll.scale) if _diag_coll else None}")
+        except Exception as _diag_exc:
+            print(f"[FO4Export][ScaleDiag] ENTRY diag failed: {_diag_exc}")
+
         # Do not export collision meshes created by the addon
         if obj.get("fo4_collision") or obj.name.upper().endswith("_COLLISION") or obj.name.upper().startswith("UCX_"):
             return False, "Collision meshes are not intended for export; select the source mesh instead"
@@ -1261,8 +1423,35 @@ class ExportHelpers:
                         ExportHelpers._scale_armature_bones(_skel_early, fo4_scale)
                         restore_armature_scales.append((_skel_early, fo4_scale))
 
+                    print(f"[FO4Export][ScaleDiag] _scale_targets = {[t.name for t in _scale_targets]} fo4_scale={fo4_scale}")
+                    # ROOT CAUSE (confirmed via direct console instrumentation on a
+                    # real asset): the UCX_ collision child is PARENTED to obj
+                    # (add_custom_collision()/add_collision_mesh() do this so the
+                    # two travel together). bpy.ops.object.transform_apply() on a
+                    # PARENT automatically compensates every PARENTED CHILD's own
+                    # .scale by the same factor being removed from the parent, so
+                    # the child's WORLD size doesn't visibly jump when the parent's
+                    # scale resets to 1 -- this is normal, sanctioned Blender
+                    # behaviour, not a bug in Blender. But reading `o.scale` fresh
+                    # at the top of EACH loop iteration means that by the time this
+                    # loop reaches the collision object (processed after obj), its
+                    # .scale has ALREADY been silently multiplied by fo4_scale as
+                    # Blender's own compensation for obj's transform_apply a few
+                    # lines above -- confirmed directly: a freshly-created collision
+                    # (scale=1.0 at creation) read orig_scale=69.99 here, purely
+                    # from processing obj first, before this loop ever touched the
+                    # collision object at all. This code then multiplied that
+                    # already-inflated 69.99 by fo4_scale AGAIN (~4899x total),
+                    # which is exactly the ~70x-too-large collision bug that no
+                    # restore-step fix could ever have corrected, since the
+                    # over-scaling happens here, at UP time, not at restore time.
+                    # Fix: snapshot every target's TRUE starting scale up front,
+                    # before ANY of them (parent included) are touched, so a
+                    # child's later Blender-compensated scale is never mistaken
+                    # for its real original value.
+                    _orig_scales = {o.name: tuple(o.scale) for o in _scale_targets}
                     for o in _scale_targets:
-                        orig_scale = tuple(o.scale)
+                        orig_scale = _orig_scales[o.name]
                         o.scale = (
                             orig_scale[0] * fo4_scale,
                             orig_scale[1] * fo4_scale,
@@ -1271,6 +1460,9 @@ class ExportHelpers:
                         bpy.context.view_layer.objects.active = o
                         bpy.ops.object.select_all(action='DESELECT')
                         o.select_set(True)
+                        print(f"[FO4Export][ScaleDiag] UP  o={o.name} orig_scale={orig_scale} "
+                              f"data_users_before={o.data.users if o.data else None} "
+                              f"hidden={o.hide_get()} in_view_layer={o.name in bpy.context.view_layer.objects}")
                         # Make the mesh single-user so transform_apply succeeds
                         # even when the object is an Alt-D linked duplicate.
                         try:
@@ -1299,6 +1491,7 @@ class ExportHelpers:
                             applied = 'FINISHED' in _sc_result and tuple(o.scale) == (1.0, 1.0, 1.0)
                         except Exception:
                             applied = False
+                        print(f"[FO4Export][ScaleDiag] UP  o={o.name} applied={applied} scale_after={tuple(o.scale)} dims_after={tuple(o.dimensions)}")
                         if not applied:
                             # Fallback: bake scale directly into mesh vertices.
                             try:
@@ -1310,10 +1503,14 @@ class ExportHelpers:
                                 o.data.transform(_mat)
                                 o.scale = (1.0, 1.0, 1.0)
                                 applied = True
-                            except Exception:
+                            except Exception as _ue_exc:
+                                print(f"[FO4Export][ScaleDiag] UP  o={o.name} FALLBACK FAILED: {_ue_exc}")
                                 o.scale = orig_scale  # undo the ×70 if all else fails
+                            else:
+                                print(f"[FO4Export][ScaleDiag] UP  o={o.name} fallback bake used, scale_after={tuple(o.scale)} dims_after={tuple(o.dimensions)}")
                         if applied:
                             restore_scale_objs.append((o, orig_scale))
+                    print(f"[FO4Export][ScaleDiag] restore_scale_objs (after UP) = {[t[0].name for t in restore_scale_objs]}")
 
                 # Auto-prepare FIRST (applies transforms, creates UV map, triangulates).
                 # Validation runs afterwards so it sees the corrected state and does not
@@ -1347,20 +1544,30 @@ class ExportHelpers:
                 # Dispatch to the appropriate exporter.
                 import time as _time_mod
                 _export_start = _time_mod.time()
-                if exporter == "pynifly":
-                    kwargs = ExportHelpers._build_pynifly_export_kwargs(filepath)
-                    result = ExportHelpers._call_nif_export(
-                        bpy.ops.export_scene.pynifly, kwargs,
-                        active_object=obj, selected_objects=selection,
-                    )
-                    exporter_label = "PyNifly"
-                else:
-                    kwargs = ExportHelpers._build_nif_export_kwargs(filepath)
-                    result = ExportHelpers._call_nif_export(
-                        bpy.ops.export_scene.nif, kwargs,
-                        active_object=obj, selected_objects=selection,
-                    )
-                    exporter_label = "Niftools v0.1.1"
+                # PyNifly reads each shape's Emissive Color/Multiple straight from
+                # whichever node feeds Material Output (usually the outer Principled
+                # BSDF), not from the "Fallout 4 MTS" group's own inputs -- see
+                # _snapshot_and_fix_emissive_for_export for the full explanation.
+                _emissive_restore = (
+                    ExportHelpers._snapshot_and_fix_emissive_for_export(selection)
+                    if exporter == "pynifly" else [])
+                try:
+                    if exporter == "pynifly":
+                        kwargs = ExportHelpers._build_pynifly_export_kwargs(filepath)
+                        result = ExportHelpers._call_nif_export(
+                            bpy.ops.export_scene.pynifly, kwargs,
+                            active_object=obj, selected_objects=selection,
+                        )
+                        exporter_label = "PyNifly"
+                    else:
+                        kwargs = ExportHelpers._build_nif_export_kwargs(filepath)
+                        result = ExportHelpers._call_nif_export(
+                            bpy.ops.export_scene.nif, kwargs,
+                            active_object=obj, selected_objects=selection,
+                        )
+                        exporter_label = "Niftools v0.1.1"
+                finally:
+                    ExportHelpers._restore_emissive_after_export(_emissive_restore)
 
                 # PyNifly returns an empty set() on SUCCESS — it never adds
                 # 'FINISHED' (see ExportNIF.execute:
@@ -1449,14 +1656,29 @@ class ExportHelpers:
                             # docstring) instead of blindly carrying over
                             # the full-detail source material's fields.
                             _is_lod_export = bool(obj.get("fo4_lod_level"))
-                            _bgsm_results = _bh_exp.export_bgsm_for_object(
-                                obj, str(_mat_dir), all_slots=False,
-                                is_lod=_is_lod_export,
-                            )
-                            _bgsm_ok = [m for ok, m in _bgsm_results if ok]
-                            _bgsm_fail = [m for ok, m in _bgsm_results if not ok]
-                            if _bgsm_ok:
-                                _bgsm_note = f" + BGSM → {_mat_dir.name}/"
+                            # Prefer the real materials\\...\\X.bgsm path baked
+                            # into the NIF's own shader over guessing a name from
+                            # the Blender material -- see bgsm_targets_from_
+                            # exported_nif's docstring for why the guess can be
+                            # wrong even when the folder mirroring is right.
+                            _real_targets = _bh_exp.bgsm_targets_from_exported_nif(filepath, [obj])
+                            if _real_targets:
+                                _wm0, _bgsm_path0, _ = _real_targets[0]
+                                _ok0, _msg0 = _bh_exp.export_bgsm_to_path(
+                                    _wm0, str(_bgsm_path0), is_lod=_is_lod_export)
+                                _bgsm_ok = [_msg0] if _ok0 else []
+                                _bgsm_fail = [] if _ok0 else [_msg0]
+                                if _bgsm_ok:
+                                    _bgsm_note = f" + BGSM → {_bgsm_path0.parent.name}/"
+                            else:
+                                _bgsm_results = _bh_exp.export_bgsm_for_object(
+                                    obj, str(_mat_dir), all_slots=False,
+                                    is_lod=_is_lod_export,
+                                )
+                                _bgsm_ok = [m for ok, m in _bgsm_results if ok]
+                                _bgsm_fail = [m for ok, m in _bgsm_results if not ok]
+                                if _bgsm_ok:
+                                    _bgsm_note = f" + BGSM → {_mat_dir.name}/"
                             if _bgsm_fail:
                                 for _fm in _bgsm_fail:
                                     print(f"[FO4Export] BGSM warning: {_fm}")
@@ -1477,17 +1699,28 @@ class ExportHelpers:
                         from . import bgsm_helpers as _bh_tex
                         if _bh_tex and obj.data.materials:
                             import pathlib as _pl
-                            _nif_p2 = _pl.Path(filepath).resolve()
-                            _parts2 = _nif_p2.parts
-                            _mesh_idx2 = next(
-                                (i for i, p in enumerate(_parts2)
-                                 if p.lower() == 'meshes'),
-                                None
-                            )
-                            if _mesh_idx2 is not None:
-                                _tex_dir = _pl.Path(*_parts2[:_mesh_idx2]) / "Textures" / _pl.Path(*_parts2[_mesh_idx2 + 1:-1])
+                            # Prefer the same NIF-derived target the BGSM
+                            # block above just used, so textures always land
+                            # next to the BGSM that references them instead
+                            # of being computed independently from a
+                            # possibly-intermediate `filepath` value (which
+                            # can produce a doubled/incorrect subpath -- see
+                            # bgsm_targets_from_exported_nif's docstring).
+                            _real_targets_tex = _bh_tex.bgsm_targets_from_exported_nif(filepath, [obj])
+                            if _real_targets_tex:
+                                _tex_dir = _real_targets_tex[0][2]
                             else:
-                                _tex_dir = _nif_p2.parent / "Textures"
+                                _nif_p2 = _pl.Path(filepath).resolve()
+                                _parts2 = _nif_p2.parts
+                                _mesh_idx2 = next(
+                                    (i for i, p in enumerate(_parts2)
+                                     if p.lower() == 'meshes'),
+                                    None
+                                )
+                                if _mesh_idx2 is not None:
+                                    _tex_dir = _pl.Path(*_parts2[:_mesh_idx2]) / "Textures" / _pl.Path(*_parts2[_mesh_idx2 + 1:-1])
+                                else:
+                                    _tex_dir = _nif_p2.parent / "Textures"
                             _tex_results = _bh_tex.export_textures_for_object(
                                 obj, str(_tex_dir), all_slots=False
                             )
@@ -1512,6 +1745,18 @@ class ExportHelpers:
                             _rt_summary = _nrt.summarize(_rt_report)
                             if _rt_summary:
                                 _roundtrip_note = f"  [{_rt_summary}]"
+                            # Wind-foliage root wrapper (BSLeafAnimNode) --
+                            # PyNifly's export API can't create/relabel this
+                            # block type itself (see nif_roundtrip.
+                            # patch_wind_root_node's docstring), so restore
+                            # it post-export when the original had one or
+                            # the object went through the Wind pipeline.
+                            _leaf_report = _nrt.patch_wind_root_node(
+                                filepath, obj, _source_nif
+                            )
+                            _leaf_summary = _nrt.summarize(_leaf_report)
+                            if _leaf_summary:
+                                _roundtrip_note += f"  [{_leaf_summary}]"
                         else:
                             # No original NIF to round-trip from (a freshly
                             # authored asset, not a reimport) -- still write
@@ -1544,6 +1789,13 @@ class ExportHelpers:
                             _root_summary = _nrt.summarize(_root_report)
                             if _root_summary:
                                 _roundtrip_note += f"  [{_root_summary}]"
+                            # Wind-foliage root wrapper -- no source NIF here
+                            # (fresh/no-reimport export), so this only fires
+                            # off the object's own "Wind" vertex group.
+                            _leaf_report = _nrt.patch_wind_root_node(filepath, obj, None)
+                            _leaf_summary = _nrt.summarize(_leaf_report)
+                            if _leaf_summary:
+                                _roundtrip_note += f"  [{_leaf_summary}]"
                     except Exception as _rte:
                         print(f"[FO4Export] NIF round-trip patch skipped: {_rte}")
 
@@ -1591,17 +1843,82 @@ class ExportHelpers:
                 # in every axis after restore; uniform inv alone reproduces
                 # the exact pre-export dimensions.
                 inv = 1.0 / _FO4_UNIT_SCALE_INV if restore_scale_objs else None
+                print(f"[FO4Export][ScaleDiag] restore_scale_objs (at RESTORE) = {[t[0].name for t in restore_scale_objs]} inv={inv}")
                 for o, orig_scale in restore_scale_objs:
                     o.scale = (inv, inv, inv)
                     bpy.context.view_layer.objects.active = o
                     bpy.ops.object.select_all(action='DESELECT')
                     o.select_set(True)
+                    print(f"[FO4Export][ScaleDiag] DOWN o={o.name} data_users_before={o.data.users if o.data else None} "
+                          f"hidden={o.hide_get()} dims_before={tuple(o.dimensions)}")
+                    # Confirmed real bug (matches a live user report): unlike
+                    # the scale-UP step above, this restore never checked
+                    # whether transform_apply actually succeeded.
+                    # transform_apply communicates failure through an
+                    # operator return value (or just doing nothing), NOT
+                    # always a Python exception -- a hidden/unselectable
+                    # collision object (a very normal state for a collision
+                    # mesh, which this add-on itself sets to WIRE display and
+                    # hide_render) is exactly the kind of case where the
+                    # operator can silently no-op. When that happens here,
+                    # o.scale is left sitting at (inv, inv, inv) -- roughly
+                    # 1/70 -- while the mesh DATA is still baked at the ×70
+                    # FO4-scale size from the pre-export step, so the object
+                    # never visibly shrinks back down: it reopens/redisplays
+                    # at full Fallout-4 scale in Blender even though nothing
+                    # is "wrong" with the file on disk. Add the same
+                    # verify-and-fall-back-to-baking-the-matrix-directly
+                    # safety net the scale-up step already has, instead of a
+                    # bare try/except that treats silent failure as success.
+                    #
+                    # SECOND confirmed bug found by direct N-panel evidence
+                    # (Scale reading 1.000 on a collision object whose
+                    # Dimensions were still ~70x too big): transform_apply()
+                    # on a MULTI-USER mesh datablock resets the calling
+                    # object's own .scale to (1,1,1) and still reports
+                    # 'FINISHED', but silently skips baking the transform
+                    # into the shared mesh data (to avoid corrupting other
+                    # users of that data). That made the `applied` check
+                    # above (FINISHED + scale==1,1,1) pass even though the
+                    # vertices were never actually shrunk back down. The
+                    # scale-UP step already guards against exactly this by
+                    # forcing single-user data BEFORE calling
+                    # transform_apply(); this restore step only did that
+                    # inside its fallback branch, never before the primary
+                    # attempt. Force single-user here too, matching scale-UP.
                     try:
-                        bpy.ops.object.transform_apply(
-                            location=False, rotation=False, scale=True
-                        )
+                        if o.data and o.data.users > 1:
+                            o.data = o.data.copy()
                     except Exception:
                         pass
+                    applied = False
+                    try:
+                        _restore_result = bpy.ops.object.transform_apply(
+                            location=False, rotation=False, scale=True
+                        )
+                        applied = ('FINISHED' in _restore_result
+                                   and tuple(o.scale) == (1.0, 1.0, 1.0))
+                    except Exception as _re_exc:
+                        print(f"[FO4Export][ScaleDiag] DOWN o={o.name} transform_apply EXCEPTION: {_re_exc}")
+                        applied = False
+                    print(f"[FO4Export][ScaleDiag] DOWN o={o.name} primary_applied={applied} "
+                          f"scale_after_primary={tuple(o.scale)} dims_after_primary={tuple(o.dimensions)}")
+                    if not applied:
+                        try:
+                            import mathutils as _mu_restore
+                            _sc = o.scale
+                            _mat = _mu_restore.Matrix.Diagonal(
+                                (_sc.x, _sc.y, _sc.z, 1.0)
+                            ).to_4x4()
+                            if o.data and o.data.users > 1:
+                                o.data = o.data.copy()
+                            o.data.transform(_mat)
+                            o.data.update()
+                            o.scale = (1.0, 1.0, 1.0)
+                            print(f"[FO4Export][ScaleDiag] DOWN o={o.name} fallback bake DONE, "
+                                  f"scale_after={tuple(o.scale)} dims_after={tuple(o.dimensions)}")
+                        except Exception as _fb_exc:
+                            print(f"[FO4Export][ScaleDiag] DOWN o={o.name} FALLBACK FAILED: {_fb_exc}")
                 # Restore the author-only wind rig removed before export.
                 ExportHelpers._reattach_wind_authoring_rig(obj, wind_token)
                 # Restore the author-only weapon animation rig removed before export.
@@ -2130,8 +2447,18 @@ class ExportHelpers:
                         restore_armature_scales.append((_skel_early, fo4_scale))
                         _scaled_armatures.add(_skel_early)
 
+                    # See the matching fix + comment in export_mesh_to_nif: a
+                    # parented UCX_ collision child's .scale gets silently
+                    # multiplied by fo4_scale as Blender's own compensation
+                    # the moment its PARENT (obj, processed earlier in this
+                    # same loop) has transform_apply() run on it -- so re-
+                    # reading o.scale fresh at the top of each iteration
+                    # picks up that already-inflated value for the child and
+                    # multiplies it by fo4_scale a second time. Snapshot every
+                    # target's true starting scale up front instead.
+                    _orig_scales = {o.name: tuple(o.scale) for o in _scale_targets}
                     for o in _scale_targets:
-                        orig_scale = tuple(o.scale)
+                        orig_scale = _orig_scales[o.name]
                         o.scale = (
                             orig_scale[0] * fo4_scale,
                             orig_scale[1] * fo4_scale,
@@ -2230,6 +2557,12 @@ class ExportHelpers:
                     kwargs = ExportHelpers._build_nif_export_kwargs(filepath)
                     exporter_label = "Niftools v0.1.1"
                     call = bpy.ops.export_scene.nif
+                # See _snapshot_and_fix_emissive_for_export: PyNifly reads
+                # Emissive Color/Multiple from whichever node feeds Material
+                # Output, not from the "Fallout 4 MTS" group's own inputs.
+                _emissive_restore = (
+                    ExportHelpers._snapshot_and_fix_emissive_for_export(meshes)
+                    if exporter == "pynifly" else [])
                 try:
                     import time as _time_mod2
                     _export_start2 = _time_mod2.time()
@@ -2272,8 +2605,106 @@ class ExportHelpers:
                                     _coll_note = f"  [{_coll_summary}]"
                         except Exception as _ce:
                             print(f"[FO4Export] Native collision patch skipped: {_ce}")
+                        _bgsm_note = ""
+                        try:
+                            # export_scene_as_single_nif (this combine path) used to
+                            # skip BGSM/texture export entirely -- only the single-
+                            # object export path below (~line 1615) had it. Real-world
+                            # symptom: every object routed through the recombine/batch
+                            # path (i.e. everything fo4.batch_export touches) shipped
+                            # with NO .bgsm file at all, so FO4/Creation Kit couldn't
+                            # resolve the shape's material -- and CK doesn't just show
+                            # a purple/missing-texture shape for that, it can flat-out
+                            # crash (access violation) the moment you try to view the
+                            # affected NIF. Mirror the same per-object BGSM + texture
+                            # export used by the single-object path, once per mesh in
+                            # this combined NIF.
+                            from . import bgsm_helpers as _bh_exp2
+                            import pathlib as _pl2
+                            _nif_p3 = _pl2.Path(filepath).resolve()
+                            _parts3 = _nif_p3.parts
+                            _mesh_idx3 = next(
+                                (i for i, p in enumerate(_parts3)
+                                 if p.lower() == 'meshes'),
+                                None
+                            )
+                            if _mesh_idx3 is not None:
+                                _mat_dir3 = _pl2.Path(*_parts3[:_mesh_idx3]) / "Materials" / _pl2.Path(*_parts3[_mesh_idx3 + 1:-1])
+                                _tex_dir3 = _pl2.Path(*_parts3[:_mesh_idx3]) / "Textures" / _pl2.Path(*_parts3[_mesh_idx3 + 1:-1])
+                            else:
+                                _mat_dir3 = _nif_p3.parent / "Materials"
+                                _tex_dir3 = _nif_p3.parent / "Textures"
+                            _bgsm_ok_any = False
+                            _tex_ok_any = False
+                            # Prefer the real materials\\...\\X.bgsm path(s)
+                            # baked into the combined NIF's own shader
+                            # properties -- see bgsm_targets_from_exported_nif's
+                            # docstring: the old mat.name-based guess put files
+                            # in the wrong folder AND under the wrong filename
+                            # (e.g. "Flower01_0.Mat.bgsm" in a flat "Materials/"
+                            # folder instead of "materials\\landscape\\plants\\
+                            # flower01.bgsm", which is what the shader and CK
+                            # actually look for).
+                            _real_targets3 = _bh_exp2.bgsm_targets_from_exported_nif(filepath, meshes)
+                            if _real_targets3:
+                                for _wm2, _bgsm_path2, _tex_dir2 in _real_targets3:
+                                    _is_lod_export2 = bool(_wm2.get("fo4_lod_level"))
+                                    _ok2, _m2 = _bh_exp2.export_bgsm_to_path(
+                                        _wm2, str(_bgsm_path2), is_lod=_is_lod_export2)
+                                    if _ok2:
+                                        _bgsm_ok_any = True
+                                    else:
+                                        print(f"[FO4Export] BGSM warning: {_m2}")
+                                    for _ok2b, _m2b in _bh_exp2.export_textures_for_object(
+                                        _wm2, str(_tex_dir2), all_slots=False
+                                    ):
+                                        if _ok2b:
+                                            _tex_ok_any = True
+                                        else:
+                                            print(f"[FO4Export] Texture warning: {_m2b}")
+                            else:
+                                for _wm2 in meshes:
+                                    if not _wm2.data.materials:
+                                        continue
+                                    _is_lod_export2 = bool(_wm2.get("fo4_lod_level"))
+                                    for _ok2, _m2 in _bh_exp2.export_bgsm_for_object(
+                                        _wm2, str(_mat_dir3), all_slots=False,
+                                        is_lod=_is_lod_export2,
+                                    ):
+                                        if _ok2:
+                                            _bgsm_ok_any = True
+                                        else:
+                                            print(f"[FO4Export] BGSM warning: {_m2}")
+                                    for _ok2, _m2 in _bh_exp2.export_textures_for_object(
+                                        _wm2, str(_tex_dir3), all_slots=False
+                                    ):
+                                        if _ok2:
+                                            _tex_ok_any = True
+                                        else:
+                                            print(f"[FO4Export] Texture warning: {_m2}")
+                            if _bgsm_ok_any:
+                                _bgsm_note += f" + BGSM \u2192 {_mat_dir3.name}/"
+                            if _tex_ok_any:
+                                _bgsm_note += f" + textures \u2192 {_tex_dir3.name}/"
+                        except Exception as _be2:
+                            print(f"[FO4Export] BGSM/texture auto-export skipped: {_be2}")
+                        _leaf_note = ""
+                        try:
+                            from . import nif_roundtrip as _nrt
+                            for _wm in meshes:
+                                _wm_source = _wm.get("fo4_source_nif")
+                                _leaf_report = _nrt.patch_wind_root_node(
+                                    filepath, _wm,
+                                    _wm_source if _wm_source and os.path.isfile(_wm_source) else None,
+                                )
+                                _leaf_summary = _nrt.summarize(_leaf_report)
+                                if _leaf_summary:
+                                    _leaf_note = f"  [{_leaf_summary}]"
+                                    break  # root is patched once for the whole file
+                        except Exception as _le:
+                            print(f"[FO4Export] Wind root patch skipped: {_le}")
                         return True, (f"Exported {mesh_count} mesh(es) as single NIF via "
-                                      f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}")
+                                      f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}{_leaf_note}{_bgsm_note}")
                     fallback_msg = f"NIF export did not finish ({result}); falling back to FBX."
                 except Exception as e:
                     print(
@@ -2282,6 +2713,8 @@ class ExportHelpers:
                     )
                     traceback.print_exc(file=sys.stderr)
                     fallback_msg = f"NIF export failed ({e}); falling back to FBX."
+                finally:
+                    ExportHelpers._restore_emissive_after_export(_emissive_restore)
             else:
                 fallback_msg = f"{nif_message}; exporting FBX."
 
@@ -2342,12 +2775,51 @@ class ExportHelpers:
                     bpy.context.view_layer.objects.active = o
                     bpy.ops.object.select_all(action='DESELECT')
                     o.select_set(True)
+                    # See the matching fix in export_mesh_to_nif: verify
+                    # transform_apply actually succeeded (a hidden/
+                    # unselectable collision object can make it silently
+                    # no-op) and fall back to baking the inverse scale
+                    # directly into the mesh data, instead of a bare
+                    # try/except that treats silent failure as success and
+                    # leaves the object stuck at ~1/70 scale with its
+                    # geometry still baked at full FO4 scale.
+                    #
+                    # SECOND confirmed bug (see the matching comment in
+                    # export_mesh_to_nif): transform_apply() on a
+                    # MULTI-USER mesh datablock resets .scale to (1,1,1)
+                    # and reports 'FINISHED' while silently skipping the
+                    # actual vertex bake, which passed the check below even
+                    # though nothing was actually restored. Force
+                    # single-user data BEFORE the primary attempt, matching
+                    # the scale-UP step's own guard.
                     try:
-                        bpy.ops.object.transform_apply(
-                            location=False, rotation=False, scale=True
-                        )
+                        if o.data and o.data.users > 1:
+                            o.data = o.data.copy()
                     except Exception:
                         pass
+                    applied = False
+                    try:
+                        _restore_result = bpy.ops.object.transform_apply(
+                            location=False, rotation=False, scale=True
+                        )
+                        applied = ('FINISHED' in _restore_result
+                                   and tuple(o.scale) == (1.0, 1.0, 1.0))
+                    except Exception:
+                        applied = False
+                    if not applied:
+                        try:
+                            import mathutils as _mu_restore
+                            _sc = o.scale
+                            _mat = _mu_restore.Matrix.Diagonal(
+                                (_sc.x, _sc.y, _sc.z, 1.0)
+                            ).to_4x4()
+                            if o.data and o.data.users > 1:
+                                o.data = o.data.copy()
+                            o.data.transform(_mat)
+                            o.data.update()
+                            o.scale = (1.0, 1.0, 1.0)
+                        except Exception:
+                            pass
             # Restore any author-only wind rigs detached before export.
             for obj_name, wt in wind_tokens_per_obj.items():
                 obj = scene.objects.get(obj_name)

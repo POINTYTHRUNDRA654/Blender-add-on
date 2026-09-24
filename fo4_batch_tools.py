@@ -91,52 +91,141 @@ def list_presets() -> list:
 # BATCH EXPORT
 # ═══════════════════════════════════════════════════════
 
+def _is_collision_proxy(obj) -> bool:
+    """Return True if *obj* is a collision/physics proxy, not a real
+    exportable shape.
+
+    These are never meant to be exported as their own standalone NIF --
+    PyNifly's exporter attaches them to their parent real mesh's export
+    automatically (see ExportHelpers._find_collision_mesh). Handed to it
+    directly instead, the export operator correctly finds nothing to write
+    and reports "No objects selected for export", which used to show up as
+    a plain batch-export failure with no explanation. Recognizes:
+    - The same markers ExportHelpers._is_collision_mesh checks (the
+      ``fo4_collision`` custom property, ``UCX_`` prefix, ``_COLLISION``
+      suffix)
+    - ``pynRigidBody`` -- PyNifly's own import-time marker for a native
+      Havok collision shape (e.g. objects named/derived from
+      ``bhkPhysicsSystem``)
+    """
+    if obj.get("fo4_collision") or obj.get("pynRigidBody"):
+        return True
+    name_upper = obj.name.upper()
+    return name_upper.startswith("UCX_") or name_upper.endswith("_COLLISION")
+
+
 def batch_export_objects(objects: list, output_dir: str,
                           apply_fo4_prep: bool = True) -> dict:
-    """Export each object as a separate NIF (or FBX fallback).
-    Returns {success_count, fail_count, exported: [paths]}
+    """Export objects as NIF file(s), recombining multi-shape sources.
+
+    A single source NIF can decompose into several Blender objects on
+    import (multiple BSTriShapes in one file -- e.g. a 3-piece dead shrub).
+    Objects imported via Batch Import NIFs carry a ``fo4_source_nif`` tag
+    recording which file they came from; objects sharing that tag are
+    grouped and written back out as ONE combined NIF (via
+    ExportHelpers.export_scene_as_single_nif), matching how they arrived.
+    An object without the tag (e.g. imported some other way) gets its own
+    singleton group, keyed by its own name -- unchanged from the old
+    one-file-per-object behaviour.
+
+    Returns {success_count, fail_count, exported: [paths], skipped: [names]}
     """
     if not output_dir:
-        return {"success": 0, "fail": len(objects), "exported": []}
+        return {"success": 0, "fail": len(objects), "exported": [], "skipped": []}
     os.makedirs(output_dir, exist_ok=True)
-    results = {"success": 0, "fail": 0, "exported": []}
+    results = {"success": 0, "fail": 0, "exported": [], "skipped": []}
 
-    progress_start(f"Batch export {len(objects)} objects", len(objects))
-
+    real_objects = []
     for obj in objects:
-        progress_step(f"Exporting {obj.name}")
-        safe = obj.name.replace(" ","_").replace(".","_")
+        if _is_collision_proxy(obj):
+            results["skipped"].append(obj.name)
+            print(f"[Batch] Skipped {obj.name}: collision/physics proxy, "
+                  f"exported automatically with its parent mesh")
+        else:
+            real_objects.append(obj)
+
+    # Group by source file. Objects with no fo4_source_nif tag each get
+    # their own singleton group.
+    groups = {}
+    group_order = []
+    for obj in real_objects:
+        key = obj.get("fo4_source_nif") or f"__singleton_{id(obj)}"
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(obj)
+
+    progress_start(f"Batch export {len(groups)} file(s) from {len(real_objects)} object(s)", len(group_order))
+
+    for key in group_order:
+        group_objs = groups[key]
+        label = key if not key.startswith("__singleton_") else group_objs[0].name
+        progress_step(f"Exporting {label} ({len(group_objs)} shape(s))")
+        safe = label.replace(" ", "_").replace(".", "_")
         nif_path = os.path.join(output_dir, safe + ".nif")
 
-        # Isolate this object BEFORE any edit-mode prep step -- fo4_post_process
+        # Isolate this group BEFORE any edit-mode prep step -- fo4_post_process
         # enters Edit Mode and runs mesh.remove_doubles()/normals_make_consistent(),
         # which under Blender's multi-object editing apply to EVERY currently
-        # selected mesh, not just the one passed in. Selecting only `obj` first
-        # prevents it from also mutating whatever the user had selected before
-        # Batch Export was invoked, or the previous loop iteration's object.
+        # selected mesh, not just the ones in this group. Selecting only this
+        # group first prevents it from also mutating whatever the user had
+        # selected before Batch Export was invoked, or the previous group.
         bpy.ops.object.select_all(action="DESELECT")
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
+        for obj in group_objs:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = group_objs[0]
 
-        # FO4 prep
+        # FO4 prep, per shape in the group
         if apply_fo4_prep:
             try:
                 from . import imageto3d_helpers as _ith
                 if hasattr(_ith, "fo4_post_process"):
-                    _ith.fo4_post_process(obj, name=safe)
+                    for obj in group_objs:
+                        _ith.fo4_post_process(obj, name=safe)
             except Exception:
                 pass
 
         exported = False
         if _eh:
-            ok, msg = _eh.ExportHelpers.export_mesh_to_nif(obj, nif_path)
+            ok, msg = _eh.ExportHelpers.export_scene_as_single_nif(
+                bpy.context.scene, nif_path, objects=group_objs)
             if ok:
                 exported = True
                 print(f"[Batch] ✓ {os.path.basename(nif_path)}: {msg}")
             else:
-                print(f"[Batch] FAILED {obj.name}: {msg}")
+                print(f"[Batch] FAILED {label}: {msg}")
         else:
-            print(f"[Batch] FAILED {obj.name}: export_helpers unavailable — install PyNifly")
+            print(f"[Batch] FAILED {label}: export_helpers unavailable — install PyNifly")
+
+        # ── Auto-export BGSM + textures alongside the combined NIF ─────────────
+        # export_mesh_to_nif() (the single-object export path) ships the
+        # material's .bgsm and referenced texture files next to the NIF it
+        # writes; export_scene_as_single_nif() -- used above so a
+        # multi-shape source recombines into one file -- does NOT do this
+        # on its own. Without it, a recombined export (e.g. every
+        # multi-shape source in a batch) silently drops the BGSM/textures
+        # that used to ship automatically with the old one-file-per-shape
+        # export, which is how a batch export folder can end up with NIFs
+        # that reference textures nobody actually copied there.
+        if exported:
+            try:
+                from . import bgsm_helpers as _bh_batch
+                _mat_dir = os.path.join(output_dir, "Materials")
+                _tex_dir = os.path.join(output_dir, "Textures")
+                for _o in group_objs:
+                    if not _o.data.materials:
+                        continue
+                    for _ok, _m in _bh_batch.export_bgsm_for_object(
+                            _o, _mat_dir, all_slots=False,
+                            is_lod=bool(_o.get("fo4_lod_level"))):
+                        if not _ok:
+                            print(f"[Batch] BGSM warning ({_o.name}): {_m}")
+                    for _ok, _m in _bh_batch.export_textures_for_object(
+                            _o, _tex_dir, all_slots=False):
+                        if not _ok:
+                            print(f"[Batch] Texture warning ({_o.name}): {_m}")
+            except Exception as _bexc:
+                print(f"[Batch] BGSM/texture auto-export skipped for {label}: {_bexc}")
 
         if exported:
             results["success"] += 1
@@ -173,8 +262,11 @@ class FO4_OT_BatchExport(bpy.types.Operator):
             return {"CANCELLED"}
         out = bpy.path.abspath(self.output_dir) if self.output_dir else bpy.path.abspath("//exports/")
         res = batch_export_objects(objects, out, self.apply_fo4_prep)
-        self.report({"INFO"},
-            f"Batch export: {res['success']} OK, {res['fail']} failed → {out}")
+        summary = f"Batch export: {res['success']} OK, {res['fail']} failed"
+        if res["skipped"]:
+            summary += f", {len(res['skipped'])} skipped (collision/physics proxies)"
+        summary += f" → {out}"
+        self.report({"INFO"} if not res["fail"] else {"WARNING"}, summary)
         return {"FINISHED"}
 
 

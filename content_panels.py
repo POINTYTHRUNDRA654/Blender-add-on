@@ -171,18 +171,24 @@ class FO4_PT_VegetationPanel(_FO4SubPanel):
         r1 = col.row(align=True)
         r1.operator("fo4.vegetation_wind_setup", text="Vegetation Wind (Vertex Groups)", icon='PARTICLES')
         r1.operator("fo4.generate_wind_weights", text="", icon='WPAINT_HLT')
-        r2 = col.row()
-        r2.enabled = has_sel
-        r2.operator("fo4.batch_apply_wind_animation", text="Batch: Wind Anim (Selected)", icon='ANIM')
-        r3 = col.row()
-        r3.enabled = has_sel
-        r3.operator("fo4.scan_wind_readiness", text="Scan Wind Readiness", icon='CHECKMARK')
-        r4 = col.row()
-        r4.enabled = has_sel
-        r4.operator("fo4.test_wind_deformation", text="Test Wind Deformation", icon='MOD_PHYSICS')
-        r5 = col.row()
-        r5.enabled = has_sel
-        r5.operator("fo4.weld_wind_seams", text="Weld Wind Seams (Targeted)", icon='AUTOMERGE_ON')
+        # Batch wind pipeline disabled in the public build -- unreliable across the
+        # range of mesh shapes real FO4 vegetation/props come in (verified 2026-09;
+        # see DEVELOPMENT_NOTES.md and ui_panels.py's ENABLE_BATCH_WIND_TOOLS flag).
+        # Kept here, commented, so it isn't lost -- still fully working locally.
+        ENABLE_BATCH_WIND_TOOLS = False
+        if ENABLE_BATCH_WIND_TOOLS:
+            r2 = col.row()
+            r2.enabled = has_sel
+            r2.operator("fo4.batch_apply_wind_animation", text="Batch: Wind Anim (Selected)", icon='ANIM')
+            r3 = col.row()
+            r3.enabled = has_sel
+            r3.operator("fo4.scan_wind_readiness", text="Scan Wind Readiness", icon='CHECKMARK')
+            r4 = col.row()
+            r4.enabled = has_sel
+            r4.operator("fo4.test_wind_deformation", text="Test Wind Deformation", icon='MOD_PHYSICS')
+            r5 = col.row()
+            r5.enabled = has_sel
+            r5.operator("fo4.weld_wind_seams", text="Weld Wind Seams (Targeted)", icon='AUTOMERGE_ON')
         sub = col.column(align=True)
         sub.scale_y = 0.75
         sub.label(text="Run after adding geometry to an already wind-rigged", icon='INFO')

@@ -1328,3 +1328,33 @@ tests A–F now guard:
 - `install_operators.py` — `FO4_OT_CheckUEImporter`, `FO4_OT_InstallUEImporter` (both delegate to `load_and_register()`)
 - `startup_helpers.py` — `deferred_startup()` Step 5b (UE4 auto-load from disk) + Step 5c (other tools auto-download)
 - `test_addon_integrity.py` — `TestUEImporterPolicyCompliance` (Section S, fixes A–F)
+
+---
+
+## 2026-09-24 — Batch wind pipeline disabled in the shipped UI
+
+**Decision:** the "Batch Operations" wind tools (Batch Wind Weights, Batch
+Wind Anim, Batch Auto-Weight, Batch Vertex Colors, Scan Wind Readiness,
+Toggle Wind Preview in `ui_panels.py`; the equivalent batch-selection rows in
+`content_panels.py`'s Wind Animation box) are hidden from the public/GitHub
+build. Verified this session on a real 7-plant export batch: the per-object
+auto-origin-fix in `AnimationHelpers.ensure_wind_ready()` (`animation_helpers.py`)
+computes each mesh's "base" independently from that object's own min-Z, with
+no shared reference between related pieces of a multi-part source. That math
+is individually correct (world position survives a full export/reimport
+round-trip, confirmed via raw NIF bounding-sphere/vertex checks) but the
+*choice* of anchor point is unreliable across the range of shapes real FO4
+vegetation/props come in — not safe to run unattended across a varied batch.
+
+**What changed:** both files gained an `ENABLE_BATCH_WIND_TOOLS = False` flag
+guarding those UI rows. Nothing was deleted — the operators
+(`FO4_OT_BatchGenerateWindWeights`, `FO4_OT_ScanWindReadiness`, etc. in
+`operators.py`) and the underlying logic are untouched and still registered;
+they're just not exposed in the panel. The per-object wind tools (Smart Wind
+Setup, Vegetation Wind, Fix Wind Vertex Colors, etc.) are unaffected.
+
+**Local desktop installs** (the live Blender extension folders, not this
+repo) were left as-is and still show the full batch wind UI — this is
+intentional, so the feature can be picked back up later without starting
+over. Flip `ENABLE_BATCH_WIND_TOOLS` back to `True` in both files to re-enable
+it for a future build once the per-piece anchoring problem has a real fix.

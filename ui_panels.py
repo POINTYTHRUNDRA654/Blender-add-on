@@ -10,6 +10,16 @@ import importlib
 
 import textwrap
 
+# Batch wind pipeline (Batch Wind Weights / Batch Wind Anim / Batch Auto-Weight /
+# Batch Vertex Colors / Scan Wind Readiness / Toggle Wind Preview) is disabled in
+# the public build: it's proven unreliable across the range of mesh shapes real
+# FO4 vegetation/props come in (verified 2026-09 -- see DEVELOPMENT_NOTES.md). The
+# per-object wind tools above it (Smart Wind Setup, Vegetation Wind, Fix Wind
+# Vertex Colors, etc.) are unaffected and stay enabled. Code is kept intact, not
+# deleted, so this can be re-enabled later without starting over -- it's still
+# fully working in local desktop installs, just hidden from the shipped UI.
+ENABLE_BATCH_WIND_TOOLS = False
+
 try:
     from . import preset_library as _preset_lib
 except Exception:
@@ -1183,6 +1193,26 @@ class FO4_PT_MeshPanel(_FO4SubPanel):
                 icon='LIGHT_HEMI',
             )
 
+            # External UV tools (Ultimate Unwrap3D / Packer-IO round-trip)
+            uv_box.separator()
+            uv_box.label(text="External UV Tools (optional):", icon='FORWARD')
+            sub = uv_box.column(align=True)
+            sub.scale_y = 0.75
+            sub.label(text="Sends the mesh out with FO4-correct FBX settings already", icon='INFO')
+            sub.label(text="applied -- edit UVs there, save over the same file, reimport.")
+            row = uv_box.row(align=True)
+            row.enabled = bool(has_mesh)
+            row.operator("fo4.open_in_unwrap3d", text="Open in Unwrap3D", icon='UV_DATA')
+            row.operator("fo4.reimport_from_unwrap3d", text="Reimport", icon='IMPORT')
+            row = uv_box.row(align=True)
+            row.enabled = bool(has_mesh)
+            row.operator("fo4.open_in_packerio", text="Open in Packer-IO", icon='UV_DATA')
+            row.operator("fo4.reimport_from_packerio", text="Reimport", icon='IMPORT')
+            sub = uv_box.column(align=True)
+            sub.scale_y = 0.75
+            sub.label(text="For mesh cleanup/repair (not UV), see the", icon='INFO')
+            sub.label(text="'Mesh Tools (PyMeshLab)' panel below -- no export needed.")
+
             # Wrap a reference photo onto the mesh, then hand-paint fixes
             uv_box.separator()
             uv_box.label(text="Wrap a Photo onto the Mesh:", icon='FORWARD')
@@ -2244,12 +2274,17 @@ class FO4_PT_AnimationPanel(_FO4SubPanel):
 
         wind_box.separator()
         wind_box.label(text="Batch Operations", icon='SEQ_SEQUENCER')
-        row = wind_box.row()
-        row.operator("fo4.batch_generate_wind_weights", text="Batch Wind Weights")
-        row.operator("fo4.batch_apply_wind_animation", text="Batch Wind Anim")
-        wind_box.operator("fo4.batch_auto_weight_paint", text="Batch Auto-Weight")
-        wind_box.operator("fo4.scan_wind_readiness", text="Scan Wind Readiness", icon='CHECKMARK')
-        wind_box.operator("fo4.toggle_wind_preview", text="Toggle Wind Preview", icon='PLAY')
+        wind_box.operator("fo4.batch_import_nifs", text="Batch Import NIFs...", icon='IMPORT')
+        if ENABLE_BATCH_WIND_TOOLS:
+            row = wind_box.row()
+            row.operator("fo4.batch_generate_wind_weights", text="Batch Wind Weights")
+            row.operator("fo4.batch_apply_wind_animation", text="Batch Wind Anim")
+            wind_box.operator("fo4.batch_auto_weight_paint", text="Batch Auto-Weight")
+            row2 = wind_box.row()
+            row2.operator("fo4.batch_fix_wind_vertex_colors", text="Batch Vertex Colors (Wind)")
+            row2.operator("fo4.batch_set_static_no_wind", text="Batch Vertex Colors (Static)")
+            wind_box.operator("fo4.scan_wind_readiness", text="Scan Wind Readiness", icon='CHECKMARK')
+            wind_box.operator("fo4.toggle_wind_preview", text="Toggle Wind Preview", icon='PLAY')
 
         # Motion Generation section
         layout.separator()
@@ -4721,6 +4756,17 @@ class FO4_PT_SetupPanel(_FO4SubPanel):
             tool_paths_box.prop(prefs, "ffmpeg_path", text="ffmpeg / folder")
         else:
             tool_paths_box.prop(scene, "fo4_ffmpeg_path", text="ffmpeg / folder")
+
+        tool_paths_box.separator()
+        tool_paths_box.label(text="External UV Tools:", icon="MOD_UVPROJECT")
+        if prefs is not None:
+            tool_paths_box.prop(prefs, "unwrap3d_exe_path", text="Ultimate Unwrap3D (unwrap3d_64.exe)")
+            tool_paths_box.prop(prefs, "packerio_exe_path", text="Packer-IO (Packer-IO.exe)")
+        else:
+            tool_paths_box.label(
+                text="Add-on preferences unavailable -- restart Blender to set these",
+                icon="ERROR",
+            )
 
         # ── Auto-installation ─────────────────────────────────────────────────
         auto_box = layout.box()

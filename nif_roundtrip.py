@@ -37,6 +37,7 @@ reports everything as not-restorable.
 from __future__ import annotations
 
 import os
+import struct
 
 try:
     from io_scene_nifly.pyn import pynifly as _pynifly
@@ -52,7 +53,6 @@ except Exception:
 
 _ALWAYS_UNRESTORABLE = [
     "Havok collision",
-    "BSLeafAnimNode",
     "shader block type (Effect/Lighting)",
 ]
 
@@ -477,6 +477,211 @@ def patch_native_collision(exported_path, collision_obj) -> dict:
                 report["could_not_restore"].append(f"Havok material ({mat_msg})")
     except Exception as exc:
         report["could_not_restore"].append(f"Havok collision ({exc})")
+
+    return report
+
+
+
+def _nif_block_type_table(data: bytes):
+    """Parse just enough of the BSStreamHeader to locate the block-type
+    string table and the per-block type-index array, without needing
+    PyNifly at all -- a raw binary read, same spirit as
+    _patch_havok_material's direct byte patching.
+
+    Layout (empirically verified against FO4 NIF version 20.2.0.7 /
+    BSVersion 130 exports, the only version this addon produces): header
+    string line -> version(4) + endian(1) + user version(4) -> num_blocks
+    (4) -> bsversion(4) -> four 1-byte-length-prefixed strings (Author /
+    ProcessScript / ExportScript / a 4th empty field) -> num_block_types
+    (2) -> block_types[] (each a 4-byte-length-prefixed ASCII string) ->
+    block_type_index[] (num_blocks * 2 bytes, one u16 per block).
+
+    Returns a dict with everything patch_root_to_leafanim_bytes() and
+    _root_block_type() need: numblocks, block_types (list[bytes]),
+    block_type_index (list[int]), and the byte offsets bracketing the
+    block-types table and the block-type-index array so a patch can splice
+    in a replacement without touching anything else in the file.
+    """
+    nl = data.index(b'\n')
+    off = nl + 1 + 4 + 1 + 4  # version, endian, user version
+    numblocks = struct.unpack_from('<I', data, off)[0]
+    off += 4
+
+    off2 = off + 4  # skip bsversion
+    for _ in range(4):
+        ln = data[off2]
+        off2 += 1 + ln
+    num_block_types_pos = off2
+    num_block_types = struct.unpack_from('<H', data, off2)[0]
+    off2 += 2
+    block_types_start = off2
+    block_types = []
+    for _ in range(num_block_types):
+        ln = struct.unpack_from('<I', data, off2)[0]
+        off2 += 4
+        s = data[off2:off2 + ln]
+        off2 += ln
+        block_types.append(s)
+    block_types_end = off2
+
+    block_type_index = list(struct.unpack_from('<%dH' % numblocks, data, off2))
+    block_type_index_start = off2
+    block_type_index_end = off2 + 2 * numblocks
+
+    return {
+        "numblocks": numblocks,
+        "num_block_types": num_block_types,
+        "num_block_types_pos": num_block_types_pos,
+        "block_types": block_types,
+        "block_types_start": block_types_start,
+        "block_types_end": block_types_end,
+        "block_type_index": block_type_index,
+        "block_type_index_start": block_type_index_start,
+        "block_type_index_end": block_type_index_end,
+    }
+
+
+def _root_block_type(data: bytes):
+    """Return the root (block 0) block-type name as bytes (e.g.
+    ``b'NiNode'``, ``b'BSLeafAnimNode'``), or ``None`` if the file is empty
+    or malformed."""
+    try:
+        table = _nif_block_type_table(data)
+        if table["numblocks"] < 1:
+            return None
+        return table["block_types"][table["block_type_index"][0]]
+    except Exception:
+        return None
+
+
+def _patch_root_to_leafanim_bytes(data: bytes) -> bytes:
+    """Rewrite *data*'s block-type table so the root (block 0) is typed as
+    ``BSLeafAnimNode`` instead of ``NiNode``.
+
+    Safe because PyNifly's own Python object model defines
+    ``BSLeafAnimNode`` (and ``BSFadeNode``) as pure aliases of ``NiNode`` --
+    ``class BSLeafAnimNode(NiNode): pass``, identical NiNodeBufType, no
+    extra fields -- so the distinction lives ONLY in this block-type name
+    string, never in any field data. Reusing an existing ``BSLeafAnimNode``
+    table entry if the file already has one, otherwise appending a new
+    table entry, exactly mirrors how NifSkope/the game itself resolve a
+    block's type: by index into this table. Every other byte of block data
+    is left untouched.
+
+    Raises ValueError if block 0 isn't actually typed NiNode (so callers
+    don't silently mis-patch an unexpected file shape).
+    """
+    table = _nif_block_type_table(data)
+    block_types = table["block_types"]
+    block_type_index = list(table["block_type_index"])
+
+    if b'NiNode' not in block_types:
+        raise ValueError("no NiNode entry in block-type table")
+    if block_type_index[0] != block_types.index(b'NiNode'):
+        raise ValueError("root (block 0) isn't typed NiNode -- refusing to patch")
+
+    if b'BSLeafAnimNode' in block_types:
+        new_index = block_types.index(b'BSLeafAnimNode')
+        new_block_types_bytes = data[table["block_types_start"]:table["block_types_end"]]
+        new_num_block_types = table["num_block_types"]
+    else:
+        new_index = table["num_block_types"]
+        new_block_types_bytes = (
+            data[table["block_types_start"]:table["block_types_end"]]
+            + struct.pack('<I', len(b'BSLeafAnimNode'))
+            + b'BSLeafAnimNode'
+        )
+        new_num_block_types = table["num_block_types"] + 1
+
+    block_type_index[0] = new_index
+
+    return (
+        data[:table["num_block_types_pos"]]
+        + struct.pack('<H', new_num_block_types)
+        + new_block_types_bytes
+        + struct.pack('<%dH' % table["numblocks"], *block_type_index)
+        + data[table["block_type_index_end"]:]
+    )
+
+
+def patch_wind_root_node(exported_path, obj=None, original_path=None) -> dict:
+    """Reconstruct the ``BSLeafAnimNode`` root wrapper on a freshly exported
+    wind-foliage NIF, when PyNifly's export dropped it in favor of a plain
+    ``NiNode``.
+
+    Root cause: PyNifly's public add_block()/NifFile API has no way to
+    create or relabel a block as BSLeafAnimNode distinctly from NiNode --
+    confirmed via source inspection (both are defined as pure NiNode
+    aliases in pynifly.py) and via the raw NiflyDLL.dll CDLL (no header/
+    block-type manipulation function exposed at all). So every PyNifly
+    export of a wind-animated mesh writes a plain NiNode root, even though
+    every real FO4 wind-foliage file (vanilla and this mod's own originals)
+    uses a BSLeafAnimNode root paired with the Vertex_Colors|Tree_Anim
+    shader flags PyNifly DOES write correctly. Verified via side-by-side
+    reference comparison (Cedar01.nif, TreeMaplePreWar02.nif, and the
+    original unpatched DeadShrubGS02.nif all use BSLeafAnimNode roots) that
+    those flags are legitimate for wind foliage -- the missing root type is
+    the actual defect, not the flags. Verified safe end-to-end: the patched
+    root loads correctly through PyNifly's own NifFile parser (root class
+    reports as BSLeafAnimNode) and through the real Blender import operator.
+
+    This is a raw post-export binary patch (see _patch_root_to_leafanim_bytes)
+    because there is no PyNifly API path to it; it does not require PyNifly
+    to be installed at all.
+
+    Only applies when there's real evidence this object is wind-animated
+    foliage that should get the BSLeafAnimNode treatment, to avoid
+    mistyping an unrelated NiNode-rooted asset:
+      - the object still carries (or carried, before the pynifly-skinning
+        cleanup) a "Wind" vertex group, i.e. AnimationHelpers.apply_wind_
+        animation's procedural wind pipeline was used on it, or
+      - *original_path* is a real source NIF whose own root is already
+        BSLeafAnimNode (a round-trip case -- restore what the original had).
+
+    Returns ``{"restored": [...], "could_not_restore": [...]}``, following
+    this module's convention. An object with neither signal returns both
+    lists empty (not applicable, not a failure).
+    """
+    report = {"restored": [], "could_not_restore": []}
+
+    has_wind_group = False
+    try:
+        has_wind_group = bool(obj is not None and obj.vertex_groups.get("Wind"))
+    except Exception:
+        has_wind_group = False
+
+    original_is_leafanim = False
+    if original_path and os.path.isfile(original_path):
+        try:
+            with open(original_path, "rb") as fh:
+                orig_data = fh.read()
+            original_is_leafanim = _root_block_type(orig_data) == b'BSLeafAnimNode'
+        except Exception:
+            original_is_leafanim = False
+
+    if not (has_wind_group or original_is_leafanim):
+        return report
+
+    if not exported_path or not os.path.isfile(exported_path):
+        return report
+
+    try:
+        with open(exported_path, "rb") as fh:
+            data = fh.read()
+        current_root_type = _root_block_type(data)
+        if current_root_type == b'BSLeafAnimNode':
+            return report  # already correct (e.g. round-tripped original)
+        if current_root_type != b'NiNode':
+            report["could_not_restore"].append(
+                f"BSLeafAnimNode root (unexpected root type {current_root_type!r})"
+            )
+            return report
+        patched = _patch_root_to_leafanim_bytes(data)
+        with open(exported_path, "wb") as fh:
+            fh.write(patched)
+        report["restored"].append("root node -> BSLeafAnimNode (wind foliage)")
+    except Exception as exc:
+        report["could_not_restore"].append(f"BSLeafAnimNode root ({exc})")
 
     return report
 
