@@ -70,20 +70,16 @@ class SkeletonAlignmentWizard:
             # Uses the real before/after diff above, not bpy.context.selected_objects
             # -- a stale selection left over from before this call could otherwise
             # get mis-scaled/renamed "FO4_Skeleton" if the import silently no-op'd.
-            _fo4_scale = 1.0 / 69.99125
-            _scalable = {'MESH', 'ARMATURE', 'CURVE', 'SURFACE'}
-            _imported = [o for o in _new if o.type in _scalable]
-            bpy.ops.object.select_all(action='DESELECT')
+            # Shrunk as one arrangement (see fo4_scale) so bones, bone-parented
+            # helpers and pose offsets all land at the same 1/70.
+            from . import fo4_scale as _fs
+            _fs.shrink_imported(bpy.context, _new)
+            _imported = [o for o in _new if o.type in {'MESH', 'ARMATURE', 'CURVE', 'SURFACE'}]
             for _obj in _imported:
-                bpy.context.view_layer.objects.active = _obj
-                _obj.select_set(True)
-                _obj.scale = (_fo4_scale, _fo4_scale, _fo4_scale)
                 try:
-                    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                    _obj["fo4_source_nif"] = skeleton_nif_path
                 except Exception:
-                    _obj.scale = (1.0, 1.0, 1.0)
-                _obj["fo4_unit_scale"] = 69.99125
-                _obj.select_set(False)
+                    pass
             for obj in _imported:
                 if obj.type == 'ARMATURE':
                     obj.name = "FO4_Skeleton"

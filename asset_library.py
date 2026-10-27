@@ -639,20 +639,27 @@ class FO4_OT_ImportLibraryAsset(Operator):
                     # before/after diff above, not context.selected_objects -- a
                     # stale selection left over from before this call could
                     # otherwise get mis-scaled if the import silently no-op'd.
-                    _fo4_scale = 1.0 / 69.99125
-                    _scalable = {'MESH', 'ARMATURE', 'CURVE', 'SURFACE'}
-                    _imported = [o for o in _new_objs if o.type in _scalable]
-                    bpy.ops.object.select_all(action='DESELECT')
-                    for _obj in _imported:
-                        context.view_layer.objects.active = _obj
-                        _obj.select_set(True)
-                        _obj.scale = (_fo4_scale, _fo4_scale, _fo4_scale)
+                    # Shrunk as one arrangement (see fo4_scale): the per-object
+                    # version left multi-mesh NIFs scattered and reset a mesh
+                    # to full game size whenever transform_apply failed.
+                    from . import fo4_scale as _fs
+                    _fs.shrink_imported(context, _new_objs)
+                    for _obj in _new_objs:
                         try:
-                            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                            _obj["fo4_source_nif"] = filepath
                         except Exception:
-                            _obj.scale = (1.0, 1.0, 1.0)
-                        _obj["fo4_unit_scale"] = 69.99125
-                        _obj.select_set(False)
+                            pass
+                    # Repair any texture whose file PyNifly couldn't find,
+                    # without touching the materials it built correctly.
+                    try:
+                        from . import fo4_texture_resolver as _ftr
+                        for _obj in _new_objs:
+                            if _obj.type == 'MESH':
+                                _ok, _m = _ftr.resolve_and_apply(
+                                    _obj, filepath, extra_roots=_ftr.preferred_roots(context))
+                                print(f"[FO4Tex] {_obj.name}: {_m}")
+                    except Exception as _te:
+                        print(f"[FO4Tex] texture repair skipped: {_te}")
                     self.report({'INFO'}, f"Imported NIF: {name}")
                 else:
                     self.report(

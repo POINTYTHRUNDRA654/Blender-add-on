@@ -333,7 +333,7 @@ def _write_nistring(s: str) -> bytes:
 # (io_scene_nifly/pyn/bgsmaterial.py, which ships its own tests against
 # real files and is used by PyNifly's own NIF import/export) and tracing
 # its exact field-read sequence against real vanilla files
-# (F:\FO4 WORKING FLODER\Materials\Barnacle.BGSM for BGSM,
+# (vanilla Data\Materials\Barnacle.BGSM for BGSM,
 # ...\DefaultEffect.BGEM for BGEM, both confirmed format version 2 -- the
 # only version observed across 500+/all real sampled files respectively).
 # The previous layout in this module was entirely invented and failed to
@@ -890,6 +890,29 @@ def _normalize_tex_path(raw: str) -> str:
     return raw
 
 
+_SOURCE_IMAGE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".exr", ".psd")
+
+
+def _bgsm_texture_ref(path: str) -> str:
+    """Texture path in the form vanilla BGSMs store it.
+
+    Vanilla FO4 materials reference textures relative to Data\\Textures with
+    no "Textures\\" prefix and always as .dds (e.g. kelp.BGSM ->
+    "Landscape/Plants/kelp_d.dds"). Material exports were writing the Blender
+    image path as-is -- "Textures\\...\\x_d.png" -- which points at a file
+    that never ships (export_textures_for_object converts it to .dds).
+    """
+    if not path:
+        return path
+    p = path.replace("/", "\\")
+    if p.lower().startswith("textures\\"):
+        p = p[len("textures\\"):]
+    root, ext = os.path.splitext(p)
+    if ext.lower() in _SOURCE_IMAGE_EXTS:
+        p = root + ".dds"
+    return p
+
+
 def _get_image_node_path(mat, node_name: str) -> str:
     """Return the filepath of the image node for *node_name* in *mat*.
 
@@ -1032,11 +1055,11 @@ def blender_mat_to_bgsm(mat, is_lod: bool = False) -> BGSMData:
         except OSError:
             pass
 
-    data.diffuse_texture = _get_image_node_path(mat, "Diffuse")
-    data.normal_texture = _get_image_node_path(mat, "Normal")
-    data.smooth_spec_texture = _get_image_node_path(mat, "Specular")
-    data.greyscale_texture = _get_image_node_path(mat, "Glow")
-    data.env_map_texture = _get_image_node_path(mat, "EnvMap")
+    data.diffuse_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Diffuse"))
+    data.normal_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Normal"))
+    data.smooth_spec_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Specular"))
+    data.greyscale_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Glow"))
+    data.env_map_texture = _bgsm_texture_ref(_get_image_node_path(mat, "EnvMap"))
 
     # When a Glow (_g) texture is assigned, auto-enable the emission / glow-map
     # flags so the BGSM always exports with the correct shader settings.
@@ -1515,6 +1538,67 @@ def _bgsm_output_path(obj, output_dir: str, mat_name: str) -> str:
     return os.path.join(output_dir, safe_name + ".bgsm")
 
 
+def _bgsm_targets_via_pynifly(filepath, meshes):
+    """Exact per-shape targets: read the exported NIF with PyNifly and pair
+    each shape with its Blender mesh BY NAME, taking that shape's own shader
+    material path. Returns None (caller falls back) when PyNifly isn't
+    available or any materialed mesh can't be matched to a shape.
+
+    Shapes with no .bgsm (textures embedded in the NIF) come back with a
+    ``None`` bgsm path and the Textures folder their own texture set names.
+    """
+    import pathlib as _pl
+    try:
+        from io_scene_nifly.pyn import pynifly as _pyn
+        nf = _pyn.NifFile(str(filepath))
+    except Exception:
+        return None
+
+    def _norm(n):
+        return str(n or "").split(":")[0].strip().lower()
+
+    shapes = {}
+    for s in nf.shapes:
+        shapes.setdefault(_norm(s.name), s)
+    parts = _pl.Path(filepath).resolve().parts
+    mi = next((i for i, p in enumerate(parts) if p.lower() == "meshes"), None)
+    root = _pl.Path(*parts[:mi]) if mi is not None else _pl.Path(filepath).resolve().parent
+
+    out = []
+    for m in meshes:
+        if not m.data.materials:
+            continue
+        s = shapes.get(_norm(m.name)) or shapes.get(_norm(m.get("fo4_original_name")))
+        if s is None:
+            return None
+        sname = str(getattr(s, "shader_name", "") or "").replace("/", "\\")
+        tex_rel = ""
+        try:
+            tex_rel = str((s.shader.textures or {}).get("Diffuse", "") or "")
+        except Exception:
+            tex_rel = ""
+        if sname.lower().endswith((".bgsm", ".bgem")):
+            rel_parts = [p for p in sname.split("\\") if p]
+            if rel_parts and rel_parts[0].lower() == "materials":
+                rel_parts = rel_parts[1:]
+            bgsm_path = root / "Materials" / _pl.Path(*rel_parts)
+            tex_dir = root / "Textures" / _pl.Path(*rel_parts[:-1]) if len(rel_parts) > 1 else root / "Textures"
+        else:
+            bgsm_path = None
+            tparts = [p for p in tex_rel.replace("/", "\\").split("\\") if p]
+            low = [p.lower() for p in tparts]
+            if "textures" in low:
+                tparts = tparts[low.index("textures") + 1:]
+                tex_dir = root / "Textures" / _pl.Path(*tparts[:-1]) if len(tparts) > 1 else root / "Textures"
+            else:
+                # A path outside any Textures\\ folder (or an absolute one):
+                # mirror the NIF's own Meshes\\ sub-folders instead.
+                nparts = _pl.Path(filepath).resolve().parts
+                tex_dir = root / "Textures" / _pl.Path(*nparts[mi + 1:-1]) if mi is not None else root / "Textures"
+        out.append((m, bgsm_path, tex_dir))
+    return out or None
+
+
 def bgsm_targets_from_exported_nif(filepath, meshes):
     """Figure out the *real* .bgsm output path for each mesh in *meshes* by
     reading the materials\\...\\X.bgsm string(s) actually baked into the
@@ -1546,6 +1630,9 @@ def bgsm_targets_from_exported_nif(filepath, meshes):
     """
     import re as _re_bt
     import pathlib as _pl_bt
+    _exact = _bgsm_targets_via_pynifly(filepath, meshes)
+    if _exact is not None:
+        return _exact
     try:
         with open(filepath, "rb") as _fh_bt:
             _data_bt = _fh_bt.read()
@@ -1593,6 +1680,61 @@ def bgsm_targets_from_exported_nif(filepath, meshes):
     return out
 
 
+def _game_data_root() -> str:
+    """The extracted Fallout 4 Data folder from the add-on preferences
+    (falling back to the scene property), or '' when not set."""
+    root = ""
+    try:
+        from . import preferences as _prefs_mod
+        _p = _prefs_mod.get_preferences()
+        root = (getattr(_p, "fo4_game_data_path", "") or "") if _p else ""
+    except Exception:
+        pass
+    if not root and bpy is not None:
+        try:
+            root = getattr(bpy.context.scene, "fo4_game_data_path", "") or ""
+        except Exception:
+            root = ""
+    if not root:
+        return ""
+    return bpy.path.abspath(root) if bpy is not None else root
+
+
+def _resource_rel(path: str, folder: str) -> str:
+    """'Materials\\a\\b.bgsm' style path from the LAST *folder* segment of
+    *path* ('' when the path has no such segment)."""
+    parts = os.path.normpath(str(path)).split(os.sep)
+    idx = max((i for i, p in enumerate(parts) if p.lower() == folder), default=None)
+    return os.path.join(*parts[idx:]) if idx is not None else ""
+
+
+def keep_existing_reason(dest_path: str, folder: str, src_path: str = "") -> str:
+    """Why an export must NOT write *dest_path*, or '' when it is new.
+
+    Export only ever ADDS files: a material/texture already at the
+    destination is never replaced, and one the game already has at the same
+    Materials\\/Textures\\ path (in the extracted Data folder) is not copied
+    into the mod. *src_path* living inside the game Data folder also counts
+    as "the game already has it".
+    """
+    if os.path.exists(dest_path):
+        return f"kept existing {os.path.basename(dest_path)} (not replaced)"
+    gdata = _game_data_root()
+    if gdata and os.path.isdir(gdata):
+        try:
+            if src_path and os.path.normcase(os.path.abspath(src_path)).startswith(
+                    os.path.normcase(os.path.abspath(gdata)) + os.sep):
+                return f"{os.path.basename(dest_path)} is a game file (not copied)"
+        except Exception:
+            pass
+        rel = _resource_rel(dest_path, folder)
+        if rel and os.path.isfile(os.path.join(gdata, rel)):
+            if os.path.normcase(os.path.abspath(os.path.join(gdata, rel))) != \
+                    os.path.normcase(os.path.abspath(dest_path)):
+                return f"{rel} is a game file (not copied)"
+    return ""
+
+
 def export_bgsm_to_path(obj, out_path, *, is_lod: bool = False) -> tuple[bool, str]:
     """Write *obj*'s active material's BGSM straight to an explicit
     *out_path*, bypassing the name-guessing in :func:`export_bgsm_for_object`
@@ -1603,6 +1745,9 @@ def export_bgsm_to_path(obj, out_path, *, is_lod: bool = False) -> tuple[bool, s
     mat = obj.data.materials[0]
     if mat is None:
         return (False, "Empty material slot skipped")
+    _keep = keep_existing_reason(str(out_path), "materials")
+    if _keep:
+        return (True, _keep)
     try:
         import os as _os_bt
         _os_bt.makedirs(_os_bt.path.dirname(str(out_path)), exist_ok=True)
@@ -1648,8 +1793,12 @@ def export_bgsm_for_object(
             results.append((False, "Empty material slot skipped"))
             continue
         try:
-            bgsm_data = blender_mat_to_bgsm(mat, is_lod=is_lod)
             out_path = _bgsm_output_path(obj, output_dir, mat.name)
+            _keep = keep_existing_reason(out_path, "materials")
+            if _keep:
+                results.append((True, _keep))
+                continue
+            bgsm_data = blender_mat_to_bgsm(mat, is_lod=is_lod)
             raw = write_bgsm(bgsm_data)
             with open(out_path, "wb") as fh:
                 fh.write(raw)
@@ -1770,7 +1919,18 @@ def export_textures_for_object(
             seen_src.add(src_norm)
 
             _subdir = _game_relative_texture_subdir(src_path)
-            _dest_dir = os.path.join(output_dir, _subdir) if _subdir else output_dir
+            if _subdir:
+                # _subdir is relative to the Textures ROOT, but output_dir is
+                # usually already Textures\\<material subfolders> (see
+                # bgsm_targets_from_exported_nif) -- joining the two nested the
+                # path twice (Textures\\A\\B\\A\\B\\x.dds). Anchor at the
+                # last "Textures" folder of output_dir instead.
+                _od_parts = os.path.normpath(output_dir).split(os.sep)
+                _ti = max((i for i, _p in enumerate(_od_parts) if _p.lower() == "textures"), default=None)
+                _tex_root = os.sep.join(_od_parts[:_ti + 1]) if _ti is not None else output_dir
+                _dest_dir = os.path.join(_tex_root, _subdir)
+            else:
+                _dest_dir = output_dir
             os.makedirs(_dest_dir, exist_ok=True)
 
             src_ext = os.path.splitext(src_path)[1].lower()
@@ -1788,13 +1948,13 @@ def export_textures_for_object(
                 # sitting in a mod folder got silently overwritten by a 512
                 # one during export, because this copy only ever checked
                 # whether source == destination, never what was already there.
-                if os.path.exists(dest_path) and _nvtt and _nvtt.is_texture_size_downgrade(dest_path, src_path):
-                    results.append((False, (
-                        f"Skipped '{os.path.basename(src_path)}': the file already at "
-                        f"{dest_path} is higher resolution than the texture currently "
-                        f"loaded in Blender. Not overwriting it -- delete the existing "
-                        f"file first if replacing it with a smaller one is intentional."
-                    )))
+                # Export only ADDS textures: one already at the destination is
+                # never replaced, and a game texture (in the extracted Data
+                # folder) isn't copied into the mod. Earlier incident this also
+                # covers: a correct 2K texture overwritten by a 512 one.
+                _keep = keep_existing_reason(dest_path, "textures", src_path)
+                if _keep:
+                    results.append((True, _keep))
                     continue
                 try:
                     import shutil as _shutil
@@ -1807,6 +1967,10 @@ def export_textures_for_object(
             # Non-DDS source (PNG/TGA/etc.) -- convert via texconv/NVTT so the
             # shipped asset is actually loadable by FO4, which has no PNG/TGA
             # texture support at all.
+            _keep = keep_existing_reason(dest_dds, "textures", src_path)
+            if _keep:
+                results.append((True, _keep))
+                continue
             converted = False
             if _nvtt and (_nvtt.NVTTHelpers.is_nvtt_available() or _nvtt.NVTTHelpers.is_texconv_available()):
                 try:
@@ -1827,15 +1991,11 @@ def export_textures_for_object(
                 # texconv/NVTT to convert it) fall back to a file-size
                 # heuristic: a larger existing file is very likely a
                 # higher-quality texture that shouldn't be silently replaced.
-                if (dest_norm != src_norm and os.path.exists(dest_path)
-                        and os.path.getsize(dest_path) > os.path.getsize(src_path)):
-                    results.append((False, (
-                        f"Skipped '{os.path.basename(src_path)}': the file already at "
-                        f"{dest_path} is larger than the texture currently loaded in "
-                        f"Blender. Not overwriting it -- delete the existing file first "
-                        f"if replacing it with a smaller one is intentional."
-                    )))
-                    continue
+                if dest_norm != src_norm:
+                    _keep = keep_existing_reason(dest_path, "textures", src_path)
+                    if _keep:
+                        results.append((True, _keep))
+                        continue
                 try:
                     import shutil as _shutil
                     _shutil.copy2(src_path, dest_path)

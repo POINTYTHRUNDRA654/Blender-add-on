@@ -171,6 +171,11 @@ class FO4_PT_VegetationPanel(_FO4SubPanel):
         r1 = col.row(align=True)
         r1.operator("fo4.vegetation_wind_setup", text="Vegetation Wind (Vertex Groups)", icon='PARTICLES')
         r1.operator("fo4.generate_wind_weights", text="", icon='WPAINT_HLT')
+        uw = col.row(align=True)
+        op = uw.operator("fo4.vegetation_wind_setup", text="Underwater: Kelp / Seaweed", icon='MOD_OCEAN')
+        op.preset = 'KELP'
+        op = uw.operator("fo4.vegetation_wind_setup", text="Soft Coral", icon='MOD_OCEAN')
+        op.preset = 'CORAL_SOFT'
         # Batch wind pipeline disabled in the public build -- unreliable across the
         # range of mesh shapes real FO4 vegetation/props come in (verified 2026-09;
         # see DEVELOPMENT_NOTES.md and ui_panels.py's ENABLE_BATCH_WIND_TOOLS flag).

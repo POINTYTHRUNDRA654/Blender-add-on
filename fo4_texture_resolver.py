@@ -141,11 +141,21 @@ def _find_file(ref, roots, deep_roots=None):
     ext = Path(name).suffix.lower()
     exts = [ext] + [e for e in _IMG_EXTS + ['.bgsm', '.bgem'] if e != ext]
 
+    # NIF texture sets and BGSM files store paths WITHOUT the resource folder
+    # ("SetDressing/ParkBench01_d.dds", "Landscape/Plants/Holly.bgsm"); the
+    # file itself lives under Textures/ or Materials/ of a data root.
+    rels = [rel]
+    _low = rel.lower()
+    if not (_low.startswith('textures/') or _low.startswith('materials/')):
+        rels.append(('materials/' if ext in ('.bgsm', '.bgem') else 'textures/') + rel)
+
     # 1. exact relative path under each root (handles the normal MO2 mod layout)
     for root in roots:
-        cand = root / rel
-        if cand.exists():
-            return cand
+        for r in rels:
+            cand = root / r
+            if cand.exists():
+                return cand
+    rel = rels[-1]
     # 2. same relative path but with an alternate image extension present
     for root in roots:
         relp = Path(rel)
@@ -404,14 +414,217 @@ def _pick_bgsm_by_name(name, bgsm_refs, roots, deep_roots):
     return None, None, False
 
 
+def preferred_roots(context=None):
+    """Extra data roots from the add-on preferences (falling back to the scene
+    properties): the MO2 mods folder and the extracted game Data folder."""
+    roots = []
+    mo2 = gdata = ""
+    try:
+        from . import preferences as _prefs_mod
+        _p = _prefs_mod.get_preferences()
+        if _p:
+            mo2 = getattr(_p, "fo4_mo2_mods_root", "") or ""
+            gdata = getattr(_p, "fo4_game_data_path", "") or ""
+    except Exception:
+        pass
+    scene = getattr(context, "scene", None) if context is not None else None
+    if scene is None and bpy is not None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene is not None:
+        mo2 = mo2 or (getattr(scene, "fo4_mo2_mods_root", "") or "")
+        gdata = gdata or (getattr(scene, "fo4_game_data_path", "") or "")
+    for r in (mo2, gdata):
+        if r:
+            roots.append(bpy.path.abspath(r))
+    return roots
+
+
+# PyNifly builds every imported FO4 shape's material around its own
+# "Fallout 4 MTS" node group, with image nodes named after the NIF texture
+# slots and wired into the group's inputs.
+_PYN_NODE = {'diffuse': 'Diffuse_Texture', 'normal': 'Normal_Texture',
+             'specular': 'Specular_Texture', 'glow': 'Glow_Texture'}
+_PYN_INPUT = {'diffuse': 'Diffuse', 'normal': 'Normal',
+              'specular': 'Smooth Spec', 'glow': 'Glow'}
+_NIF_PROP = {'diffuse': 'BSShaderTextureSet_Diffuse', 'normal': 'BSShaderTextureSet_Normal',
+             'specular': 'BSShaderTextureSet_Specular', 'glow': 'BSShaderTextureSet_Glow'}
+_BGSM_ATTR = {'diffuse': 'diffuse_texture', 'normal': 'normal_texture',
+              'specular': 'smooth_spec_texture', 'glow': 'glow_texture'}
+
+
+def _image_works(img):
+    """True when an image actually has pixels to show: packed, or its file
+    exists on disk."""
+    if img is None:
+        return False
+    try:
+        if img.packed_file is not None:
+            return True
+        fp = bpy.path.abspath(img.filepath) if img.filepath else ""
+        return bool(fp) and os.path.isfile(fp)
+    except Exception:
+        return False
+
+
+def _surface_node(mat):
+    for n in mat.node_tree.nodes:
+        if n.type == 'OUTPUT_MATERIAL' and n.inputs.get('Surface') and n.inputs['Surface'].links:
+            return n.inputs['Surface'].links[0].from_node
+    return None
+
+
+def _is_nif_material(mat):
+    """A material PyNifly built from a NIF shader (its own FO4 node group)."""
+    if mat is None or not mat.use_nodes or not mat.node_tree:
+        return False
+    if mat.get('BS_Shader_Block_Name') or mat.get('BSLSP_Shader_Name'):
+        return True
+    s = _surface_node(mat)
+    return bool(s and s.type == 'GROUP' and s.node_tree and 'fallout 4' in s.node_tree.name.lower())
+
+
+def _exact_texture_set(mat, roots, deep_roots):
+    """The exact textures this one shape uses, straight from its own data:
+    the shape's BGSM (named in the material) when it has one -- that is what
+    the game reads -- else the NIF's own texture set. No name guessing.
+    Returns (slot -> resolved file path, bgsm file or None, slot -> wanted ref)."""
+    wanted = {}
+    bgsm_file = None
+    shader_name = str(mat.get('BSLSP_Shader_Name', '') or '').strip()
+    if shader_name.lower().endswith(('.bgsm', '.bgem')):
+        bgsm_file = _find_file(shader_name, roots, deep_roots)
+        if bgsm_file:
+            try:
+                from . import bgsm_helpers
+                raw = open(bgsm_file, 'rb').read()
+                try:
+                    data = bgsm_helpers.read_bgsm(raw)
+                except Exception:
+                    data = bgsm_helpers._bgsm_scrape_textures(raw)
+                if data is not None:
+                    for slot, attr in _BGSM_ATTR.items():
+                        rel = (getattr(data, attr, '') or '').strip()
+                        if rel:
+                            wanted[slot] = rel
+            except Exception as exc:
+                print(f"[FO4Tex] BGSM read failed ({exc})")
+    for slot, prop in _NIF_PROP.items():
+        if slot not in wanted:
+            rel = str(mat.get(prop, '') or '').strip()
+            if rel:
+                wanted[slot] = rel
+    resolved = {}
+    for slot, rel in wanted.items():
+        hit = _find_file(rel, roots, deep_roots)
+        if hit:
+            resolved[slot] = str(hit)
+    return resolved, bgsm_file, wanted
+
+
+def _repair_nif_material(mat, resolved, force=False):
+    """Fill in PyNifly's own texture nodes. A node whose image already works is
+    left alone (unless *force*); a node whose file is missing gets the exact
+    file; a slot PyNifly left out gets a node wired into the FO4 group.
+    The material's output is never rewired."""
+    nt = mat.node_tree
+    group = _surface_node(mat)
+    uv = nt.nodes.get('UV_Converter')
+    repaired = []
+    for slot, path in resolved.items():
+        node = nt.nodes.get(_PYN_NODE[slot])
+        if node is not None and node.type == 'TEX_IMAGE':
+            if _image_works(node.image) and not force:
+                continue
+            if force and node.image and _image_works(node.image) and \
+                    os.path.normcase(bpy.path.abspath(node.image.filepath)) == os.path.normcase(path):
+                continue
+            img = _load_image(path)
+            if img is None:
+                continue
+            if slot != 'diffuse':
+                try:
+                    img.colorspace_settings.name = 'Non-Color'
+                except Exception:
+                    pass
+            node.image = img
+            repaired.append(slot)
+            continue
+        # PyNifly made no node for this slot (e.g. the NIF texture set was
+        # empty and only the BGSM names it): add one into the FO4 group.
+        if group is None or group.type != 'GROUP':
+            continue
+        sock = group.inputs.get(_PYN_INPUT[slot])
+        if sock is None or sock.links:
+            continue
+        img = _load_image(path)
+        if img is None:
+            continue
+        if slot != 'diffuse':
+            try:
+                img.colorspace_settings.name = 'Non-Color'
+            except Exception:
+                pass
+        node = nt.nodes.new('ShaderNodeTexImage')
+        node.name = node.label = _PYN_NODE[slot]
+        node.image = img
+        node.location = (group.location[0] - 400, group.location[1] - 260 * len(repaired))
+        nt.links.new(node.outputs['Color'], sock)
+        if uv is not None and uv.outputs.get('Vector'):
+            nt.links.new(uv.outputs['Vector'], node.inputs['Vector'])
+        repaired.append(slot)
+    return repaired
+
+
+def _repair_broken_paths(mat, roots, deep_roots):
+    """For any material: re-point image nodes whose file is missing to the same
+    file name found under the asset's folders / data roots. Nothing else."""
+    fixed = []
+    for n in mat.node_tree.nodes:
+        if n.type != 'TEX_IMAGE' or n.image is None or _image_works(n.image):
+            continue
+        ref = n.image.filepath or n.image.name
+        if not ref:
+            continue
+        hit = _find_file(ref, roots, deep_roots) or _find_file(Path(ref.replace('\\', '/')).name, roots, deep_roots)
+        if hit:
+            try:
+                n.image.filepath = str(hit)
+                n.image.reload()
+                fixed.append(Path(str(hit)).name)
+            except Exception:
+                pass
+    return fixed
+
+
+def _has_working_texture(mat):
+    try:
+        return any(n.type == 'TEX_IMAGE' and _image_works(n.image)
+                   and any(o.links for o in n.outputs)
+                   for n in mat.node_tree.nodes)
+    except Exception:
+        return False
+
+
 def resolve_and_apply(obj, source_path, extra_roots=None, force=False):
-    """Resolve an imported FO4 asset's BGSM textures and wire them onto *obj*.
+    """Make an imported asset's materials show their real textures.
 
-    ``force`` re-resolves even if the mesh already has a textured material (used
-    by the manual operator); the automatic import path leaves an already-
-    textured mesh untouched so PyNifly's correct per-shape materials survive.
+    Rules (each confirmed against real PyNifly imports of vanilla NIFs):
+      * A material PyNifly built (its "Fallout 4 MTS" group) is kept as is.
+        Only image nodes whose file is missing are filled in, from this
+        shape's own BGSM / texture set -- the old version replaced every such
+        material with a new Principled BSDF and guessed textures by name,
+        which unplugged correct materials and put e.g. the sky cubemap on a
+        pistol and the hedgerow texture on a holly bush.
+      * Any other material (FBX/OBJ/GLB, hand-made) only gets missing image
+        files re-pointed to the same file name under the asset's folders.
+      * A NIF material with no texture nodes at all falls back to the exact
+        per-shape texture set (PyNifly's parse, then a name-matched BGSM only
+        when the match is confident).
 
-    Returns (success: bool, message: str).  Safe/no-op if nothing is found.
+    ``force`` (manual "Resolve FO4 Textures" button) also re-points working
+    NIF texture nodes to the exact BGSM textures when they differ.
+
+    Returns (success: bool, message: str).
     """
     if bpy is None or obj is None or getattr(obj, 'type', None) != 'MESH':
         return False, "no mesh object"
@@ -420,10 +633,8 @@ def resolve_and_apply(obj, source_path, extra_roots=None, force=False):
     if not roots:
         return False, "no search roots found near the asset"
 
-    # Deep (recursive) search is reserved for the asset's OWN mod folder.  The
-    # global data/MO2 roots passed as extra_roots are used only for fast exact-
-    # path lookups — never recursively crawled (they can hold every game asset
-    # and would stall the import for minutes).
+    # Deep (recursive) search only in the asset's own folder; the global data
+    # / MO2 roots get fast exact-path lookups only.
     _extra_set = set()
     for _r in (extra_roots or []):
         try:
@@ -433,201 +644,102 @@ def resolve_and_apply(obj, source_path, extra_roots=None, force=False):
     deep_roots = [r for r in roots if r.resolve() not in _extra_set]
 
     src = Path(source_path)
-    bgsm_refs, dds_refs = ([], [])
-    if src.suffix.lower() == '.nif':
-        bgsm_refs, dds_refs = _scan_nif_refs(src)
+    is_nif = src.suffix.lower() == '.nif'
+    bgsm_refs, dds_refs = (_scan_nif_refs(src) if is_nif else ([], []))
 
-    def _texmap_from_shape(shape_name):
-        """Read the exact per-shape texture set straight from PyNifly's own
-        NIF parse — no name-matching heuristics involved at all, since this
-        is the literal data that shape's BSLightingShaderProperty carries.
+    done, missing, kept = [], [], 0
+    for slot in list(getattr(obj, 'material_slots', [])):
+        mat = slot.material
+        if mat is None:
+            continue
+        if not mat.use_nodes:
+            mat.use_nodes = True
 
-        Some FO4 NIFs embed texture paths directly in the shader's own
-        BSShaderTextureSet (not only via an external .bgsm), which is a
-        per-SHAPE field the raw byte-scan (_scan_nif_refs, which only finds
-        `.bgsm` file references) has no way to see — confirmed on a real
-        multi-shape landscape NIF where only ONE `.bgsm` existed in the
-        whole file (shared/irrelevant to one of the two shapes) while each
-        shape's actual Diffuse/Normal/Specular came from its own shader
-        block. Returns tex_map dict or None if unavailable/not found.
-        """
-        if src.suffix.lower() != '.nif' or not shape_name:
-            return None
-        try:
-            from io_scene_nifly.pyn import pynifly as _pyn
-        except Exception:
-            return None
-        try:
-            _nf = _pyn.NifFile(str(src))
-        except Exception:
-            return None
-        _shape = next((s for s in _nf.shapes if s.name == shape_name), None)
-        if _shape is None or _shape.shader is None:
-            return None
-        _tex = getattr(_shape.shader, 'textures', None) or {}
-        tex_map = {}
-        for key, slot in (('Diffuse', 'diffuse'), ('Normal', 'normal'),
-                          ('Specular', 'specular'), ('Glow', 'glow')):
-            rel = (_tex.get(key) or '').strip()
-            if not rel:
-                continue
-            hit = _find_file(rel, roots, deep_roots)
-            if hit:
-                tex_map[slot] = str(hit)
-        return tex_map or None
+        if _is_nif_material(mat):
+            resolved, bgsm_file, wanted = _exact_texture_set(mat, roots, deep_roots)
+            if bgsm_file:
+                try:
+                    mat["fo4_bgsm_path"] = str(bgsm_file)
+                except Exception:
+                    pass
+            got = _repair_nif_material(mat, resolved, force=force)
+            done += got
+            for s, rel in wanted.items():
+                node = mat.node_tree.nodes.get(_PYN_NODE[s])
+                if s not in resolved and not (node is not None and _image_works(node.image)):
+                    missing.append(f"{s} ({rel})")
+            if not got:
+                kept += 1
+            continue
 
-    def _texmap_for(name_hint, shape_name=None):
-        """Resolve (tex_map, alpha_cutout, bgsm_file, confident) for one
-        material. Tries the exact per-shape texture set first (see
-        _texmap_from_shape); falls back to choosing the BGSM that best
-        matches *name_hint* (the material/mesh name). ``confident`` is False
-        when nothing scored a name match and this fell back to "first
-        resolvable BGSM" — see _pick_bgsm_by_name."""
+        fixed = _repair_broken_paths(mat, roots, deep_roots)
+        done += fixed
+        if _has_working_texture(mat):
+            if not fixed:
+                kept += 1
+            continue
+        if not is_nif:
+            continue
+
+        # A NIF material with nothing usable at all (e.g. imported by another
+        # NIF tool): use the exact per-shape data, or a confident BGSM match.
         tex_map = {}
         alpha_cutout = False
         bgsm_file = None
-        confident = False
-
-        _direct = _texmap_from_shape(shape_name)
-        if _direct:
-            return _direct, alpha_cutout, bgsm_file, True
-
-        if bgsm_refs:
-            _ref, bgsm_file, confident = _pick_bgsm_by_name(name_hint, bgsm_refs, roots, deep_roots)
-        if bgsm_file:
-            try:
-                from . import bgsm_helpers
-                _raw = open(bgsm_file, 'rb').read()
+        shape_name = obj.get('fo4_original_name') or obj.name
+        try:
+            from io_scene_nifly.pyn import pynifly as _pyn
+            _nf = _pyn.NifFile(str(src))
+            _shape = next((s for s in _nf.shapes if s.name == shape_name), None)
+            _tex = (getattr(_shape.shader, 'textures', None) or {}) if (_shape and _shape.shader) else {}
+            for key, sl in (('Diffuse', 'diffuse'), ('Normal', 'normal'),
+                            ('Specular', 'specular'), ('Glow', 'glow')):
+                rel = (_tex.get(key) or '').strip()
+                hit = _find_file(rel, roots, deep_roots) if rel else None
+                if hit:
+                    tex_map[sl] = str(hit)
+        except Exception:
+            pass
+        if not tex_map and bgsm_refs:
+            _ref, bgsm_file, confident = _pick_bgsm_by_name(mat.name, bgsm_refs, roots, deep_roots)
+            if bgsm_file and confident:
                 try:
-                    data = bgsm_helpers.read_bgsm(_raw)
-                except Exception:
-                    data = bgsm_helpers._bgsm_scrape_textures(_raw)
-                    if data is None:
-                        raise
-                for key, attr in (('diffuse', 'diffuse_texture'),
-                                  ('normal', 'normal_texture'),
-                                  ('specular', 'smooth_spec_texture'),
-                                  ('glow', 'glow_texture')):
-                    rel = (getattr(data, attr, '') or '').strip()
-                    if rel:
-                        hit = _find_file(rel, roots, deep_roots)
+                    from . import bgsm_helpers
+                    _raw = open(bgsm_file, 'rb').read()
+                    try:
+                        data = bgsm_helpers.read_bgsm(_raw)
+                    except Exception:
+                        data = bgsm_helpers._bgsm_scrape_textures(_raw)
+                    for key, attr in _BGSM_ATTR.items():
+                        rel = (getattr(data, attr, '') or '').strip()
+                        hit = _find_file(rel, roots, deep_roots) if rel else None
                         if hit:
                             tex_map[key] = str(hit)
-                name_l = (src.name + str(getattr(data, 'diffuse_texture', ''))).lower()
-                if (getattr(data, 'tree', False)
-                        or 'grass' in name_l or 'plant' in name_l
-                        or 'leaf' in name_l or 'foliage' in name_l
-                        or 'ivy' in name_l or 'vine' in name_l or 'bush' in name_l):
-                    alpha_cutout = True
-                print(f"[FO4Tex] BGSM '{Path(bgsm_file).name}' -> {list(tex_map)}")
-            except Exception as exc:
-                print(f"[FO4Tex] BGSM read failed ({exc})")
-        if 'diffuse' not in tex_map:
-            for ref in dds_refs:
-                hit = _find_file(ref, roots, deep_roots)
-                if not hit:
-                    continue
-                low = ref.lower()
-                if low.endswith('_n.dds'):
-                    tex_map.setdefault('normal', str(hit))
-                elif low.endswith('_s.dds'):
-                    tex_map.setdefault('specular', str(hit))
-                elif low.endswith('_g.dds'):
-                    tex_map.setdefault('glow', str(hit))
-                else:
-                    tex_map.setdefault('diffuse', str(hit))
-
-        # If still no diffuse, infer it from the normal or specular path.
-        # Many FO4 NIFs only embed _n/_s paths; the _d lives at the same
-        # location with the suffix swapped.
-        if 'diffuse' not in tex_map:
-            for key in ('normal', 'specular'):
-                ref_path = tex_map.get(key) or next(
-                    (r for r in dds_refs
-                     if r.lower().endswith(f'_{key[0]}.dds')), None
-                )
-                if not ref_path:
-                    continue
-                low = ref_path.lower()
-                for suffix in ('_n.dds', '_s.dds', '_g.dds', '_e.dds'):
-                    if low.endswith(suffix):
-                        candidate = ref_path[:-len(suffix)] + '_d.dds'
-                        hit = _find_file(candidate, roots, deep_roots)
-                        if hit:
-                            tex_map['diffuse'] = str(hit)
-                            print(f"[FO4Tex] inferred diffuse: {hit}")
-                        break
-                if 'diffuse' in tex_map:
-                    break
-
-        return tex_map, alpha_cutout, bgsm_file, confident
-
-    # Texture EVERY material slot so a merged multi-material mesh gets each slot
-    # textured, not just slot 0 (the old behaviour left extra slots white).
-    # Slots that already have a diffuse image are preserved unless force=True.
-    slots = list(getattr(obj, 'material_slots', []))
-    applied_all = []
-    skipped = 0
-    if slots:
-        for slot in slots:
-            mat = slot.material
-            if mat is None:
-                continue
-            _was_textured = _mat_already_textured(mat)
-            if not force and _was_textured:
-                skipped += 1
-                continue
-            tex_map, alpha_cutout, bgsm_file, confident = _texmap_for(
-                mat.name, shape_name=(obj.get('fo4_original_name') or obj.name)
-            )
-            if not tex_map:
-                continue
-            # A force re-resolve that couldn't confidently match a BGSM to
-            # THIS specific material would otherwise fall back to "first
-            # resolvable BGSM" and silently overwrite an already-correct
-            # material with the wrong mesh's texture (confirmed real case:
-            # a multi-shape vegetation NIF where one shape's BGSM couldn't be
-            # matched by name, so its sibling's texture got force-applied to
-            # both). Only allow the low-confidence fallback when there was
-            # nothing worth preserving in the first place.
-            if force and _was_textured and not confident:
-                skipped += 1
-                continue
-            got = _apply(obj, tex_map, alpha_cutout=alpha_cutout, mat=mat)
-            if got:
-                applied_all.extend(got)
-                # Stash the source .bgsm path so export can preserve fields
-                # Blender's node graph has no equivalent for (see bgsm_helpers
-                # .blender_mat_to_bgsm, which reads this back as a baseline).
-                if bgsm_file:
-                    try:
-                        mat["fo4_bgsm_path"] = str(bgsm_file)
-                    except Exception:
-                        pass
-    else:
-        _shape_name = obj.get('fo4_original_name') or getattr(obj, 'name', '')
-        tex_map, alpha_cutout, bgsm_file, _confident = _texmap_for(
-            getattr(obj, 'name', ''), shape_name=_shape_name
-        )
+                    alpha_cutout = bool(getattr(data, 'tree', False))
+                except Exception as exc:
+                    print(f"[FO4Tex] BGSM read failed ({exc})")
         if tex_map:
-            got = _apply(obj, tex_map, alpha_cutout=alpha_cutout)
-            if got:
-                applied_all.extend(got)
-                if bgsm_file and obj.data.materials and obj.data.materials[0]:
-                    try:
-                        obj.data.materials[0]["fo4_bgsm_path"] = str(bgsm_file)
-                    except Exception:
-                        pass
+            got = _apply(obj, tex_map, alpha_cutout=alpha_cutout, mat=mat)
+            done += got
+            if bgsm_file:
+                try:
+                    mat["fo4_bgsm_path"] = str(bgsm_file)
+                except Exception:
+                    pass
+        else:
+            missing.append(f"'{mat.name}' (no texture data found)")
 
-    if not applied_all:
-        if skipped:
-            return True, f"kept existing textures on {skipped} material slot(s)"
-        return False, ("no textures resolved - checked the BGSM and NIF refs "
-                       f"under {roots[0]}")
-    msg = "textures applied: " + ", ".join(sorted(set(applied_all)))
-    if skipped:
-        msg += f"  ({skipped} already-textured slot(s) kept)"
-    return True, msg
+    parts = []
+    if done:
+        parts.append("filled in: " + ", ".join(sorted(set(done))))
+    if kept:
+        parts.append(f"{kept} material(s) already complete, left as imported")
+    if missing:
+        parts.append("NOT found: " + "; ".join(missing[:4]) +
+                     f" -- searched {roots[0]}" + (f" and {len(roots) - 1} more folder(s)" if len(roots) > 1 else ""))
+    if not parts:
+        return True, "no materials to texture"
+    return (not missing or bool(done) or bool(kept)), "  |  ".join(parts)
 
 
 # ---------------------------------------------------------------------------

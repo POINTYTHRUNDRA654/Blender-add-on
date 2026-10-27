@@ -31,57 +31,20 @@ PRESET_ITEMS = [(p, p, d) for p, d in TEXTURE_PRESETS]
 
 def generate_texture_via_mossy(description: str, output_dir: str,
                                  base_name: str, resolution: int = 1024) -> dict:
-    """Ask Mossy AI to generate a texture from description.
-    Falls back to procedural generation if Mossy is offline.
+    """Generate a texture set from a description, on this PC.
+
+    This used to ask Mossy and then POST to http://localhost:5000/
+    generate_texture -- an endpoint Mossy has never had (port 5000 is its
+    Nemotron service), so that call always failed and fell through to the
+    procedural generator after a wasted Mossy chat round trip. It now goes
+    straight to the procedural generator and says so in the result message.
     Returns {success, diffuse, normal, specular, message}
     """
-    result = {"success": False, "diffuse": None, "normal": None,
-               "specular": None, "message": ""}
     os.makedirs(output_dir, exist_ok=True)
-
-    # Try Mossy first
-    try:
-        from . import mossy_link
-        ok, _ = mossy_link.check_bridge()
-        if ok:
-            payload = mossy_link.ask_mossy(
-                f"Generate a seamless PBR texture: {description}. "
-                f"Output base64-encoded PNG for diffuse, normal, and specular maps.",
-                fo4_context=True, max_tokens=50
-            )
-            # Mossy texture generation via process_texture endpoint
-            import json
-            req_data = json.dumps({
-                "description": description,
-                "resolution":  resolution,
-                "maps":        ["diffuse", "normal", "specular"],
-            }).encode()
-            from urllib import request as _req
-            req = _req.Request(
-                "http://localhost:5000/generate_texture",
-                data=req_data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with _req.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read().decode())
-            for map_type in ("diffuse","normal","specular"):
-                b64 = data.get(map_type, "")
-                if b64:
-                    suffix = {"diffuse":"_d","normal":"_n","specular":"_s"}[map_type]
-                    png_path = os.path.join(output_dir, base_name + suffix + ".png")
-                    with open(png_path, "wb") as fh:
-                        fh.write(base64.b64decode(b64))
-                    result[map_type] = png_path
-            if result["diffuse"]:
-                result["success"] = True
-                result["message"] = f"Mossy generated texture set for: {description}"
-                return _convert_to_dds(result, output_dir, base_name)
-    except Exception as exc:
-        print(f"[Tex Gen] Mossy generation failed: {exc}, falling back to procedural")
-
-    # Procedural fallback — generates a basic tileable texture using NumPy + PIL
-    return _generate_procedural(description, output_dir, base_name, resolution)
+    result = _generate_procedural(description, output_dir, base_name, resolution)
+    if result.get("success") and result.get("message"):
+        result["message"] += " (procedural, made on this PC)"
+    return result
 
 
 def _generate_procedural(description: str, output_dir: str,

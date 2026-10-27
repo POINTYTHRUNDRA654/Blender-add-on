@@ -151,84 +151,75 @@ def _apply_fo4_import_scale(context, objects=None) -> int:
     into — only ``.location`` needs correcting for those, never ``.scale``.
 
     Returns the number of objects scaled.
+
+    The scaling itself lives in fo4_scale.shrink_imported: the whole
+    arrangement is shrunk in world space, parent-first. The per-object
+    .scale + transform_apply approach this replaced got 12 of 78 real
+    vanilla NIFs wrong (skinned armour, creatures, bone-parented cutpoints,
+    pieces with their own NIF scale), because applying a parent's scale makes
+    Blender compensate its children in an order-dependent way.
     """
+    from . import fo4_scale
     _SCALABLE = {'MESH', 'ARMATURE', 'CURVE', 'SURFACE', 'META', 'FONT'}
-    candidates = objects if objects is not None else context.selected_objects
+    candidates = list(objects if objects is not None else context.selected_objects)
     imported = [o for o in candidates if o.type in _SCALABLE]
-    empties = [o for o in candidates if o.type == 'EMPTY']
-    if not imported and not empties:
+    if not candidates:
         return 0
-
-    # Parent EMPTY nodes (e.g. NiNode ":ROOT") carry no mesh to bake scale
-    # into, but their .location can still hold a real offset - scale that
-    # alone, never .scale (an empty's scale would otherwise compound into
-    # every child's world transform through normal parent-child composition).
-    for obj in empties:
-        obj.location = tuple(c * _FO4_UNIT_SCALE for c in obj.location)
-
-    # Deselect all, then scale + apply each object individually so Blender's
-    # transform_apply works reliably (it operates on the active object).
-    bpy.ops.object.select_all(action='DESELECT')
-    for obj in imported:
-        # select_set(True) silently fails on hidden objects; ensure visible first.
+    for obj in candidates:
+        # Hidden objects can't be selected for framing below.
         try:
             obj.hide_set(False)
             obj.hide_viewport = False
         except Exception:
             pass
-        context.view_layer.objects.active = obj
-        obj.select_set(True)
-        obj.scale = (_FO4_UNIT_SCALE, _FO4_UNIT_SCALE, _FO4_UNIT_SCALE)
-        # Scale location too - see the "IMPORTANT" note above.  This must
-        # happen whether or not the transform_apply below succeeds, since it
-        # corrects a completely separate value that transform_apply
-        # deliberately never touches (location=False).
-        obj.location = tuple(c * _FO4_UNIT_SCALE for c in obj.location)
-        # Bake the scale into the mesh so Blender measurements are meaningful and
-        # the object stays downsized.  transform_apply can fail on PyNifly
-        # imports (mesh parented to a skeleton, multi-user mesh data, or a
-        # mismatched operator context), so run it inside an explicit context
-        # override.  If it STILL fails, single-user the mesh and retry.  Only as
-        # a last resort do we leave the scale unbaked — but we never reset to
-        # 1.0, so the mesh is always visually downsized; the export path
-        # multiplies back x70 from the fo4_unit_scale tag regardless.
-        applied = False
-        _override = getattr(context, "temp_override", None)
-        try:
-            if _override is not None:
-                with _override(active_object=obj, selected_objects=[obj],
-                               selected_editable_objects=[obj]):
-                    bpy.ops.object.transform_apply(
-                        location=False, rotation=False, scale=True)
-            else:
-                bpy.ops.object.transform_apply(
-                    location=False, rotation=False, scale=True)
-            applied = True
-        except Exception:
-            try:
-                # Multi-user mesh data is a common apply blocker — make it
-                # single-user, then retry the apply once more.
-                if obj.data and getattr(obj.data, "users", 1) > 1:
-                    obj.data = obj.data.copy()
-                bpy.ops.object.transform_apply(
-                    location=False, rotation=False, scale=True)
-                applied = True
-            except Exception:
-                # Leave obj.scale at _FO4_UNIT_SCALE (downsized but unbaked)
-                # rather than resetting to 1.0 (which left the mesh at full
-                # game size — the bug this fixes).
-                applied = False
-        obj["fo4_unit_scale"] = _FO4_UNIT_SCALE_INV
-        obj["fo4_scale_applied"] = applied
-        obj.select_set(False)
+    fo4_scale.shrink_imported(context, candidates)
 
-    # Re-select for viewport framing
+    # Select for viewport framing
+    bpy.ops.object.select_all(action='DESELECT')
     for obj in imported:
         obj.select_set(True)
     if imported:
         context.view_layer.objects.active = imported[0]
     _frame_viewport_to_selection(context)
     return len(imported)
+
+
+def _repair_imported_textures(context, objects, source_path) -> str:
+    """Run the texture repair on every mesh an import just added and return a
+    short note for the import report ('' when there is nothing to say).
+
+    Materials that already show their textures are left exactly as imported;
+    only image nodes whose file is missing get filled in (see
+    fo4_texture_resolver.resolve_and_apply). Every message is printed to the
+    console per mesh, and anything that still couldn't be found is counted in
+    the report so a pink/white mesh is never a silent surprise.
+    """
+    try:
+        from . import fo4_texture_resolver as _ftr
+    except Exception as exc:
+        print(f"[FO4Tex] texture repair unavailable: {exc}")
+        return ""
+    roots = _ftr.preferred_roots(context)
+    filled = missing = 0
+    for o in objects:
+        if getattr(o, "type", None) != 'MESH':
+            continue
+        try:
+            ok, msg = _ftr.resolve_and_apply(o, source_path, extra_roots=roots)
+        except Exception as exc:
+            ok, msg = False, f"texture repair failed: {exc}"
+        print(f"[FO4Tex] {o.name}: {msg}")
+        if "filled in:" in msg:
+            filled += 1
+        if "NOT found:" in msg or not ok:
+            missing += 1
+    notes = []
+    if filled:
+        notes.append(f"textures filled in on {filled} mesh(es)")
+    if missing:
+        notes.append(f"{missing} mesh(es) have textures that could not be found "
+                     "(set your FO4 Data folder in the add-on preferences; details in the console)")
+    return (" -- " + "; ".join(notes)) if notes else ""
 
 
 # Real-world-scale FBX/OBJ/GLB content (~1.7-1.8m human) does not natively
@@ -1512,7 +1503,11 @@ class FO4_OT_LoadFO4Skeleton(Operator):
             if arm:
                 arm_height = (arm.dimensions.z if arm.dimensions.z > 0 else 0)
                 if arm_height > 5.0:
-                    _apply_fo4_import_scale(context, objects=[arm])
+                    # Everything this import left in the scene moves together
+                    # (the clean-up above removed some helpers, so re-diff).
+                    _survivors = [o for o in context.scene.objects
+                                  if o not in pre_import_objects]
+                    _apply_fo4_import_scale(context, objects=_survivors or [arm])
                 # Tell PyNifly explicitly this is an FO4 skeleton (PYN_GAME custom
                 # prop) so its export-time game auto-detection (which otherwise
                 # falls back to guessing from bone names -- and can misfire to
@@ -1568,24 +1563,27 @@ class FO4_OT_FixNIFScale(Operator):
             self.report({'WARNING'}, "No objects selected or in scene.")
             return {'CANCELLED'}
 
-        f = self._FO4_SCALE_FACTOR
-        scaled = 0
+        # Shrink the whole arrangement together (fo4_scale), not object by
+        # object: setting each object's .scale to 1/70 threw away its own
+        # scale and left the gaps between pieces at full game size. Objects
+        # already converted by an import (tagged fo4_unit_scale) are skipped
+        # so running this twice can't shrink anything to 1/4900.
+        from . import fo4_scale
+        group = []
+        seen = set()
         for obj in targets:
-            # Only scale objects that look oversized (> 2 BU in any dimension)
-            if max(abs(obj.scale.x), abs(obj.scale.y), abs(obj.scale.z)) > 1.5:
-                obj.scale = (f, f, f)
-                scaled += 1
-            elif max(obj.dimensions.x, obj.dimensions.y, obj.dimensions.z) > 5.0:
-                obj.scale = (f, f, f)
-                scaled += 1
-
-        if scaled:
-            bpy.ops.object.transform_apply(scale=True)
-            self.report({'INFO'},
-                f"Fixed scale on {scaled} object(s). "
-                "Mesh is now at FO4/Havok units (÷69.99125).")
-        else:
+            for o in [obj] + list(obj.children_recursive):
+                if o.name not in seen and o.get("fo4_unit_scale") is None:
+                    seen.add(o.name)
+                    group.append(o)
+        meshes = [o for o in group if o.type in ('MESH', 'ARMATURE')]
+        if not meshes or max(max(o.dimensions) for o in meshes) <= 5.0:
             self.report({'INFO'}, "Objects already appear to be at the correct scale.")
+            return {'FINISHED'}
+        scaled = fo4_scale.shrink_imported(context, group)
+        self.report({'INFO'},
+            f"Fixed scale on {scaled} object(s): shrunk ÷69.99125 from FO4 game units "
+            "to Blender metres, positions included.")
         return {'FINISHED'}
 
 
@@ -2517,11 +2515,10 @@ class FO4_OT_ShowMessage(Operator):
 
 # Mesh Operators
 
-# Personal fallback default for the "From Game Mesh File" browse path below,
+# Fallback start folder for the "From Game Mesh File" browse path below,
 # used only when the user hasn't configured fo4_game_data_path in
-# preferences. Harmless on another machine -- it's just an initial directory
-# for the file browser, not a hard dependency.
-_CREATE_BASE_MESH_DEFAULT_DIR = r"F:\FO4 WORKING FLODER\Meshes"
+# preferences. Empty means the file browser opens at Blender's default.
+_CREATE_BASE_MESH_DEFAULT_DIR = ""
 
 
 class FO4_OT_CreateBaseMesh(Operator):
@@ -3577,9 +3574,17 @@ class FO4_OT_BatchImportNifs(Operator):
                     # exporter later knows to recombine them back into ONE
                     # output NIF instead of writing one file per shape.
                     objs_after_this_file = set(context.scene.objects)
-                    for o in (objs_after_this_file - objs_before_this_file):
+                    _this_file = list(objs_after_this_file - objs_before_this_file)
+                    for o in _this_file:
                         if o.type == 'MESH':
                             o["fo4_source_nif"] = source_stem
+                            o["fo4_source_nif_path"] = filepath
+                    # Same game-units -> metres conversion and texture repair
+                    # as a single NIF import, so batch-imported and single-
+                    # imported assets share one scale in the scene (batch
+                    # imports used to stay at full game size, ~70x bigger).
+                    _apply_fo4_import_scale(context, objects=_this_file)
+                    _repair_imported_textures(context, _this_file, filepath)
                 else:
                     failed.append(name)
             except Exception as exc:
@@ -3791,13 +3796,12 @@ class FO4_OT_VegetationWindSetup(Operator):
             ('SHRUB_STORM', 'Shrub (Storm)', 'Aggressive sway (amp=0.24, period=55)'),
             ('TREE_STORM',  'Tree (Storm)',  'Heavy storm sway(amp=0.42, period=85)'),
             ('KELP',        'Kelp / Seaweed (Current)',
-             'Slow, broad underwater drift (amp=0.09, period=170) -- an '
-             'approximation of ocean current, NOT a true current sim tied to '
-             'wave direction'),
+             'Gentle underwater drift: sway strength capped at 50% in the '
+             'exported vertex alpha. FO4 wind timing is global, so this '
+             'softens the motion rather than simulating a real current'),
             ('CORAL_SOFT',  'Soft Coral (Current)',
-             'Subtle, gentle underwater sway for flexible coral fronds '
-             '(amp=0.08, period=140) -- rigid/stony coral should stay '
-             'static with no wind setup at all'),
+             'Very subtle underwater sway for flexible coral fronds: sway '
+             'strength capped at 35%. Rigid/stony coral should use No Wind'),
         ],
         default='NONE',
     )
@@ -3859,7 +3863,11 @@ class FO4_OT_VegetationWindSetup(Operator):
 
         ok_count = 0
         for obj in targets:
-            ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(obj, amp, per)
+            alpha_scale = {'KELP': 0.5, 'CORAL_SOFT': 0.35}.get(self.preset, 1.0)
+            ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(
+                obj, amp, per, alpha_scale=alpha_scale)
+            if alpha_scale < 1.0:
+                obj["fo4_underwater"] = True
             if ok:
                 ok_count += 1
                 _notify(msg, 'INFO')
@@ -3925,6 +3933,23 @@ class FO4_OT_SetStaticNoWind(Operator):
         return {'FINISHED'} if ok else {'CANCELLED'}
 
 
+_UNDERWATER_KEYWORDS = ('kelp', 'seaweed', 'sea_weed', 'seagrass', 'sea grass', 'coral',
+                        'anemone', 'algae', 'underwater', 'aquatic', 'sponge',
+                        'seaplant', 'sea plant', 'sea_plant', 'waterweed', 'eelgrass')
+
+
+def _looks_underwater(obj):
+    """True when the object is tagged or named like underwater vegetation."""
+    if obj.get("fo4_underwater"):
+        return True
+    names = [obj.name, getattr(obj.data, 'name', '')]
+    for slot in getattr(obj, 'material_slots', []):
+        if slot.material:
+            names.append(slot.material.name)
+    text = ' '.join(n.lower() for n in names if n)
+    return any(k in text for k in _UNDERWATER_KEYWORDS)
+
+
 class FO4_OT_SmartWindSetup(Operator):
     """Auto-detect object type and apply the correct wind or animation setup.
 
@@ -3950,7 +3975,17 @@ class FO4_OT_SmartWindSetup(Operator):
 
         obj_class = export_helpers.ExportHelpers.detect_fo4_object_class(obj)
 
-        if obj_class == 'VEGETATION':
+        # Underwater vegetation (kelp, seaweed, soft coral, algae...) uses the same
+        # FO4 vertex-wind system as land plants -- FO4 has no separate water-current
+        # animation for meshes -- but needs the slow, broad KELP tuning instead of
+        # the default land sway. Detected by name/material keywords or an explicit
+        # fo4_underwater custom property so Smart Wind picks it automatically.
+        if obj_class == 'VEGETATION' and _looks_underwater(obj):
+            ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(
+                obj, 0.09, 170.0, alpha_scale=0.5)
+            obj["fo4_underwater"] = True
+            label = "UNDERWATER VEGETATION (Kelp current)"
+        elif obj_class == 'VEGETATION':
             ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(obj)
             label = "VEGETATION"
         elif obj_class in ('CHARACTER', 'CREATURE'):
@@ -9496,7 +9531,8 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                         f"FBX import did not add anything from {filename} "
                         f"(result={_result!r})")
                     return {'CANCELLED'}
-                self.report({'INFO'}, f"Imported FBX: {filename}")
+                _tex_note = _repair_imported_textures(context, _new, filepath)
+                self.report({'INFO'}, f"Imported FBX: {filename}{_tex_note}")
                 _notify(f"Imported {filename}", 'INFO')
                 return {'FINISHED'}
             except Exception as e:
@@ -9517,7 +9553,8 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                         f"OBJ import did not add anything from {filename} "
                         f"(result={_result!r})")
                     return {'CANCELLED'}
-                self.report({'INFO'}, f"Imported OBJ: {filename}")
+                _tex_note = _repair_imported_textures(context, _new, filepath)
+                self.report({'INFO'}, f"Imported OBJ: {filename}{_tex_note}")
                 _notify(f"Imported {filename}", 'INFO')
                 return {'FINISHED'}
             except Exception as e:
@@ -9535,7 +9572,8 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                             f"GLB/GLTF import did not add anything from {filename} "
                             f"(result={_result!r})")
                         return {'CANCELLED'}
-                    self.report({'INFO'}, f"Imported GLB/GLTF: {filename}")
+                    _tex_note = _repair_imported_textures(context, _new, filepath)
+                    self.report({'INFO'}, f"Imported GLB/GLTF: {filename}{_tex_note}")
                     _notify(f"Imported {filename}", 'INFO')
                     return {'FINISHED'}
                 else:
@@ -9582,31 +9620,9 @@ class FO4_OT_ImportFO4AssetFile(Operator):
 
                     n = _apply_fo4_import_scale(context, objects=_new)
 
-                    # Follow the NIF's BGSM material and load its textures from the
-                    # asset's mod folder (MO2-aware). Run on ALL imported meshes
-                    # (not just selected_objects — PyNifly may only select empties).
-                    try:
-                        from . import fo4_texture_resolver as _ftr
-                        from . import preferences as _prefs_mod
-                        _extra = []
-                        # Prefer addon preferences (persistent); fall back to scene props.
-                        _p = _prefs_mod.get_preferences()
-                        _mo2 = (getattr(_p, "fo4_mo2_mods_root", "") or "") if _p else ""
-                        if not _mo2:
-                            _mo2 = getattr(context.scene, "fo4_mo2_mods_root", "") or ""
-                        _gdata = (getattr(_p, "fo4_game_data_path", "") or "") if _p else ""
-                        if not _gdata:
-                            _gdata = getattr(context.scene, "fo4_game_data_path", "") or ""
-                        if _mo2:
-                            _extra.append(bpy.path.abspath(_mo2))
-                        if _gdata:
-                            _extra.append(bpy.path.abspath(_gdata))
-                        for _o in _new:
-                            if _o.type == 'MESH':
-                                _rok, _rmsg = _ftr.resolve_and_apply(_o, filepath, extra_roots=_extra)
-                                print(f"[FO4Tex] {_o.name}: {_rmsg}")
-                    except Exception as _re:
-                        print(f"[FO4Tex] auto-resolve skipped: {_re}")
+                    # Keep PyNifly's materials; only fill in textures whose
+                    # files are missing (see fo4_texture_resolver).
+                    _tex_note = _repair_imported_textures(context, _new, filepath)
 
                     # Tag every imported object so the whole asset is traceable.
                     _helpers = 0
@@ -9627,7 +9643,7 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                     _mesh_names = [o.name for o in _new if o.type == 'MESH']
                     print(f"[FO4Import] {len(_mesh_names)} mesh(es): {_mesh_names}")
                     _htxt = f", {_helpers} helper node(s) kept" if _helpers else ""
-                    self.report({'INFO'}, f"Imported NIF: {filename} ({n} mesh(es) scaled to Blender metres){_htxt}")
+                    self.report({'INFO'}, f"Imported NIF: {filename} ({n} mesh(es) scaled to Blender metres){_htxt}{_tex_note}")
                     _notify(f"Imported {filename}", 'INFO')
                     return {'FINISHED'}
                 except Exception as e:

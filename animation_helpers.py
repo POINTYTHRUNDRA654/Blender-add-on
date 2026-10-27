@@ -1047,10 +1047,15 @@ class AnimationHelpers:
         for i in range(len(mesh.vertices)):
             vg.add([i], 0.001, 'REPLACE')
 
+        # Static means no wind shader either (see apply_vegetation_wind).
+        for _slot in getattr(mesh_obj, "material_slots", []):
+            if _slot.material is not None and _slot.material.get("fo4_bgsm_tree"):
+                _slot.material["fo4_bgsm_tree"] = False
+
         return AnimationHelpers.apply_wind_vertex_colors(mesh_obj, group_name=group_name)
 
     @staticmethod
-    def apply_wind_vertex_colors(mesh_obj, group_name="Wind", attr_name="Col"):
+    def apply_wind_vertex_colors(mesh_obj, group_name="Wind", attr_name="Col", alpha_scale=None):
         """Write the Wind vertex-group gradient into vertex color data.
 
         FO4's BSLeafAnimNode reads a per-vertex alpha value to decide how much
@@ -1094,12 +1099,22 @@ class AnimationHelpers:
 
         mesh = mesh_obj.data
 
+        # alpha_scale caps how far the in-game sway goes. FO4's wind speed and
+        # timing are global (engine-side), so the only per-mesh control over
+        # sway strength is this vertex alpha. Underwater presets (kelp, soft
+        # coral) use < 1.0 so they drift gently instead of gusting like land
+        # plants. Remembered on the object so re-baking keeps the same strength.
+        if alpha_scale is None:
+            alpha_scale = float(mesh_obj.get("fo4_wind_alpha_scale", 1.0))
+        alpha_scale = max(0.0, min(1.0, float(alpha_scale)))
+        mesh_obj["fo4_wind_alpha_scale"] = alpha_scale
+
         # Build a per-vertex weight lookup from the Wind group.
         weights = {}
         for v in mesh.vertices:
             for ge in v.groups:
                 if ge.group == vg.index:
-                    weights[v.index] = ge.weight
+                    weights[v.index] = ge.weight * alpha_scale
                     break
 
         wrote_alpha_map = False
@@ -1166,7 +1181,8 @@ class AnimationHelpers:
         return True, f"Wind vertex colors written to '{attr_name}' (alpha = Wind weight)"
 
     @staticmethod
-    def apply_vegetation_wind(mesh_obj, amplitude: float = 0.2, period: float = 60.0):
+    def apply_vegetation_wind(mesh_obj, amplitude: float = 0.2, period: float = 60.0,
+                              alpha_scale: float = 1.0):
         """Set up FO4 vegetation wind using vertex groups and vertex color alpha.
 
         FO4 vegetation wind is procedural in-engine.  The BSLeafAnimNode reads
@@ -1195,12 +1211,22 @@ class AnimationHelpers:
 
         # Mirror the wind weights into vertex color alpha so FO4's BSLeafAnimNode
         # can read the per-vertex sway amount in-engine.
-        vc_ok, vc_msg = AnimationHelpers.apply_wind_vertex_colors(mesh_obj)
+        vc_ok, vc_msg = AnimationHelpers.apply_wind_vertex_colors(mesh_obj, alpha_scale=alpha_scale)
         vc_note = f" | {vc_msg}" if not vc_ok else ""
 
         mesh_obj["fo4_object_type"]    = "VEGETATION"
         mesh_obj["fo4_wind_amplitude"] = amplitude
         mesh_obj["fo4_wind_period"]    = period
+
+        # FO4 only runs the wind vertex shader when the material's BGSM has the
+        # Tree flag set -- vertex alpha + BSLeafAnimNode alone don't sway.
+        # Vanilla animated foliage confirms it: KelpAnim01.nif / Seaweed01_Tree.nif
+        # use kelp.BGSM / Seaweed01_Tree.BGSM with tree=True (27 of the 74 vanilla
+        # Landscape\Plants materials are tree=True, all of them swaying plants).
+        # blender_mat_to_bgsm reads this custom property into BGSMData.tree.
+        for _slot in getattr(mesh_obj, "material_slots", []):
+            if _slot.material is not None:
+                _slot.material["fo4_bgsm_tree"] = True
 
         return True, (
             f"Vegetation wind applied to '{mesh_obj.name}' "

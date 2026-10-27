@@ -2255,6 +2255,13 @@ class FO4_PT_AnimationPanel(_FO4SubPanel):
                          text="Vegetation Wind (Vertex Groups)", icon='FORCE_WIND')
         veg_row.operator("fo4.generate_wind_weights",
                          text="", icon='WPAINT_HLT')
+        uw_row = type_col.row(align=True)
+        op = uw_row.operator("fo4.vegetation_wind_setup",
+                             text="Underwater: Kelp / Seaweed", icon='MOD_OCEAN')
+        op.preset = 'KELP'
+        op = uw_row.operator("fo4.vegetation_wind_setup",
+                             text="Soft Coral", icon='MOD_OCEAN')
+        op.preset = 'CORAL_SOFT'
         type_col.operator("fo4.fix_wind_vertex_colors",
                           text="Fix Wind Vertex Colors (stops breathing)", icon='VPAINT_HLT')
         type_col.operator("fo4.set_static_no_wind",

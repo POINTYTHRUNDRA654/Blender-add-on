@@ -711,6 +711,15 @@ def _execute_command_on_main_thread(cmd: dict, bpy) -> dict:
     if cmd_type == "get_context":
         return {"status": "success", "context": _build_scene_context(bpy)}
 
+    if cmd_type == "mesh_features":
+        # Thin measurement only (no ML in Blender): Mossy sends these to Brain B, which finds the
+        # closest vanilla meshes. See vanilla_compare.py.
+        try:
+            from . import vanilla_compare
+            return vanilla_compare.mesh_features(bpy)
+        except Exception as exc:
+            return {"status": "error", "message": f"mesh_features failed: {exc}"}
+
     if cmd_type == "get_capabilities":
         return {
             "status": "success",
@@ -726,7 +735,7 @@ def _execute_command_on_main_thread(cmd: dict, bpy) -> dict:
             # incident this closes.
             "supported_commands": [
                 "script", "text", "operator", "set_pytorch_path",
-                "get_context", "get_capabilities",
+                "get_context", "get_capabilities", "mesh_features",
             ],
         }
 

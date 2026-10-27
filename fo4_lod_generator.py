@@ -14,7 +14,7 @@ FO4 uses separate NIF files for each LOD level, referenced by the ESP/ESM:
 NIF naming convention for LODs (mod-folder relative -- no "Data\" wrapper,
 since mod_folder IS the MO2 mod folder that already holds
 Meshes/Materials/Textures directly). Verified directly against a real
-game-exported reference folder (F:\FO4 WORKING FLODER), e.g.
+game-exported reference folder (unpacked vanilla Data), e.g.
 Meshes/LOD/Landscape/Trees/Maple/TreeMapleForest01_LOD_0/1/2/3.nif:
   Meshes/[path]/[name].nif               (LOD0, full quality — used in-game close-up)
   Meshes/LOD/[path]/[name]_LOD_0.nif     (LOD1, medium distance)

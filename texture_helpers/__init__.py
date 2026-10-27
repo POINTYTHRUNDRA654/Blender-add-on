@@ -287,8 +287,7 @@ class TextureHelpers:
     # hard to find/manage in the actual Data folder.
     #
     # Verified against the real vanilla Textures\ folder layout (checked
-    # 2026-08-25 via the user's F:\FO4 WORKING FLODER, which mirrors a real
-    # Data folder) rather than guessed -- ARMOR/WEAPON/FURNITURE/ARCHITECTURE/
+    # 2026-08-25 against an unpacked vanilla Data folder) rather than guessed -- ARMOR/WEAPON/FURNITURE/ARCHITECTURE/
     # VEGETATION/FLORA all confirmed as real top-level folders. Two entries
     # were corrected after that check found they didn't match anything real:
     # there is no top-level "Clutter" folder (small junk/debris items like

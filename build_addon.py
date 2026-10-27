@@ -66,7 +66,7 @@ EXCLUDE = {
     # Desktop installer scripts (dev tools, not part of the addon)
     "install_addon.bat", "install_addon.ps1",
     # Standalone test files (no use inside Blender)
-    "test_addon_integrity.py",
+    "test_addon_integrity.py", "test_vanilla_compare.py",
 }
 
 # Blender version variants

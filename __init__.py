@@ -6,7 +6,7 @@ A comprehensive tutorial and helper system for creating Fallout 4 mods in Blende
 bl_info = {
     "name": "Mossy Industries blender addon",
     "author": "Mossy Industries",
-    "version": (5, 3, 3),
+    "version": (5, 4, 0),
     "blender": (2, 90, 0),  # Compatible with Blender 2.90+ through 5.x
     "location": "View3D > Sidebar > Fallout 4",
     "description": (
@@ -159,6 +159,7 @@ motion_generation_helpers = None
 shap_e_helpers         = None
 point_e_helpers        = None
 mossy_link = _try_import("mossy_link")
+mesh_check_ui = _try_import("mesh_check_ui")  # rule-check button + panel (uses vanilla_compare)
 torch_path_manager = _try_import("torch_path_manager")
 
 # tool_installers is not registered automatically but may be used during
@@ -333,6 +334,7 @@ _PHASE1_MODULES = list(filter(_filter, [
 # Everything else.  By the time the user navigates to any of these panels
 # they are already registered.  All features remain fully available.
 _PHASE2_MODULES = list(filter(_filter, [
+    mesh_check_ui,
     knowledge_helpers,
     quest_helpers,
     npc_helpers,
