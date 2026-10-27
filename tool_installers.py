@@ -575,7 +575,14 @@ def _get_github_release_asset(repo: str, keyword: str) -> str | None:
         with urllib.request.urlopen(api) as resp:
             data = json.load(resp)
     except Exception:
-        return None
+        # /releases/latest skips pre-releases (havok2fbx only has one), so
+        # fall back to the newest release of any kind.
+        try:
+            with urllib.request.urlopen(f"https://api.github.com/repos/{repo}/releases") as resp:
+                releases = json.load(resp)
+            data = releases[0] if releases else {}
+        except Exception:
+            return None
 
     for asset in data.get("assets", []):
         name = asset.get("name", "")
@@ -714,7 +721,7 @@ def check_havok2fbx(path: str) -> bool:
 def install_havok2fbx() -> tuple[bool, str]:
     """Download Havok2FBX from GitHub releases and wire it into preferences.
 
-    Queries the GitHub Releases API for dfm/havok2fbx, downloads the first
+    Queries the GitHub Releases API for Highflex/havok2fbx, downloads the first
     Windows zip asset, extracts it to the tools/havok2fbx folder, and
     persists the path in add-on preferences so it is usable immediately.
     """
@@ -725,14 +732,14 @@ def install_havok2fbx() -> tuple[bool, str]:
         _configure_tool_paths()
         return True, f"Havok2FBX already installed at {dest}"
 
-    url = _get_github_release_asset("dfm/havok2fbx", ".zip")
+    url = _get_github_release_asset("Highflex/havok2fbx", ".zip")
     if not url:
         # Try exe as well (some releases ship just an exe)
-        url = _get_github_release_asset("dfm/havok2fbx", "havok2fbx")
+        url = _get_github_release_asset("Highflex/havok2fbx", "havok2fbx")
     if not url:
         return False, (
             "Could not resolve Havok2FBX download URL from GitHub. "
-            "Please download manually from https://github.com/dfm/havok2fbx/releases "
+            "Please download manually from https://github.com/Highflex/havok2fbx/releases "
             f"and extract to {dest}."
         )
 
@@ -945,16 +952,19 @@ def install_niftools(blender_version: str = "3.6") -> tuple[bool, str]:
 
 
 
-# GitHub API endpoint - always resolves to the newest published release.
+# Pinned to the PyNifly release this add-on is tested against.  "latest" moved
+# to V30.x on 2026-10-27, which has not been tested with our import/export
+# code; bump this tag only after re-running the NIF round-trip tests.
+PYNIFLY_TESTED_TAG = "V27.0.0"
 _PYNIFLY_LATEST_API = (
-    "https://api.github.com/repos/BadDogSkyrim/PyNifly/releases/latest"
+    f"https://api.github.com/repos/BadDogSkyrim/PyNifly/releases/tags/{PYNIFLY_TESTED_TAG}"
 )
 
 
 def _download_pynifly_zip(dest_dir: "Path") -> "tuple[Path, str] | tuple[None, None]":
-    """Download the latest PyNifly zip from GitHub to *dest_dir*.
+    """Download the tested PyNifly zip (PYNIFLY_TESTED_TAG) from GitHub to *dest_dir*.
 
-    Queries the GitHub Releases API for the newest published release, finds
+    Queries the GitHub Releases API for that release, finds
     the first ``.zip`` asset, downloads it, and returns ``(local_path,
     version_tag)``.  Returns ``(None, None)`` if the download fails for any
     reason.
@@ -1047,7 +1057,7 @@ def install_pynifly() -> tuple[bool, str]:
     # ── 2. Auto-download the latest release from GitHub if not found locally ──
     if not zip_path:
         tools_root = get_tools_root()
-        print("PyNifly: no local zip found - auto-downloading latest release from GitHub …")
+        print(f"PyNifly: no local zip found - downloading the tested release ({PYNIFLY_TESTED_TAG}) from GitHub …")
         zip_path, version_tag = _download_pynifly_zip(tools_root)
 
     if not zip_path:
@@ -1058,7 +1068,7 @@ def install_pynifly() -> tuple[bool, str]:
         except Exception:
             pass
         return False, (
-            f"Could not auto-download the latest PyNifly release. "
+            f"Could not download PyNifly {PYNIFLY_TESTED_TAG}. "
             f"Please download it manually from {release_url}, "
             f"place the zip in {DEFAULT_TOOLS_ROOT}, and click Install again.\n"
             f"Credit: BadDog (BadDogSkyrim) - {release_url}"

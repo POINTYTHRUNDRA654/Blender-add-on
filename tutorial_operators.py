@@ -303,14 +303,14 @@ _CREDITS_SECTIONS = [
         "GNU GPL v2+ license",
     ]),
     ('PLUGIN', "Niftools Blender Plugin (NIF export)", [
-        "NifTools Team - https://github.com/niftools/blender_nif_plugin",
+        "NifTools Team - https://github.com/niftools/blender_niftools_addon",
         "Enables direct .nif export for Fallout 4 / Skyrim (Blender 3.6 LTS)",
     ]),
     ('FUND', "PyNifly  \u2605  PRIMARY NIF EXPORTER", [
         "BadDog (BadDogSkyrim) - https://github.com/BadDogSkyrim/PyNifly",
-        "The recommended NIF exporter for Blender 4.x and 5.x.",
-        "Supports Fallout 4, Skyrim SE, and Starfield with full",
-        "body-morph and material path support.",
+        "This add-on is built on PyNifly: our Import/Export buttons use",
+        "it to read and write NIFs. Download it from BadDog's releases page",
+        "(tested with V27.0.0). GNU GPL v3 license.",
         "Huge thanks to BadDog for maintaining this essential tool!",
     ]),
     ('IMPORT', "UModel / UE Viewer (Unreal asset extraction)", [
@@ -351,7 +351,7 @@ _CREDITS_SECTIONS = [
         "High-quality text and image conditioned 3D generation",
     ]),
     ('MESH_DATA', "GET3D (text-to-3D)", [
-        "NVIDIA Research - https://github.com/nVlabs/GET3D",
+        "NVIDIA Research - https://github.com/nv-tlabs/GET3D",
         "Generative model for high-quality 3D shapes",
     ]),
     ('MESH_DATA', "Instant-NGP (neural radiance field)", [
@@ -381,7 +381,7 @@ _CREDITS_SECTIONS = [
         "SMPL-X extension: https://github.com/ellemcfarlane/MotionDiffuse",
     ]),
     ('ARMATURE_DATA', "MediaPipe (motion tracking / pose estimation)", [
-        "Google - https://github.com/google/mediapipe",
+        "Google - https://github.com/google-ai-edge/mediapipe",
         "Real-time hand, face, and body pose tracking for motion capture",
     ]),
     ('ARMATURE_DATA', "BlendArMocap (Blender motion capture add-on)", [
@@ -413,7 +413,7 @@ _CREDITS_SECTIONS = [
         "Recommended replacement for Havok2FBX in the FO4 animation pipeline.",
     ]),
     ('EXPORT', "havok2fbx (Havok \u2194 FBX fallback converter)", [
-        "dfm - https://github.com/dfm/havok2fbx",
+        "Highflex - https://github.com/Highflex/havok2fbx",
         "Converts Havok HKX/HKT files to/from FBX. Fallback when ck-cmd",
         "is unavailable. Requires Havok SDK 2014-1-0 + Autodesk FBX SDK to build.",
     ]),
@@ -499,7 +499,7 @@ _CREDITS_SECTIONS = [
         "into Blender scenes. Must be installed as a separate add-on",
     ]),
     ('PLUGIN', "TexTools for Blender (UV & texture tools)", [
-        "SavMartin - https://github.com/SavMartin/TexTools-Blender",
+        "franMarz & SavMartin - https://github.com/franMarz/TexTools-Blender",
         "Comprehensive UV mapping and texture baking tools for Blender",
     ]),
     ('PLUGIN', "UnityFBX-To-Blender-Importer", [
@@ -541,6 +541,43 @@ _CREDITS_SECTIONS = [
     ('SCRIPT', "pypdf (Python PDF library)", [
         "py-pdf Team - https://github.com/py-pdf/pypdf",
         "Pure Python library for reading, writing, and merging PDF files",
+    ]),
+    # Page 6 – Bundled libraries & further tools
+    ('SCRIPT', "tqdm (progress bars)  -  bundled", [
+        "tqdm developers - https://github.com/tqdm/tqdm",
+        "Ships inside this add-on (lib/tqdm). MIT / MPL-2.0 license,",
+        "full text in lib/tqdm/LICENCE.",
+    ]),
+    ('SCRIPT', "easydict (attribute-style dicts)  -  bundled", [
+        "Makina Corpus - https://github.com/makinacorpus/easydict",
+        "Ships inside this add-on (lib/easydict). GNU LGPL v3 license,",
+        "full text in lib/easydict/LICENSE.",
+    ]),
+    ('MESH_DATA', "MeshLab / PyMeshLab (mesh processing)", [
+        "Visual Computing Lab, ISTI-CNR - https://github.com/cnr-isti-vclab/meshlab",
+        "Python library: https://github.com/cnr-isti-vclab/PyMeshLab",
+        "Installed on request for mesh repair and decimation. GNU GPL v3.",
+    ]),
+    ('IMPORT', "UE Viewer source code", [
+        "Konstantin Nosov (Gildor) - https://github.com/gildor2/UEViewer",
+        "Source of UModel (credited above).",
+    ]),
+    ('MESH_DATA', "TripoSR community tools", [
+        "flowtyone - https://github.com/flowtyone/ComfyUI-Flowty-TripoSR",
+        "ejones - https://github.com/ejones/triposr-texture-gen",
+        "iffyloop - https://github.com/iffyloop/TripoSR-Bake",
+        "Dragoy - https://github.com/Dragoy/triposr_light",
+        "pythonicforge - https://github.com/pythonicforge/triposr-implementation",
+        "StarxSky - https://github.com/StarxSky/TRIPOSR",
+    ]),
+    ('ARMATURE_DATA', "RigNet community ports", [
+        "pKrime - https://github.com/pKrime/brignet",
+        "L-Medici - https://github.com/L-Medici/Rignet_blender_addon",
+        "govindjoshi12 - https://github.com/govindjoshi12/rignet-gj",
+    ]),
+    ('MESH_DATA', "BbwPlugin (bone weight calculation)", [
+        "PhillipZeratul - https://github.com/PhillipZeratul/BbwPlugin",
+        "Bounded biharmonic weight port used alongside BBW (credited above).",
     ]),
 ]
 

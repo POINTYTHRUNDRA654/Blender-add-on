@@ -315,7 +315,7 @@ class ExportHelpers:
         if hasattr(export_scene, "pynifly"):
             return True, "PyNifly exporter available (BadDog / BadDogSkyrim)"
         return False, (
-            "PyNifly not installed - click 'Auto-Install PyNifly (Latest)' in the Setup & Status panel "
+            "PyNifly not installed - click 'Auto-Install PyNifly' in the Setup & Status panel "
             "to auto-download and install it"
         )
 

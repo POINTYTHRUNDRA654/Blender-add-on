@@ -202,11 +202,20 @@ def build_nexus_bundle(outdir: Path, addon_version: str,
 
         Check your Blender version:  Help → About Blender
 
+        Before you start, install PyNifly by BadDog (BadDogSkyrim). This add-on
+        is built on it: you import and export with this add-on's own buttons,
+        and PyNifly reads and writes the NIF files underneath:
+          https://github.com/BadDogSkyrim/PyNifly/releases  (tested with V27.0.0)
+
         Installing:
           1. Open Blender
-          2. Edit → Preferences → Add-ons → Install
+          2. Blender 4.2+: Edit → Preferences → Add-ons → arrow menu (top right)
+             → Install from Disk…
+             Blender 3.6–4.1: Edit → Preferences → Add-ons → Install…
           3. Select the zip that matches your Blender version
           4. Enable the add-on (check the box)
+          5. In the add-on preferences, set "FO4 Game Data Path" to your
+             extracted Fallout 4 Data folder (loose Meshes/Materials/Textures)
 
         ════════════════════════════════════════════════════════════════════════
 
@@ -233,8 +242,20 @@ def build_nexus_bundle(outdir: Path, addon_version: str,
         3. Enable "AI Advisor (via Mossy)"
         4. Connect to Mossy (localhost only - no cloud)
 
-        All AI runs locally on YOUR machine. No API keys, no cloud services,
-        no data transmission. Complete privacy.
+        All AI runs locally on YOUR machine. No API keys, no cloud services.
+
+        Internet use: the add-on only goes online when YOU click something --
+        "Check for Updates" (GitHub) or an "Auto-Install" button (downloads the
+        tool you picked). The Mossy link stays on your own PC (localhost).
+
+        ════════════════════════════════════════════════════════════════════════
+
+        CREDITS
+
+        Built on PyNifly by BadDog (BadDogSkyrim) -- full thanks to BadDog.
+        Every third-party project this add-on uses is credited, with links and
+        licences, in CONTRIBUTORS.md and in Blender (N panel → Fallout 4 →
+        Tutorial System → Credits).
 
         ════════════════════════════════════════════════════════════════════════
 

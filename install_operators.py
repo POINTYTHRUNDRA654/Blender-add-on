@@ -829,7 +829,7 @@ class FO4_OT_ConfigureFallout4Settings(Operator):
         if pynifly_ok:
             messages.append("✓ PyNifly ready - primary NIF exporter (BadDog / BadDogSkyrim)")
         else:
-            messages.append(f"⚠ PyNifly not installed - use 'Auto-Install PyNifly (Latest)' button")
+            messages.append(f"⚠ PyNifly not installed - use 'Auto-Install PyNifly' button")
             messages.append(f"  {pynifly_msg}")
             # Check Niftools as fallback
             nif_available, nif_msg = export_helpers.ExportHelpers.nif_exporter_available()
@@ -1533,10 +1533,10 @@ class FO4_OT_InstallPyNifly(Operator):
     Credit: BadDog (BadDogSkyrim) - https://github.com/BadDogSkyrim/PyNifly
     """
     bl_idname = "fo4.install_pynifly"
-    bl_label = "Auto-Install PyNifly (Latest)"
+    bl_label = "Auto-Install PyNifly"
     bl_description = (
-        "Auto-download and install the latest PyNifly release by BadDog (BadDogSkyrim). "
-        "Downloads the newest version from GitHub if not already in the tools folder."
+        "Download and install PyNifly by BadDog (BadDogSkyrim), the version this add-on is tested with. "
+        "Downloads it from BadDog's GitHub releases if it is not already in the tools folder."
     )
 
     def execute(self, context):

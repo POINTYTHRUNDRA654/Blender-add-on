@@ -1097,7 +1097,7 @@ class FO4_OT_ShowArmorClothingWorkflow(Operator):
 
         _box('TOOL_SETTINGS', "Required Tools", [
             "• Blender 4.1+            - blender.org",
-            "• PyNifly                 - use 'Auto-Install PyNifly (Latest)' in Setup panel",
+            "• PyNifly                 - use 'Auto-Install PyNifly' in Setup panel",
             "  Imports/exports NIF meshes with full skeleton support.",
             "• NifSkope               - github.com/niftools/nifskope",
             "  Inspect/tweak NIF shader flags and texture paths.",
