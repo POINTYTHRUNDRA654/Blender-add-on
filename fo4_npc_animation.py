@@ -23,6 +23,8 @@ import os
 import subprocess
 from typing import List, Optional, Dict
 
+from . import fo4_bone_names as _bn
+
 
 # ---------------------------------------------------------------------------
 # Full-body bone groups (NPC skeleton)
@@ -39,6 +41,11 @@ L_LEG_BONES  = ["NPC L Thigh [LThg]","NPC L Calf [LClf]","NPC L Foot [Lft ]"]
 R_LEG_BONES  = ["NPC R Thigh [RThg]","NPC R Calf [RClf]","NPC R Foot [Rft ]"]
 ROOT_BONES   = ["NPC Root [Root]","NPC COM [COM ]"]
 ALL_BONES    = ROOT_BONES + SPINE_BONES + HEAD_BONES + L_ARM_BONES + R_ARM_BONES + L_LEG_BONES + R_LEG_BONES
+# The lists above use the old Skyrim-style spelling; these are the real FO4 names.
+SPINE_BONES, HEAD_BONES, L_ARM_BONES, R_ARM_BONES, L_LEG_BONES, R_LEG_BONES, ROOT_BONES = (
+    [_bn.to_fo4(b) for b in group]
+    for group in (SPINE_BONES, HEAD_BONES, L_ARM_BONES, R_ARM_BONES, L_LEG_BONES, R_LEG_BONES, ROOT_BONES))
+ALL_BONES = ROOT_BONES + SPINE_BONES + HEAD_BONES + L_ARM_BONES + R_ARM_BONES + L_LEG_BONES + R_LEG_BONES
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +322,11 @@ def _lk(pb, f, x=0, y=0, z=0):
 
 
 def _get(arm_obj, name):
-    return arm_obj.pose.bones.get(name)
+    # The generators below name bones in the old Skyrim style ("NPC COM [COM ]");
+    # find_bone translates to the real FO4 bone in either spelling PyNifly
+    # imports ("COM", "Arm_Hand.L" / "LArm_Hand"). A plain .get() of the
+    # Skyrim name found nothing on a real FO4 rig, so every animation was empty.
+    return _bn.find_bone(arm_obj.pose.bones, name)
 
 
 def _rest_all(arm_obj, frame):

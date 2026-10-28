@@ -6,7 +6,7 @@ Generate brand-new FO4-ready textures from a text description using Mossy AI.
 Outputs a complete PBR texture set:
   name_d.dds  — diffuse (BC7)
   name_n.dds  — normal map (BC5)
-  name_s.dds  — specular composite (BC7)
+  name_s.dds  — specular (BC5, as vanilla)
 """
 
 import bpy, os, base64, tempfile
@@ -153,7 +153,7 @@ def _convert_to_dds(result: dict, output_dir: str, base_name: str) -> dict:
         result["message"] += " (PNG only — texconv not configured for DDS)"
         return result
 
-    fmt_map = {"diffuse": "BC7_UNORM", "normal": "BC5_UNORM", "specular": "BC7_UNORM"}
+    fmt_map = {"diffuse": "BC7_UNORM", "normal": "BC5_UNORM", "specular": "BC5_UNORM"}  # vanilla _s maps are BC5
     for map_type, fmt in fmt_map.items():
         png = result.get(map_type)
         if png and os.path.isfile(png):

@@ -21,7 +21,8 @@ from . import preferences
 # Mapping from texture slot name (as returned by detect_slot_from_filename)
 # to the key NVTTHelpers.get_fo4_dds_format expects. That method is this
 # module's single source of truth for FO4 compression conventions (BC1
-# diffuse/specular/glow, BC5 normal) -- this module used to keep a SECOND,
+# diffuse/glow, BC5 normal and specular -- specular checked 2026-10-27 against
+# the vanilla Textures1-3.ba2 archives: 2,722 of 2,730 _s maps are BC5) -- this module used to keep a SECOND,
 # independent format table here (BC7 diffuse, BC4 specular) that had
 # silently drifted out of sync with it. Auto-detection now always resolves
 # through get_fo4_dds_format so the two can never disagree again.
@@ -214,7 +215,7 @@ class NVTTHelpers:
         | DIFFUSE   | BC1     | RGB colour without alpha – smallest size    |
         | DIFFUSE_A | BC3     | RGB colour *with* alpha (cutout/opacity)    |
         | NORMAL    | BC5     | Two-channel (R+G) tangent-space normals     |
-        | SPECULAR  | BC1     | RGB smoothness/specular colour              |
+        | SPECULAR  | BC5     | Two-channel specular + gloss (vanilla: BC5) |
         | GLOW      | BC1     | Greyscale or RGB emissive/glow mask         |
         | EMISSIVE  | BC1     | Alias for GLOW                              |
         | ALPHA     | BC3     | Any texture that stores an alpha channel   |
@@ -227,7 +228,7 @@ class NVTTHelpers:
             'DIFFUSE':     'bc1',
             'DIFFUSE_A':   'bc3',  # diffuse with transparency/alpha
             'NORMAL':      'bc5',  # ATI2 / two-channel tangent-space
-            'SPECULAR':    'bc1',
+            'SPECULAR':    'bc5',  # vanilla _s maps: 2,722 of 2,730 are BC5
             'GLOW':        'bc1',
             'EMISSIVE':    'bc1',
             'ENVIRONMENT': 'bc1',  # cube-map mask (BC1 – greyscale/RGB)
@@ -464,7 +465,7 @@ class NVTTHelpers:
             compression_map = {
                 'DIFFUSE':     'bc1',  # DXT1 – RGB diffuse without alpha
                 'NORMAL':      'bc5',  # ATI2 – two-channel tangent-space normals
-                'SPECULAR':    'bc1',  # DXT1 – RGB specular / smoothness
+                'SPECULAR':    'bc5',  # ATI2 – two-channel specular + gloss (as vanilla)
                 'GLOW':        'bc1',  # DXT1 – glow / emissive mask
                 'EMISSIVE':    'bc1',  # DXT1 – alias for glow
                 'ENVIRONMENT': 'bc1',  # DXT1 – cube-map environment mask

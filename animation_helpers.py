@@ -5,6 +5,14 @@ Animation helper functions for Fallout 4 mod creation
 import bpy
 from mathutils import Vector
 
+from . import fo4_bone_names as _bn
+
+
+def _fo4_bone(name):
+    """Real FO4 bone name, in PyNifly's default Blender spelling ("Arm_Hand.L"),
+    for a name written in the old Skyrim style. See fo4_bone_names.py."""
+    return _bn.pynifly_name(name)
+
 # preview handler stored at module scope
 _wind_preview_handler = None
 
@@ -249,37 +257,14 @@ class AnimationHelpers:
     def setup_fo4_armature():
         """Create a Fallout 4 compatible biped armature.
 
-        Bone names match the FO4 vanilla skeleton convention used in
-        ``HumanRace.nif`` / ``HumanRace.hkx``.  The "NPC X [Abbrev]" format
-        is required by the Creation Kit and vanilla equipment so that armour
-        and clothing pieces deform correctly when parented to this skeleton.
-
-        Hierarchy (simplified - fingers/facial bones omitted for base meshes):
-
-        Root
-        └─ COM [COM]
-           └─ Pelvis [Pelvis]
-              ├─ Spine [Spine]
-              │  ├─ Spine1 [Spine1]
-              │  │  └─ Spine2 [Spine2]
-              │  │     ├─ Neck [Neck]
-              │  │     │  └─ Head [Head]
-              │  │     ├─ NPC L Clavicle [LClav]
-              │  │     │  └─ NPC L UpperArm [LUpArm]
-              │  │     │     └─ NPC L Forearm [LForearm]
-              │  │     │        └─ NPC L Hand [LHand]
-              │  │     └─ NPC R Clavicle [RClav]
-              │  │        └─ NPC R UpperArm [RUpArm]
-              │  │           └─ NPC R Forearm [RForearm]
-              │  │              └─ NPC R Hand [RHand]
-              ├─ NPC L Thigh [LThigh]
-              │  └─ NPC L Calf [LCalf]
-              │     └─ NPC L Foot [LFoot]
-              │        └─ NPC L Toe0 [LToe0]
-              └─ NPC R Thigh [RThigh]
-                 └─ NPC R Calf [RCalf]
-                    └─ NPC R Foot [RFoot]
-                       └─ NPC R Toe0 [RToe0]
+        Bone names are the real FO4 character bones from the vanilla
+        Meshes/Actors/Character/CharacterAssets/skeleton.nif (Root, COM,
+        Pelvis, SPINE1, SPINE2, Chest, Neck, HEAD, LArm_Collarbone,
+        LArm_UpperArm, LArm_ForeArm1, LArm_Hand, LLeg_Thigh, LLeg_Calf,
+        LLeg_Foot, LLeg_Toe1 and the right-side equivalents), created in
+        PyNifly's default Blender spelling (Arm_Hand.L / Leg_Thigh.R) so they
+        match the vertex groups of a vanilla body imported with default
+        settings. PyNifly writes the real NIF names on export.
         """
         # Create armature
         bpy.ops.object.armature_add(location=(0, 0, 0))
@@ -294,138 +279,134 @@ class AnimationHelpers:
         bpy.ops.object.mode_set(mode='EDIT')
 
         edit_bones = armature.edit_bones
-        # rename the default bone that armature_add creates. Bone names
-        # below were previously mismatched against the real canonical FO4
-        # skeleton (fo4_bone_names.py, sourced from the real HumanRace
-        # skeleton.nif) -- confirmed live: this caused vanilla-bone-name
-        # skinning to fail to deform correctly, and this addon's own
-        # fo4_npc_animation.py generators to silently no-op on Spine/COM/
-        # Pelvis/Clavicle/Toe0 keyframes since their bone-name lookups never
-        # matched. Corrected to the exact canonical strings.
+        # Rename the default bone that armature_add creates. The names below
+        # are written in the old Skyrim style ("NPC Root [Root]"), which no FO4
+        # skeleton uses; _fo4_bone() turns each into the real FO4 bone (checked
+        # against the vanilla skeleton.nif on 2026-10-27).
         root_bone = edit_bones[0]
-        root_bone.name = "NPC Root [Root]"
+        root_bone.name = _fo4_bone("NPC Root [Root]")
         root_bone.head = Vector((0, 0, 0))
         root_bone.tail = Vector((0, 0, 0.1))
 
         # ── Centre of Mass ──────────────────────────────────────────────
-        com = edit_bones.new("NPC COM [COM ]")
+        com = edit_bones.new(_fo4_bone("NPC COM [COM ]"))
         com.head = Vector((0, 0, 0.9))
         com.tail = Vector((0, 0, 1.0))
         com.parent = root_bone
 
         # ── Pelvis ──────────────────────────────────────────────────────
-        pelvis = edit_bones.new("NPC Pelvis [Pelv]")
+        pelvis = edit_bones.new(_fo4_bone("NPC Pelvis [Pelv]"))
         pelvis.head = Vector((0, 0, 1.0))
         pelvis.tail = Vector((0, 0, 1.1))
         pelvis.parent = com
 
         # ── Spine chain ─────────────────────────────────────────────────
-        spine = edit_bones.new("NPC Spine [Spn0]")
+        spine = edit_bones.new(_fo4_bone("NPC Spine [Spn0]"))
         spine.head = Vector((0, 0, 1.1))
         spine.tail = Vector((0, 0, 1.2))
         spine.parent = pelvis
 
-        spine1 = edit_bones.new("NPC Spine1 [Spn1]")
+        spine1 = edit_bones.new(_fo4_bone("NPC Spine1 [Spn1]"))
         spine1.head = Vector((0, 0, 1.2))
         spine1.tail = Vector((0, 0, 1.35))
         spine1.parent = spine
 
-        spine2 = edit_bones.new("NPC Spine2 [Spn2]")
+        spine2 = edit_bones.new(_fo4_bone("NPC Spine2 [Spn2]"))
         spine2.head = Vector((0, 0, 1.35))
         spine2.tail = Vector((0, 0, 1.5))
         spine2.parent = spine1
 
         # ── Neck / Head ─────────────────────────────────────────────────
-        neck = edit_bones.new("NPC Neck [Neck]")
+        neck = edit_bones.new(_fo4_bone("NPC Neck [Neck]"))
         neck.head = Vector((0, 0, 1.5))
         neck.tail = Vector((0, 0, 1.6))
         neck.parent = spine2
 
-        head = edit_bones.new("NPC Head [Head]")
+        head = edit_bones.new(_fo4_bone("NPC Head [Head]"))
         head.head = Vector((0, 0, 1.6))
         head.tail = Vector((0, 0, 1.8))
         head.parent = neck
 
         # ── Left arm ────────────────────────────────────────────────────
-        l_clav = edit_bones.new("NPC L Clavicle [LClv]")
+        l_clav = edit_bones.new(_fo4_bone("NPC L Clavicle [LClv]"))
         l_clav.head = Vector((0.1, 0, 1.48))
         l_clav.tail = Vector((0.3, 0, 1.46))
         l_clav.parent = spine2
 
-        l_upper_arm = edit_bones.new("NPC L UpperArm [LUar]")
+        l_upper_arm = edit_bones.new(_fo4_bone("NPC L UpperArm [LUar]"))
         l_upper_arm.head = Vector((0.3, 0, 1.46))
         l_upper_arm.tail = Vector((0.6, 0, 1.4))
         l_upper_arm.parent = l_clav
 
-        l_forearm = edit_bones.new("NPC L Forearm [LLar]")
+        l_forearm = edit_bones.new(_fo4_bone("NPC L Forearm [LLar]"))
         l_forearm.head = Vector((0.6, 0, 1.4))
         l_forearm.tail = Vector((0.9, 0, 1.35))
         l_forearm.parent = l_upper_arm
 
-        l_hand = edit_bones.new("NPC L Hand [LHnd]")
+        l_hand = edit_bones.new(_fo4_bone("NPC L Hand [LHnd]"))
         l_hand.head = Vector((0.9, 0, 1.35))
         l_hand.tail = Vector((1.05, 0, 1.32))
         l_hand.parent = l_forearm
 
         # ── Right arm ───────────────────────────────────────────────────
-        r_clav = edit_bones.new("NPC R Clavicle [RClv]")
+        r_clav = edit_bones.new(_fo4_bone("NPC R Clavicle [RClv]"))
         r_clav.head = Vector((-0.1, 0, 1.48))
         r_clav.tail = Vector((-0.3, 0, 1.46))
         r_clav.parent = spine2
 
-        r_upper_arm = edit_bones.new("NPC R UpperArm [RUar]")
+        r_upper_arm = edit_bones.new(_fo4_bone("NPC R UpperArm [RUar]"))
         r_upper_arm.head = Vector((-0.3, 0, 1.46))
         r_upper_arm.tail = Vector((-0.6, 0, 1.4))
         r_upper_arm.parent = r_clav
 
-        r_forearm = edit_bones.new("NPC R Forearm [RLar]")
+        r_forearm = edit_bones.new(_fo4_bone("NPC R Forearm [RLar]"))
         r_forearm.head = Vector((-0.6, 0, 1.4))
         r_forearm.tail = Vector((-0.9, 0, 1.35))
         r_forearm.parent = r_upper_arm
 
-        r_hand = edit_bones.new("NPC R Hand [RHnd]")
+        r_hand = edit_bones.new(_fo4_bone("NPC R Hand [RHnd]"))
         r_hand.head = Vector((-0.9, 0, 1.35))
         r_hand.tail = Vector((-1.05, 0, 1.32))
         r_hand.parent = r_forearm
 
         # ── Left leg ────────────────────────────────────────────────────
-        l_thigh = edit_bones.new("NPC L Thigh [LThg]")
+        l_thigh = edit_bones.new(_fo4_bone("NPC L Thigh [LThg]"))
         l_thigh.head = Vector((0.18, 0, 1.0))
         l_thigh.tail = Vector((0.2, 0, 0.55))
         l_thigh.parent = pelvis
 
-        l_calf = edit_bones.new("NPC L Calf [LClf]")
+        l_calf = edit_bones.new(_fo4_bone("NPC L Calf [LClf]"))
         l_calf.head = Vector((0.2, 0, 0.55))
         l_calf.tail = Vector((0.2, 0, 0.15))
         l_calf.parent = l_thigh
 
-        l_foot = edit_bones.new("NPC L Foot [Lft ]")
+        l_foot = edit_bones.new(_fo4_bone("NPC L Foot [Lft ]"))
         l_foot.head = Vector((0.2, 0, 0.15))
         l_foot.tail = Vector((0.2, 0.12, 0.05))
         l_foot.parent = l_calf
 
-        l_toe = edit_bones.new("NPC L Toe0 [LToe]")
+        l_toe = edit_bones.new(_fo4_bone("NPC L Toe0 [LToe]"))
         l_toe.head = Vector((0.2, 0.12, 0.05))
         l_toe.tail = Vector((0.2, 0.2, 0.02))
         l_toe.parent = l_foot
 
         # ── Right leg ───────────────────────────────────────────────────
-        r_thigh = edit_bones.new("NPC R Thigh [RThg]")
+        r_thigh = edit_bones.new(_fo4_bone("NPC R Thigh [RThg]"))
         r_thigh.head = Vector((-0.18, 0, 1.0))
         r_thigh.tail = Vector((-0.2, 0, 0.55))
         r_thigh.parent = pelvis
 
-        r_calf = edit_bones.new("NPC R Calf [RClf]")
+        r_calf = edit_bones.new(_fo4_bone("NPC R Calf [RClf]"))
         r_calf.head = Vector((-0.2, 0, 0.55))
         r_calf.tail = Vector((-0.2, 0, 0.15))
         r_calf.parent = r_thigh
 
-        r_foot = edit_bones.new("NPC R Foot [Rft ]")
+        r_foot = edit_bones.new(_fo4_bone("NPC R Foot [Rft ]"))
         r_foot.head = Vector((-0.2, 0, 0.15))
         r_foot.tail = Vector((-0.2, 0.12, 0.05))
         r_foot.parent = r_calf
 
-        r_toe = edit_bones.new("NPC R Toe0 [RToe]")
+        r_toe = edit_bones.new(_fo4_bone("NPC R Toe0 [RToe]"))
         r_toe.head = Vector((-0.2, 0.12, 0.05))
         r_toe.tail = Vector((-0.2, 0.2, 0.02))
         r_toe.parent = r_foot
@@ -604,9 +585,8 @@ class AnimationHelpers:
             pass
         
         # Check bone naming conventions.
-        # NOTE: FO4 bone names follow the "NPC X [Abbrev]" convention which
-        # deliberately includes spaces (e.g. "NPC L UpperArm [LUpArm]").
-        # Flagging spaces as errors is INCORRECT for FO4 skeletons.
+        # NOTE: names with spaces are legal (PyNifly's segment groups such as
+        # "FO4 Seg 000" have them), so spaces are not flagged.
         # We instead warn only about names that are completely empty.
         for bone in armature.bones:
             if not bone.name.strip():

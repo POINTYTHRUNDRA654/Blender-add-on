@@ -322,7 +322,7 @@ def enhance_texture(texture_path: str,
     tier values: "1K_4K" | "2K_8K" | "4K_16K"
 
     Pipeline:
-      DDS->PNG -> AI upscale 4x -> normal + specular from hi-res -> Lanczos downscale -> BC7/BC5/BC4 DDS
+      DDS->PNG -> AI upscale 4x -> normal + specular from hi-res -> Lanczos downscale -> BC7/BC5/BC5 DDS
 
     Returns dict: {success, diffuse_path, normal_path, specular_path, message, steps, tier}
     """
@@ -429,7 +429,7 @@ def enhance_texture(texture_path: str,
         return result
     steps.append(f"Diffuse Lanczos -> {src_w}x{src_h}")
 
-    # -- Step 5: PNG -> DDS (BC7 diffuse, BC5 normal, BC4 specular) -----------
+    # -- Step 5: PNG -> DDS (BC7 diffuse, BC5 normal, BC5 specular) -----------
     diff_final = diff_1x
     nrm_final  = normal_png
     spec_final = specular_png
@@ -451,11 +451,12 @@ def enhance_texture(texture_path: str,
                 steps.append(f"⚠ Normal DDS skipped: {nrm_dds}")
 
         if specular_png and os.path.isfile(specular_png):
-            # BC4 is single-channel (R only) — perfect for a greyscale specular mask
-            ok, spec_dds = _convert_png_to_dds(specular_png, work_dir, fmt="BC4_UNORM")
+            # BC5, as vanilla uses for _s maps (2,722 of 2,730 in Textures1-3.ba2):
+            # two channels, specular and gloss. BC4 (one channel) dropped the second.
+            ok, spec_dds = _convert_png_to_dds(specular_png, work_dir, fmt="BC5_UNORM")
             if ok:
                 spec_final = spec_dds
-                steps.append("Specular -> BC4 DDS (single-channel smoothness)")
+                steps.append("Specular -> BC5 DDS (specular + gloss, as vanilla)")
             else:
                 steps.append(f"⚠ Specular DDS skipped: {spec_dds}")
 
@@ -518,11 +519,11 @@ class FO4_OT_EnhanceTexture(bpy.types.Operator):
     )
     generate_specular: bpy.props.BoolProperty(
         name="Generate Specular Map", default=True,
-        description="Generate a BC4 specular/smoothness map from the AI intermediate",
+        description="Generate a BC5 specular/gloss map from the AI intermediate",
     )
     to_dds: bpy.props.BoolProperty(
         name="Output as DDS", default=True,
-        description="BC7 diffuse, BC5 normal, BC4 specular — best quality for FO4",
+        description="BC7 diffuse, BC5 normal, BC5 specular (vanilla FO4 uses BC5 for _s)",
     )
 
     def invoke(self, context, event):

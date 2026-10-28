@@ -3999,7 +3999,7 @@ class FO4_OT_SavePyNIFCreaturePreset(bpy.types.Operator):
         preset = {
             "label": "pyNIF Export — Rigged Creature (Fallout 4)",
             "game": "Fallout4", "version": "20.2.0.7",
-            "user_version": 12, "user_version_2": 83,
+            "user_version": 12, "user_version_2": 130,
             "nodes": {"root": "BSFadeNode", "enable_skinning": True,
                       "enable_tangents": True, "enable_havok": True},
             "skeleton": {"export_armature": True, "preserve_bone_names": True,
@@ -4048,7 +4048,7 @@ class FO4_OT_CopyFullLODPipeline(bpy.types.Operator):
                 "STEP 3 Run fo4_collision_from_lod3.py → LOD3_COL\n"
                 "STEP 4 Clean LOD0: Merge by Distance, Triangulate, Apply Transforms, Normals, Auto Smooth 30°\n"
                 "STEP 5 pyNIF export: Main=Mesh_LOD0, Collision=Mesh_LOD3_COL, "
-                "bhkConvexShape/MO_SYS_STATIC/Mass=0, Header 20.2.0.7/12/83, BSFadeNode\n"
+                "bhkConvexShape/MO_SYS_STATIC/Mass=0, Header 20.2.0.7/12/130, BSFadeNode\n"
                 "STEP 6 Creation Kit: Static → New → Model → NIF\n"
             )
         context.window_manager.clipboard = txt
@@ -4167,7 +4167,7 @@ class FO4_OT_CopyPyNIFLODSettings(bpy.types.Operator):
     def execute(self, context):
         txt = (
             "# pyNIF Export — LOD + Collision (Fallout 4)\n"
-            "Game: Fallout4 | Version: 20.2.0.7 | UV12 | UV2-83\n"
+            "Game: Fallout4 | Version: 20.2.0.7 | UV12 | UV2-130\n"
             "Geometry: Triangulate=On, Apply Modifiers=On, Remove Doubles=On, Normals=Recalculate, Auto Smooth=30°\n"
             "Materials: BGSM, Use External BGSM=On  ← do NOT rename/remove material slots\n"
             "Collision Static:  bhkConvexShape | Source=Mesh_Collision | MO_SYS_STATIC | Mass=0\n"
@@ -4380,7 +4380,7 @@ class FO4_OT_CopyPyNIFRiggedSettings(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        txt = "Game: Fallout4 | Version: 20.2.0.7 | UV12/UV2-83 | Skinning: ON | BSDismember: ON"
+        txt = "Game: Fallout4 | Version: 20.2.0.7 | UV12/UV2-130 | Skinning: ON | BSDismember: ON"
         context.window_manager.clipboard = txt
         self.report({'INFO'}, "pyNIF rigged armor settings copied to clipboard")
         return {'FINISHED'}
@@ -4722,7 +4722,7 @@ class FO4_OT_SavePyNIFPreset(bpy.types.Operator):
             "export_format": "NIF",
             "version": "20.2.0.7",
             "user_version": 12,
-            "user_version_2": 83,
+            "user_version_2": 130,
             "geometry": {
                 "triangulate": True,
                 "apply_modifiers": True,
@@ -4779,7 +4779,7 @@ class FO4_OT_CopyPyNIFSettings(bpy.types.Operator):
     def execute(self, context):
         txt = (
                 "Game: Fallout 4\nExport Format: NIF\n"
-                "Version: 20.2.0.7\nUser Version: 12\nUser Version 2: 83\n"
+                "Version: 20.2.0.7\nUser Version: 12\nUser Version 2: 130\n"
                 "Triangulate Mesh: On\nApply Modifiers: On\n"
                 "Remove Doubles: On\nNormals: Recalculate\nAuto Smooth: 30 deg\n"
                 "Material Type: BGSM\nTexture Format: DDS (BC7)\n"

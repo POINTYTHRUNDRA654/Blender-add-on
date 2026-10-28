@@ -69,6 +69,8 @@ import os
 import re
 import traceback
 
+from . import fo4_bone_names as _bn
+
 try:
     import bpy
     from bpy.types import Operator
@@ -890,7 +892,7 @@ class FO4_OT_GenerateLODs(Operator):
                 return 'VEGETATION'
         if obj.parent and obj.parent.type == 'ARMATURE':
             bones = [b.name for b in obj.parent.data.bones]
-            return 'CHARACTER' if any(b.startswith("NPC ") for b in bones) else 'CREATURE'
+            return 'CHARACTER' if _bn.is_character_skeleton(bones) else 'CREATURE'
         return 'STATIC'
 
     def invoke(self, context, event):

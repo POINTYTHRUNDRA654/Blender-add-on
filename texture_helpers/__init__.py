@@ -13,7 +13,7 @@ class TextureHelpers:
     # FO4 .dds textures follow strict suffixes recognised by the game engine:
     #   _d  – diffuse/albedo colour map        (BC1 or BC3 with alpha)
     #   _n  – tangent-space normal map          (BC5 / ATI2N)
-    #   _s  – specular / smoothness map         (BC1)
+    #   _s  – specular / gloss map              (BC5, as vanilla)
     #   _g  – glow / emissive mask              (BC1)
     #   _e  – environment / cube-map mask       (BC1)
     # The helpers use these conventions for auto-detection and compression.

@@ -16,7 +16,7 @@ KNOWN_MODS = {
 }
 
 SKELETON_COMPAT = {
-    "fo4":  {"bones":["NPC Root [Root]","NPC Pelvis [Pelv]","NPC Spine [Spn0]"]},
+    "fo4":  {"bones":["COM","Pelvis","SPINE1"]},  # real FO4 names (was Skyrim's "NPC ..." names)
     "cbbe": {"bones":["CBBE_Spine","CBBE_Pelvis"]},
 }
 
@@ -43,7 +43,8 @@ def check_skeleton_compatibility(arm_obj) -> list:
     issues = []
     if not arm_obj or arm_obj.type != 'ARMATURE':
         return issues
-    bones = {b.name for b in arm_obj.data.bones}
+    from . import fo4_bone_names as _bn
+    bones = {_bn.to_fo4(b.name) for b in arm_obj.data.bones}  # raw or PyNifly .L/.R names
     fo4_required = set(SKELETON_COMPAT["fo4"]["bones"])
     missing = fo4_required - bones
     if missing:

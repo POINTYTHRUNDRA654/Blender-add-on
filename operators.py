@@ -1137,7 +1137,7 @@ class FO4_OT_ShowArmorClothingWorkflow(Operator):
             "2. Create textures in 512×512, 1024×1024, or 2048×2048:",
             "   _d.dds = diffuse/albedo (BC1 or BC7)",
             "   _n.dds = normal map     (BC5 or BC7)",
-            "   _s.dds = specular       (BC1 or BC7)",
+            "   _s.dds = specular       (BC5)",
             "3. Use Cathedral Assets Optimizer to compress textures for FO4.",
         ])
 
@@ -2989,7 +2989,7 @@ class FO4_OT_InstallTexture(Operator):
         items=[
             ('DIFFUSE',     "Diffuse",          "Diffuse/albedo colour map (_d) - BC1 or BC3 with alpha"),
             ('NORMAL',      "Normal Map",        "Tangent-space normal map (_n) - BC5 (ATI2)"),
-            ('SPECULAR',    "Specular",          "Specular/smoothness map (_s) - BC1"),
+            ('SPECULAR',    "Specular",          "Specular/gloss map (_s) - BC5 (as vanilla)"),
             ('GLOW',        "Glow/Emissive",     "Glow / emissive mask (_g) - BC1"),
             ('ENVIRONMENT', "Environment Mask",  "Cube-map environment mask (_e) - BC1"),
         ]
@@ -5616,7 +5616,7 @@ class FO4_OT_ShowQuickReference(Operator):
             "  Diffuse (no alpha) : BC1 / DXT1",
             "  Diffuse (alpha)    : BC3 / DXT5",
             "  Normal map         : BC5 / ATI2",
-            "  Specular / Gloss   : BC1 / DXT1",
+            "  Specular / Gloss   : BC5 / ATI2",
             "  Power of 2 sizes only: 256, 512, 1024, 2048, 4096",
             "",
             "SCALE",
@@ -14908,7 +14908,7 @@ class FO4_OT_SetupHDMaterial(Operator):
     --------------------
     • **Diffuse** (_d.dds)  – BC3/DXT5 with alpha, or BC1/DXT1 for opaque
     • **Normal**  (_n.dds)  – BC5/ATI2 (two-channel tangent-space)
-    • **Specular** (_s.dds) – BC1 (RGB glossiness/specular)
+    • **Specular** (_s.dds) – BC5 (specular + gloss, as vanilla)
     • **Glow**    (_g.dds)  – BC1 glow/emissive mask; auto-enables BGSM emit
     • **EnvMap**  (_e.dds)  – BC1 cube-map reflection mask (optional)
 
@@ -14998,7 +14998,7 @@ class FO4_OT_SetupHDMaterial(Operator):
         col.label(text="4K Texture Format Recommendations:", icon='INFO')
         col.label(text="  Diffuse (_d): BC3/DXT5 (with alpha) or BC1/DXT1 (opaque)")
         col.label(text="  Normal  (_n): BC5/ATI2  ← always, regardless of resolution")
-        col.label(text="  Specular (_s): BC1/DXT1")
+        col.label(text="  Specular (_s): BC5/ATI2")
         col.label(text="  Glow    (_g): BC1/DXT1")
         col.label(text="  EnvMap  (_e): BC1/DXT1")
         col.separator(factor=0.5)

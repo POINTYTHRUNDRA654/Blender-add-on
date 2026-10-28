@@ -1939,11 +1939,11 @@ class FO4_PT_RiggedArmorPipeline(_FO4SubPanel):
         layout.label(text="Skeleton NIF import settings:", icon='ARMATURE_DATA')
         info = layout.box()
         info.label(text="Import Skeleton / Skin Weights / Partitions = ON", icon='INFO')
-        info.label(text="Look for: NPC Root [Root] → Bip01 hierarchy", icon='DOT')
+        info.label(text="Look for: Root → COM → Pelvis hierarchy", icon='DOT')
 
         layout.separator()
         layout.label(text="Step 4 — Bind mesh to FO4 skeleton:", icon='MOD_ARMATURE')
-        layout.label(text="Add Modifier → Armature → NPC Root [Root]", icon='DOT')
+        layout.label(text="Add Modifier → Armature → the imported FO4 skeleton", icon='DOT')
 
         layout.separator()
         layout.label(text="Step 5 — Transfer skin weights:", icon='WPAINT_HLT')

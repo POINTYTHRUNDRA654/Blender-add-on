@@ -286,11 +286,11 @@ def find_fo4_skeleton_in_scene() -> Optional[bpy.types.Object]:
             continue
         bones = {b.name for b in obj.data.bones}
         # Check for key FO4 bone names
-        fo4_key_bones = {"NPC Pelvis [Pelv]", "NPC Spine [Spn0]", "NPC Head [Head]"}
-        if fo4_key_bones & bones:
+        # FO4 character rigs use COM / Pelvis / SPINE1 / LArm_Hand (or PyNifly's
+        # Arm_Hand.L); the old test looked for Skyrim's "NPC ..." names.
+        if _bn.is_character_skeleton(bones):
             return obj
-        # Simpler skeleton check
-        if any("NPC" in b for b in bones) or any("COM" in b for b in bones):
+        if any("COM" in b for b in bones):
             return obj
     return None
 
@@ -310,6 +310,12 @@ def build_reference_skeleton() -> bpy.types.Object:
     eb = arm_data.edit_bones
 
     def bone(name, head, tail, parent_name=None):
+        # Names below are written in the old Skyrim style; build the real FO4
+        # bone in PyNifly's default Blender spelling ("Arm_Hand.L"), which is
+        # what a vanilla body imported with default settings uses for its
+        # vertex groups, and which PyNifly exports as the real NIF name.
+        name = _bn.pynifly_name(name)
+        parent_name = _bn.pynifly_name(parent_name) if parent_name else None
         b      = eb.new(name)
         b.head = mathutils.Vector(head)
         b.tail = mathutils.Vector(tail)
@@ -466,7 +472,7 @@ def _limit_vertex_groups(armor_obj, keep_bones: List[str],
         best_name, best_dist = None, None
         sk_mw = skeleton_obj.matrix_world
         for bname in keep_bones:
-            pbone = skeleton_obj.pose.bones.get(bname)
+            pbone = _bn.find_bone(skeleton_obj.pose.bones, bname)
             if pbone is None:
                 continue
             bone_head_world = sk_mw @ pbone.head

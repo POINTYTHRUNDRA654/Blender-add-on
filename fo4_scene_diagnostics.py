@@ -30,7 +30,7 @@ COLLISION
 RIGGING (skipped for non-mesh / non-skinned objects)
   - Armature modifier present
   - Bone count ≤ 256
-  - Root bone "NPC Root [Root]" or "Root" present
+  - Root bone "Root" (or "COM" for a body or armour without the skeleton) present
   - Vertex groups match bone names
 
 EXPORT
@@ -910,14 +910,16 @@ class SceneDiagnostics:
             ))
 
         # Root bone
-        root_names = {"root", "npc root [root]", "npc root"}
+        # FO4: "Root" in skeleton.nif; an armature imported from a body or armour
+        # NIF (no skeleton) starts at "COM". Skyrim's "NPC Root [Root]" kept for old rigs.
+        root_names = {"root", "com", "npc root [root]", "npc root"}
         bone_names_lower = {b.name.lower() for b in arm_obj.data.bones}
         has_root = bool(root_names & bone_names_lower)
         if not has_root:
             results.append(CheckResult(
                 ERROR, "RIGGING",
-                "No root bone found. FO4 skeletons require a 'NPC Root [Root]' bone "
-                "at the top of the hierarchy.",
+                "No root bone found. FO4 character skeletons start at 'Root' "
+                "(or 'COM' for a body or armour imported without the skeleton).",
             ))
         else:
             results.append(CheckResult(OK, "RIGGING", "Root bone found"))

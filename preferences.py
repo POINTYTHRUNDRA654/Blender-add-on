@@ -648,6 +648,24 @@ class FO4AddonPreferences(bpy.types.AddonPreferences):
         description="Path to ffmpeg.exe or its folder (optional, installer will place binaries under tools/ffmpeg)",
         update=_pref_path_update,
     )
+    # External UV tools. The Settings panel drew these and the Unwrap3D /
+    # Packer-IO operators read them, but the properties were never defined,
+    # so the panel showed "property not found" and the operators could never
+    # find the programs.
+    unwrap3d_exe_path: bpy.props.StringProperty(
+        name="Ultimate Unwrap3D Path",
+        subtype="FILE_PATH",
+        default="",
+        description="Path to unwrap3d_64.exe (Ultimate Unwrap3D), used by the external UV unwrap button",
+        update=_pref_path_update,
+    )
+    packerio_exe_path: bpy.props.StringProperty(
+        name="Packer-IO Path",
+        subtype="FILE_PATH",
+        default="",
+        description="Path to Packer-IO.exe, used by the external UV packing button",
+        update=_pref_path_update,
+    )
 
     texconv_path: bpy.props.StringProperty(
         name="texconv Path",

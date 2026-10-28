@@ -22,26 +22,20 @@ try:
 except ImportError:
     pref_module = None  # type: ignore[assignment]
 
-# Canonical FO4 vanilla NPC skeleton bone names sourced from fo4_bone_names.py.
-# These match HumanRace skeleton.nif exactly, including trailing spaces where
-# the game uses them (e.g. "NPC COM [COM ]", "NPC L Foot [Lft ]").
+# Canonical FO4 character skeleton bone names, from fo4_bone_names.py (read
+# from the vanilla skeleton.nif: "COM", "Pelvis", "LArm_Hand", "RLeg_Thigh"...).
 try:
     from . import fo4_bone_names as _bn
     FO4_SKELETON_BONES = list(_bn.NPC.values())
 except ImportError:
-    # Fallback hard-coded list (canonical abbreviations)
+    # Fallback list: the real FO4 character bones from vanilla skeleton.nif
+    # (same as fo4_bone_names.NPC).
     FO4_SKELETON_BONES = [
-        "NPC Root [Root]", "NPC COM [COM ]", "NPC Pelvis [Pelv]",
-        "NPC Spine [Spn0]", "NPC Spine1 [Spn1]", "NPC Spine2 [Spn2]",
-        "NPC Neck [Neck]", "NPC Head [Head]",
-        "NPC L Clavicle [LClv]", "NPC L UpperArm [LUar]",
-        "NPC L Forearm [LLar]", "NPC L Hand [LHnd]",
-        "NPC R Clavicle [RClv]", "NPC R UpperArm [RUar]",
-        "NPC R Forearm [RLar]", "NPC R Hand [RHnd]",
-        "NPC L Thigh [LThg]", "NPC L Calf [LClf]",
-        "NPC L Foot [Lft ]", "NPC L Toe0 [LToe]",
-        "NPC R Thigh [RThg]", "NPC R Calf [RClf]",
-        "NPC R Foot [Rft ]", "NPC R Toe0 [RToe]",
+        "Root", "COM", "Pelvis", "SPINE1", "SPINE2", "Chest", "Neck", "HEAD",
+        "LArm_Collarbone", "LArm_UpperArm", "LArm_ForeArm1", "LArm_Hand",
+        "RArm_Collarbone", "RArm_UpperArm", "RArm_ForeArm1", "RArm_Hand",
+        "LLeg_Thigh", "LLeg_Calf", "LLeg_Foot", "LLeg_Toe1",
+        "RLeg_Thigh", "RLeg_Calf", "RLeg_Foot", "RLeg_Toe1",
     ]
 
 
@@ -235,11 +229,12 @@ _CLASSES = [
 # ---------------------------------------------------------------------------
 
 # FO4 hard limits
-_FO4_MAX_BONES       = 80    # max deform bones per single skinned mesh (NIF loader limit)
-_FO4_MAX_INFLUENCES  = 4     # max bone influences per vertex
+_FO4_MAX_INFLUENCES  = 4     # max bone influences per vertex (vanilla never exceeds 4)
 
-# Expected FO4 skeleton root bone names (only the true root — COM is a child)
-_FO4_ROOT_BONES = {"NPC Root [Root]"}
+# FO4 skeleton roots: "Root" in skeleton.nif; a body imported without the
+# skeleton starts at "COM". (Was {"NPC Root [Root]"}, Skyrim's name, so every
+# real FO4 rig got a "no root bone" warning.)
+_FO4_ROOT_BONES = {"Root", "COM"}
 
 
 def _validate_fo4_rig(armature_obj) -> list:
@@ -256,20 +251,16 @@ def _validate_fo4_rig(armature_obj) -> list:
     bones = armature_obj.data.bones
     bone_count = len(bones)
 
-    if bone_count > _FO4_MAX_BONES:
-        issues.append({
-            "severity": "warning",
-            "message": f"{bone_count} bones — FO4 recommends ≤{_FO4_MAX_BONES}",
-            "fix_hint": "Remove unused bones or split skinned mesh",
-        })
+    # No whole-armature bone-count warning: the vanilla character skeleton
+    # alone has 128 bones, so the old "> 80" check warned on every real rig.
 
-    # Check for root bone
+    # Check for root bone (either spelling PyNifly imports)
     root_names = {b.name for b in bones if b.parent is None}
-    if not root_names.intersection(_FO4_ROOT_BONES):
+    if not {_bn.to_fo4(n) for n in root_names} & _FO4_ROOT_BONES:
         issues.append({
             "severity": "warning",
             "message": f"No standard FO4 root bone found (roots: {root_names})",
-            "fix_hint": "Rename root bone to 'NPC Root [Root]' or import fo4_skeleton.nif",
+            "fix_hint": "The FO4 skeleton root is 'Root' (or 'COM' on a body imported without the skeleton); import skeleton.nif",
         })
 
     # Check for bones with spaces (NIF exporter issues)

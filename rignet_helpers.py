@@ -1051,7 +1051,7 @@ def _validate_fo4_rig(armature_obj) -> list:
     if bone_count > _FO4_MAX_BONES:
         issues.append({
             "severity": "warning",
-            "message": f"{bone_count} bones — FO4 recommends ≤{_FO4_MAX_BONES}",
+            "message": f"{bone_count} bones on this rig; vanilla skinned meshes mostly use under {_FO4_MAX_BONES} (the most seen is 141), and fewer bones skin faster",
             "fix_hint": "Remove unused bones or split skinned mesh",
         })
 

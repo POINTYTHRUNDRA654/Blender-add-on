@@ -8,6 +8,8 @@ import json
 import sys
 import traceback
 
+from . import fo4_bone_names as _bn
+
 # FO4 game units per metre (Havok scale).  Must match operators._FO4_UNIT_SCALE_INV.
 _FO4_UNIT_SCALE_INV = 69.99125
 
@@ -96,7 +98,7 @@ class ExportHelpers:
 
         Returns one of:
         - ``'VEGETATION'``  – trees, plants, shrubs (vertex-group wind, no armature)
-        - ``'CHARACTER'``   – player / NPC (armature with "NPC " bone names)
+        - ``'CHARACTER'``   – player / NPC (armature with the FO4 character bones: COM, Pelvis, SPINE1, LArm_Hand...)
         - ``'CREATURE'``    – creature / animal (armature, non-NPC bone names)
         - ``'STATIC'``      – static prop / architecture (no armature)
         - ``'WEAPON'``      – weapon (explicit override or naming convention)
@@ -139,7 +141,7 @@ class ExportHelpers:
 
         if arm:
             bone_names = [b.name for b in arm.data.bones]
-            if any(b.startswith("NPC ") for b in bone_names):
+            if _bn.is_character_skeleton(bone_names):
                 return 'CHARACTER'
             return 'CREATURE'
 
