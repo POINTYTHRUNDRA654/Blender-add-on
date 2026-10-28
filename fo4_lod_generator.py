@@ -296,7 +296,24 @@ def _nearest_pow2(n: int) -> int:
     return upper if (n - lower) > (upper - n) else lower
 
 
-def _lod_texture_output_dir(src_path: str, out_subdir: str = "LOD") -> str:
+def _is_game_data_folder(textures_root: str) -> bool:
+    """True when *textures_root* is the Textures folder of a game Data folder
+    (the configured FO4 Data path, or any folder holding Fallout4.esm).
+    LOD textures must go into the mod being built, never into the game."""
+    data_dir = os.path.normcase(os.path.normpath(os.path.dirname(textures_root)))
+    try:
+        from . import preferences as _prefs_mod
+        prefs = _prefs_mod.get_preferences()
+        game = (getattr(prefs, "fo4_game_data_path", "") or "").strip() if prefs else ""
+        if game and os.path.normcase(os.path.normpath(bpy.path.abspath(game))) == data_dir:
+            return True
+    except Exception:
+        pass
+    return os.path.isfile(os.path.join(data_dir, "Fallout4.esm"))
+
+
+def _lod_texture_output_dir(src_path: str, out_subdir: str = "LOD",
+                            textures_root: str = "") -> str:
     """Directory to write a downscaled LOD texture into, mirroring real FO4's
     ``Textures\\LOD\\...`` convention (see the vanilla
     ``LOD/Trees/BlastedForestTrunksLOD_d.dds`` reference in the comment
@@ -324,9 +341,13 @@ def _lod_texture_output_dir(src_path: str, out_subdir: str = "LOD") -> str:
         None,
     )
     if tex_idx is None:
+        if textures_root:
+            return os.path.join(textures_root, out_subdir)
         return os.path.join(os.path.dirname(src_path), out_subdir)
 
-    textures_root = os.sep.join(parts[:tex_idx + 1])
+    # *textures_root* (the mod's own Textures folder) wins over the folder the
+    # source texture was loaded from, which is often the game's own Data.
+    textures_root = textures_root or os.sep.join(parts[:tex_idx + 1])
     rel_parts = [p for p in parts[tex_idx + 1:-1] if p]  # everything between Textures/ and the filename
     # Re-running LOD generation on the same object reuses its material, whose
     # texture node by then already points at THIS function's own previous
@@ -344,7 +365,7 @@ def _lod_texture_output_dir(src_path: str, out_subdir: str = "LOD") -> str:
 
 
 def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
-                         out_subdir: str = "LOD") -> tuple:
+                         out_subdir: str = "LOD", textures_root: str = "") -> tuple:
     """Give every object in *lod_objects* a shared, downscaled copy of the
     source's textures instead of the full-resolution original.
 
@@ -456,12 +477,23 @@ def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
                     processed += 1
                     continue
 
+                if not textures_root:
+                    _parts = os.path.normpath(src_path).split(os.sep)
+                    _ti = next((i for i in range(len(_parts) - 1, -1, -1)
+                                if _parts[i].lower() == "textures"), None)
+                    if _ti is not None and _is_game_data_folder(os.sep.join(_parts[:_ti + 1])):
+                        skipped.append(
+                            f"'{node.name}' on '{lod_obj.name}': source texture is in the game's "
+                            "Data folder -- set a Mod Folder so the LOD texture goes into your mod"
+                        )
+                        continue
+
                 stem = os.path.splitext(os.path.basename(src_path))[0]
                 new_img = img.copy()
                 new_img.name = f"{stem}_LOD"
                 new_img.scale(new_w, new_h)
 
-                out_dir = _lod_texture_output_dir(src_path, out_subdir)
+                out_dir = _lod_texture_output_dir(src_path, out_subdir, textures_root)
                 os.makedirs(out_dir, exist_ok=True)
                 out_path = os.path.join(out_dir, f"{stem}.png")
                 new_img.filepath_raw = out_path
@@ -1405,7 +1437,9 @@ class FO4_OT_GenerateLODs(Operator):
         # using the same bark diffuse) end up sharing one LOD atlas instead
         # of each target separately downscaling its own copy.
         if all_lod_objects:
-            _ok, tex_msg = create_lod_textures(all_lod_objects, scale_factor=0.25)
+            _ok, tex_msg = create_lod_textures(
+                all_lod_objects, scale_factor=0.25,
+                textures_root=os.path.join(self.mod_folder, "Textures") if self.mod_folder else "")
             steps.append(tex_msg)
 
         # ── Texture / material info ───────────────────────────────────────────

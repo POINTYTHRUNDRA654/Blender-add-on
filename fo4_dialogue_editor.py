@@ -51,7 +51,7 @@ class FO4DialogueNode(Node):
 class FO4TopicNode(Node):
     bl_idname = 'FO4TopicNodeType'
     bl_label  = 'Topic / DIAL'
-    bl_icon   = 'SEQUENCE_COLOR_06'
+    bl_icon   = 'STRIP_COLOR_06'
 
     topic_name: bpy.props.StringProperty(name="Topic", default="MyTopic")
     topic_type: bpy.props.EnumProperty(

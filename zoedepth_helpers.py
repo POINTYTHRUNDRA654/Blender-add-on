@@ -265,8 +265,20 @@ def estimate_depth_from_image(image_path, output_path=None, model_type="ZoeD_N")
         from zoedepth.models.builder import build_model
         from zoedepth.utils.config import get_config
 
-        # Build the requested model variant
-        conf = get_config(model_type, "infer")
+        # Build the requested model variant. get_config() takes the model
+        # folder name, not the hub function name, so map them the way
+        # ZoeDepth's own hubconf.py does (passing "ZoeD_NK" straight in fails
+        # with "not in supported choices"). The infer configs carry the
+        # pretrained weights URL for each variant.
+        model_name, config_version = {
+            "ZoeD_N": ("zoedepth", None),
+            "ZoeD_K": ("zoedepth", "kitti"),
+            "ZoeD_NK": ("zoedepth_nk", None),
+        }.get(model_type, ("zoedepth", None))
+        if config_version:
+            conf = get_config(model_name, "infer", config_version=config_version)
+        else:
+            conf = get_config(model_name, "infer")
         model = build_model(conf)
         model.eval()
 

@@ -158,7 +158,7 @@ def _convert_to_dds(result: dict, output_dir: str, base_name: str) -> dict:
         png = result.get(map_type)
         if png and os.path.isfile(png):
             try:
-                subprocess.run([texconv, "-f", fmt, "-o", output_dir, png],
+                subprocess.run([texconv, "-y", "-f", fmt, "-o", output_dir, png],
                                capture_output=True, timeout=60)
                 dds = png.replace(".png", ".dds")
                 if os.path.isfile(dds):
@@ -192,8 +192,11 @@ class FO4_OT_GenerateTexture(bpy.types.Operator):
         desc     = getattr(context.scene, "fo4_tex_description", "rusted metal")
         out_dir  = bpy.path.abspath(getattr(context.scene, "fo4_tex_output", "//"))
         base_name= getattr(context.scene, "fo4_tex_name", "generated")
-        resolution = getattr(context.scene, "fo4_tex_resolution", 1024)
+        resolution = int(getattr(context.scene, "fo4_tex_resolution", 1024))
 
+        if not out_dir:
+            self.report({"ERROR"}, "Set an Output Folder first (or save the .blend so '//' has a folder)")
+            return {"CANCELLED"}
         result = generate_texture_via_mossy(desc, out_dir, base_name, resolution)
         if result["success"]:
             self.report({"INFO"}, result["message"])

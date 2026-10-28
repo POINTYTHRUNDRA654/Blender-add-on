@@ -4687,6 +4687,9 @@ class FO4_OT_ExportAll(Operator):
         if not export_helpers:
             self.report({'ERROR'}, "export_helpers module not available")
             return {'CANCELLED'}
+        if not self.directory:
+            self.report({'ERROR'}, "Choose an output folder first")
+            return {'CANCELLED'}
         success, results = export_helpers.ExportHelpers.export_complete_mod(
             context.scene, self.directory
         )
@@ -4923,6 +4926,12 @@ class FO4_OT_ExportSceneAsNif(Operator):
         )
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         if not export_helpers:
             self.report({'ERROR'}, "export_helpers module not available")
             return {'CANCELLED'}
@@ -7331,7 +7340,10 @@ class FO4_OT_HybridUnwrap(Operator):
         src_uv_name = None
         if has_texture and obj.data.uv_layers:
             active_uv = obj.data.uv_layers.active
-            if active_uv and active_uv.name != 'UV_bake_src':
+            # Read the name now: bm.to_mesh() below rebuilds the UV layers, which
+            # leaves active_uv pointing at freed memory (garbage name bytes).
+            active_uv_name = active_uv.name if active_uv else None
+            if active_uv_name and active_uv_name != 'UV_bake_src':
                 stale = obj.data.uv_layers.get('UV_bake_src')
                 if stale:
                     obj.data.uv_layers.remove(stale)
@@ -7340,17 +7352,17 @@ class FO4_OT_HybridUnwrap(Operator):
                 import bmesh as _bmesh
                 bm = _bmesh.new()
                 bm.from_mesh(obj.data)
-                src_uv_bm = bm.loops.layers.uv.get(active_uv.name)
+                src_uv_bm = bm.loops.layers.uv.get(active_uv_name)
                 if src_uv_bm is not None:
                     bkp_uv_bm = bm.loops.layers.uv.new('UV_bake_src')
                     for face in bm.faces:
                         for loop in face.loops:
                             loop[bkp_uv_bm].uv = loop[src_uv_bm].uv.copy()
                     bm.to_mesh(obj.data)
-                    src_uv_name = active_uv.name
+                    src_uv_name = active_uv_name
                 bm.free()
                 # Keep the original layer active for unwrapping.
-                orig_idx = obj.data.uv_layers.find(active_uv.name)
+                orig_idx = obj.data.uv_layers.find(active_uv_name)
                 if orig_idx >= 0:
                     obj.data.uv_layers.active_index = orig_idx
 
@@ -12377,6 +12389,12 @@ class FO4_OT_ExportLODChainAsNif(Operator):
         return context.active_object is not None and context.active_object.type == 'MESH'
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.directory, "an output folder"):
+
+            return {'CANCELLED'}
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "No mesh object selected")
@@ -12562,6 +12580,9 @@ class FO4_OT_ExportQuestData(Operator):
     filepath: StringProperty(subtype='FILE_PATH')
     
     def execute(self, context):
+        if not self.filepath:
+            self.report({'ERROR'}, "Choose a file to export the quest data to first")
+            return {'CANCELLED'}
         try:
             scene = context.scene
             # Build from the scene's own quest state -- the name set by
@@ -13413,6 +13434,12 @@ class FO4_OT_ExportPresets(Operator):
     filepath: StringProperty(subtype='FILE_PATH', default="fo4_presets_export.json")
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         if not preset_library:
             self.report({'ERROR'}, "preset_library module unavailable")
             return {'CANCELLED'}
@@ -14115,6 +14142,12 @@ class FO4_OT_ExportOperationLog(Operator):
     filepath: StringProperty(subtype='FILE_PATH', default="fo4_operation_log.txt")
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         if not notification_system:
             self.report({'ERROR'}, "notification_system module not available")
             return {'CANCELLED'}
@@ -16670,6 +16703,9 @@ class FO4_OT_ExportBGSM(Operator):
             self.report({'ERROR'}, "bgsm_helpers module not available")
             return {'CANCELLED'}
 
+        if not self.directory:
+            self.report({'ERROR'}, "Choose an output folder first (usually Data/Materials/...)")
+            return {'CANCELLED'}
         obj = context.active_object
         results = bgsm_helpers.export_bgsm_for_object(
             obj,

@@ -6,7 +6,7 @@ A comprehensive tutorial and helper system for creating Fallout 4 mods in Blende
 bl_info = {
     "name": "Mossy Industries blender addon",
     "author": "Mossy Industries",
-    "version": (5, 4, 2),
+    "version": (5, 4, 3),
     "blender": (2, 90, 0),  # Compatible with Blender 2.90+ through 5.x
     "location": "View3D > Sidebar > Fallout 4",
     "description": (
@@ -144,20 +144,30 @@ def _lazy_import(name):
     except Exception:
         return None
 
-hunyuan3d_helpers      = None  # loaded on demand in AI panel
-zoedepth_helpers       = None
-gradio_helpers         = None
-hymotion_helpers       = None
-realesrgan_helpers     = None
-gpu_manager            = None
-get3d_helpers          = None
-stylegan2_helpers      = None
-instantngp_helpers     = None
-imageto3d_helpers      = None
-rignet_helpers         = None
-motion_generation_helpers = None
-shap_e_helpers         = None
-point_e_helpers        = None
+def _already_loaded(name):
+    """The module if another submodule already imported it, else None.
+
+    A plain ``name = None`` here would overwrite the package attribute that
+    importing the submodule set, so ``from . import name`` elsewhere would
+    return None until Phase 2 re-imports it (and forever if Phase 2 never runs).
+    """
+    return sys.modules.get(f"{__package__}.{name}") if __package__ else None
+
+
+hunyuan3d_helpers      = _already_loaded("hunyuan3d_helpers")  # loaded on demand in AI panel
+zoedepth_helpers       = _already_loaded("zoedepth_helpers")
+gradio_helpers         = _already_loaded("gradio_helpers")
+hymotion_helpers       = _already_loaded("hymotion_helpers")
+realesrgan_helpers     = _already_loaded("realesrgan_helpers")
+gpu_manager            = _already_loaded("gpu_manager")
+get3d_helpers          = _already_loaded("get3d_helpers")
+stylegan2_helpers      = _already_loaded("stylegan2_helpers")
+instantngp_helpers     = _already_loaded("instantngp_helpers")
+imageto3d_helpers      = _already_loaded("imageto3d_helpers")
+rignet_helpers         = _already_loaded("rignet_helpers")
+motion_generation_helpers = _already_loaded("motion_generation_helpers")
+shap_e_helpers         = _already_loaded("shap_e_helpers")
+point_e_helpers        = _already_loaded("point_e_helpers")
 mossy_link = _try_import("mossy_link")
 mesh_check_ui = _try_import("mesh_check_ui")  # rule-check button + panel (uses vanilla_compare)
 torch_path_manager = _try_import("torch_path_manager")

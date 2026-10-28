@@ -51,6 +51,11 @@ _FO4_MAX_BONES   = 4      # bone influences per vertex
 
 # ── Shared pipeline helpers ────────────────────────────────────────────────────
 
+# Default folder for export dialogs when the .blend is unsaved (not the root of C:,
+# which normally needs admin rights to write to).
+_DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
+
+
 def _get_active_mesh(context) -> "tuple[object | None, str]":
     """Return (obj, error_msg).  obj is None when there is no valid selection."""
     obj = context.active_object
@@ -353,7 +358,7 @@ class FO4_OT_PipelineStaticMesh(Operator):
     def invoke(self, context, event):
         if not self.mod_folder:
             blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-            self.mod_folder = blend_dir or "C:/"
+            self.mod_folder = blend_dir or _DOWNLOADS
         if not self.filepath:
             obj = context.active_object
             name = obj.name if obj else "mesh"
@@ -369,6 +374,12 @@ class FO4_OT_PipelineStaticMesh(Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         obj, err = _get_active_mesh(context)
         if obj is None:
             self.report({'ERROR'}, err)
@@ -519,11 +530,17 @@ class FO4_OT_PipelineWeapon(Operator):
         obj = context.active_object
         if obj:
             blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-            self.filepath = os.path.join(blend_dir or "C:/", f"{obj.name}_weapon.nif")
+            self.filepath = os.path.join(blend_dir or _DOWNLOADS, f"{obj.name}_weapon.nif")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         obj, err = _get_active_mesh(context)
         if obj is None:
             self.report({'ERROR'}, err)
@@ -697,11 +714,17 @@ class FO4_OT_PipelineFlora(Operator):
         obj = context.active_object
         if obj:
             blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-            self.filepath = os.path.join(blend_dir or "C:/", f"{obj.name}_flora.nif")
+            self.filepath = os.path.join(blend_dir or _DOWNLOADS, f"{obj.name}_flora.nif")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         obj, err = _get_active_mesh(context)
         if obj is None:
             self.report({'ERROR'}, err)
@@ -812,11 +835,17 @@ class FO4_OT_PipelineNavMesh(Operator):
         obj = context.active_object
         if obj:
             blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-            self.filepath = os.path.join(blend_dir or "C:/", f"{obj.name}_navmesh.fbx")
+            self.filepath = os.path.join(blend_dir or _DOWNLOADS, f"{obj.name}_navmesh.fbx")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         obj, err = _get_active_mesh(context)
         if obj is None:
             self.report({'ERROR'}, err)
@@ -941,7 +970,7 @@ class FO4_OT_PipelineTRIMorphs(Operator):
         obj = context.active_object
         if obj:
             blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-            self.filepath = os.path.join(blend_dir or "C:/", f"{obj.name}.tri")
+            self.filepath = os.path.join(blend_dir or _DOWNLOADS, f"{obj.name}.tri")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1012,7 +1041,7 @@ class FO4_OT_PipelineTextures(Operator):
 
     def invoke(self, context, event):
         blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-        self.output_dir = os.path.join(blend_dir or "C:/", "textures")
+        self.output_dir = os.path.join(blend_dir or _DOWNLOADS, "textures")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1035,7 +1064,9 @@ class FO4_OT_PipelineTextures(Operator):
         if self.convert_to_dds:
             try:
                 from . import nvtt_helpers
-                os.makedirs(self.output_dir, exist_ok=True)
+                if not self.output_dir:
+                    raise ValueError("no output folder chosen")
+                os.makedirs(bpy.path.abspath(self.output_dir), exist_ok=True)
                 converted = 0
                 for slot in obj.material_slots:
                     mat = slot.material
@@ -1110,7 +1141,7 @@ class FO4_OT_PipelineFullMod(Operator):
 
     def invoke(self, context, event):
         blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ""
-        self.output_dir = os.path.join(blend_dir or "C:/", "ModOutput")
+        self.output_dir = os.path.join(blend_dir or _DOWNLOADS, "ModOutput")
         if not self.mod_name or self.mod_name == "MyFO4Mod":
             self.mod_name = os.path.splitext(
                 os.path.basename(bpy.data.filepath or "MyMod.blend")
@@ -1127,9 +1158,14 @@ class FO4_OT_PipelineFullMod(Operator):
     def execute(self, context):
         steps, warnings, errors = [], [], []
 
+        out_root = bpy.path.abspath(self.output_dir) if self.output_dir else ""
+        if not out_root or not os.path.isabs(out_root):
+            # A relative path here would land in whatever folder Blender was started from.
+            self.report({'ERROR'}, "Choose a Mod Output Directory first")
+            return {'CANCELLED'}
         try:
             from . import export_helpers, mod_packaging_helpers
-            mod_dir = os.path.join(self.output_dir, self.mod_name)
+            mod_dir = os.path.join(out_root, self.mod_name)
 
             # Create FO4 mod folder structure
             fo4_paths = {

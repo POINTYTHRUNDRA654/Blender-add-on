@@ -323,12 +323,42 @@ class FO4_OT_GenerateTextureFromDesc(bpy.types.Operator):
     bl_label   = "Generate + Apply Texture"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
     def execute(self, context):
+        # This used to only call fo4.generate_texture, so nothing was applied.
         try:
-            bpy.ops.fo4.generate_texture()
-        except AttributeError:
-            self.report({'ERROR'}, "fo4.generate_texture operator not available")
+            from . import fo4_texture_generator as _gen
+            from .texture_helpers import TextureHelpers
+        except Exception as e:
+            self.report({'ERROR'}, f"Texture generator not available: {e}")
             return {'CANCELLED'}
+        scene = context.scene
+        out_dir = bpy.path.abspath(getattr(scene, "fo4_tex_output", "") or "")
+        if not out_dir:
+            self.report({'ERROR'}, "Set an Output Folder first (or save the .blend so '//' has a folder)")
+            return {'CANCELLED'}
+        result = _gen.generate_texture_via_mossy(
+            getattr(scene, "fo4_tex_description", "rusted metal"), out_dir,
+            getattr(scene, "fo4_tex_name", "generated"), int(getattr(scene, "fo4_tex_resolution", 1024)))
+        if not result.get("success"):
+            self.report({'ERROR'}, result.get("message") or "Texture generation failed")
+            return {'CANCELLED'}
+        obj = context.active_object
+        applied, failed = [], []
+        for key, slot in (("diffuse", 'DIFFUSE'), ("normal", 'NORMAL'), ("specular", 'SPECULAR')):
+            path = result.get(key)
+            if not path:
+                continue
+            ok, msg = TextureHelpers.install_texture(obj, path, slot)
+            (applied if ok else failed).append(key if ok else f"{key}: {msg}")
+        if failed:
+            self.report({'WARNING'}, f"{result['message']}; applied {', '.join(applied) or 'nothing'}; failed {'; '.join(failed)}")
+        else:
+            self.report({'INFO'}, f"{result['message']}; applied {', '.join(applied)} to '{obj.name}'")
         return {"FINISHED"}
 
 

@@ -176,9 +176,17 @@ class FO4_OT_AlignMeshToSkeleton(bpy.types.Operator if bpy else object):
             self.report({'ERROR'}, "Select a mesh object first")
             return {'CANCELLED'}
 
+        # The add-on's own import names it FO4_Skeleton; a skeleton or body
+        # imported with PyNifly keeps its NIF name, so also accept any real FO4
+        # character rig (selected first, then anywhere in the scene).
         armature = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and 'FO4_Skeleton' in o.name), None)
         if not armature:
-            self.report({'ERROR'}, "FO4_Skeleton armature not found in scene. Import it first.")
+            def _is_rig(o):
+                return o.type == 'ARMATURE' and _bn.is_character_skeleton([b.name for b in o.data.bones])
+            armature = (next((o for o in context.selected_objects if _is_rig(o)), None)
+                        or next((o for o in context.scene.objects if _is_rig(o)), None))
+        if not armature:
+            self.report({'ERROR'}, "No FO4 skeleton in the scene. Import skeleton.nif (or a body NIF with its rig) first.")
             return {'CANCELLED'}
 
         msg = SkeletonAlignmentWizard.align_mesh_to_skeleton(obj, armature)

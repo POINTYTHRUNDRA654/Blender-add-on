@@ -3995,6 +3995,12 @@ class FO4_OT_SavePyNIFCreaturePreset(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         import json, pathlib
         preset = {
             "label": "pyNIF Export — Rigged Creature (Fallout 4)",
@@ -4402,6 +4408,12 @@ class FO4_OT_SavePyNIFRiggedPreset(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         import pathlib, shutil
         bundled = pathlib.Path(__file__).parent / "presets" / "pynif_fo4_rigged_preset.json"
         dst = pathlib.Path(self.filepath)
@@ -4615,6 +4627,12 @@ class FO4_OT_GenerateBGSMFile(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         import pathlib
         from . import bgsm_helpers
 
@@ -4679,6 +4697,12 @@ class FO4_OT_SaveBGSMTemplate(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         import pathlib, shutil
         fname = next((fn for k, _, fn in _BGSM_TEMPLATES if k == self.template), None)
         if fname is None:
@@ -4715,6 +4739,12 @@ class FO4_OT_SavePyNIFPreset(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
+
+        from .path_guard import output_path_ok
+
+        if not output_path_ok(self, self.filepath, "where to save"):
+
+            return {'CANCELLED'}
         import os, json, pathlib
 
         preset = {

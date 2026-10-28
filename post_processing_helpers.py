@@ -51,12 +51,110 @@ import os
 # Legacy:  inputs['Fac'], inputs[1]=A, inputs[2]=B, outputs['Image']
 # New:     inputs[0]=Factor, inputs[6]=A, inputs[7]=B, outputs[2]=Color
 
+def _compositor_tree(scene, create=False):
+    """The scene's compositor node tree on every supported Blender.
+
+    Blender 3.6-4.x: scene.node_tree (after scene.use_nodes = True).
+    Blender 5.x: scene.node_tree no longer exists; the compositor is a node
+    group assigned to scene.compositing_node_group. Every function here used
+    scene.node_tree, so on Blender 5 all post-processing buttons raised
+    AttributeError (found by running every operator, 2026-10-28).
+    """
+    if hasattr(scene, "node_tree"):
+        if create:
+            scene.use_nodes = True
+        return scene.node_tree if (scene.use_nodes or create) else None
+    tree = getattr(scene, "compositing_node_group", None)
+    if tree is None and create:
+        tree = bpy.data.node_groups.new("FO4 Compositing", "CompositorNodeTree")
+        scene.compositing_node_group = tree
+    return tree
+
+
+def _compositor_output(tree, name):
+    """Image output node: Composite (Blender <= 4.x) or Group Output with an
+    Image socket (Blender 5.x, where CompositorNodeComposite was removed)."""
+    try:
+        node = tree.nodes.new("CompositorNodeComposite")
+        node.name = name
+        return node, node.inputs["Image"]
+    except RuntimeError:
+        pass
+    if not any(getattr(s, "in_out", "") == "OUTPUT" and s.name == "Image"
+               for s in tree.interface.items_tree):
+        tree.interface.new_socket(name="Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    node = tree.nodes.new("NodeGroupOutput")
+    node.name = name
+    return node, node.inputs["Image"]
+
+
+def _glare_init(glare):
+    """Bloom-style glare. Blender 5 moved the node's settings into input
+    sockets (menus take display names); 3.6-4.x keep them as properties."""
+    if hasattr(glare, "glare_type"):
+        # 'BLOOM' was removed in Blender 4.0; FOG_GLOW is the closest equivalent
+        glare.glare_type = 'FOG_GLOW' if bpy.app.version >= (4, 0, 0) else 'BLOOM'
+        glare.quality = 'MEDIUM'
+    else:
+        glare.inputs['Type'].default_value = 'Bloom'
+        glare.inputs['Quality'].default_value = 'Medium'
+
+
+def _glare_set(glare, threshold, strength, radius):
+    """threshold: luminance cutoff; strength and radius: 0-1."""
+    if hasattr(glare, "threshold"):
+        glare.threshold = threshold
+        # 'mix' ranges -1 (input only) to 1 (glare only); strength 0-1 -> -1..0
+        glare.mix = max(-1.0, min(0.0, strength - 1.0))
+        # size 2-9 maps the 0-1 radius to Blender's integer scale
+        glare.size = max(2, min(9, round(2 + radius * 7)))
+    else:
+        glare.inputs['Threshold'].default_value = threshold
+        glare.inputs['Strength'].default_value = max(0.0, strength)
+        glare.inputs['Size'].default_value = max(0.0, min(1.0, radius))
+
+
+def _bright_contrast_set(bc, brightness, contrast):
+    """Inputs are 'Bright'/'Contrast' before Blender 5, 'Brightness'/'Contrast' after."""
+    bc.inputs['Bright' if 'Bright' in bc.inputs else 'Brightness'].default_value = brightness
+    bc.inputs['Contrast'].default_value = contrast
+
+
+def _ellipse_size(ellipse, w, h):
+    if hasattr(ellipse, "width"):
+        ellipse.width, ellipse.height = w, h
+    else:
+        ellipse.inputs['Size'].default_value = (w, h)
+
+
+def _gauss_blur(blur, scene, rel):
+    """Gaussian blur of `rel` x the frame size (relative before Blender 5,
+    pixels from the render resolution after, where relative size was removed)."""
+    if hasattr(blur, "filter_type"):
+        blur.filter_type = 'GAUSS'
+        blur.use_relative = True
+        blur.factor_x = rel
+        blur.factor_y = rel
+    else:
+        blur.inputs['Type'].default_value = 'Gaussian'
+        blur.inputs['Size'].default_value = (scene.render.resolution_x * rel, scene.render.resolution_y * rel)
+
+
 def _new_mix_rgb(nodes, name, blend_type='MIX'):
     """Create a colour-mix compositor node compatible with Blender 3.x–5.x."""
-    try:
-        n = nodes.new('CompositorNodeMixRGB')
-    except Exception:
-        n = nodes.new('CompositorNodeMix')
+    n = None
+    # Blender <= 4.x: CompositorNodeMixRGB (or CompositorNodeMix in some 4.x);
+    # Blender 5.x: both are gone and the compositor uses the shared ShaderNodeMix
+    # (same socket layout as CompositorNodeMix, which _mix_in/_mix_out expect).
+    for node_type in ('CompositorNodeMixRGB', 'CompositorNodeMix', 'ShaderNodeMix'):
+        try:
+            n = nodes.new(node_type)
+            break
+        except Exception:
+            continue
+    if n is None:
+        raise RuntimeError("No colour-mix node type available in this Blender version")
+    if hasattr(n, 'data_type'):
         n.data_type = 'RGBA'
     n.name = name
     n.blend_type = blend_type
@@ -386,8 +484,7 @@ class PostProcessingHelpers:
         preset = PostProcessingHelpers.get_preset(preset_id)
 
         try:
-            scene.use_nodes = True
-            tree = scene.node_tree
+            tree = _compositor_tree(scene, create=True)
             nodes = tree.nodes
             links = tree.links
 
@@ -402,15 +499,8 @@ class PostProcessingHelpers:
             # ── Glare (bloom / lens flare) ──────────────────────────────────
             glare = nodes.new('CompositorNodeGlare')
             glare.name = _TAG_GLARE
-            # 'BLOOM' was removed in Blender 4.0; FOG_GLOW is the closest equivalent
-            glare.glare_type = 'FOG_GLOW' if bpy.app.version >= (4, 0, 0) else 'BLOOM'
-            glare.quality = 'MEDIUM'
-            glare.threshold = preset["bloom_threshold"]
-            # 'mix' on the Glare node ranges -1 (input only) to 1 (glare only).
-            # We map bloom_strength 0-1 → mix -1 to 0 (i.e. blend in).
-            glare.mix = max(-1.0, min(0.0, preset["bloom_strength"] - 1.0))
-            # size 2–9 maps our 0-1 radius to Blender's integer scale
-            glare.size = max(2, min(9, round(2 + preset["bloom_radius"] * 7)))
+            _glare_init(glare)
+            _glare_set(glare, preset["bloom_threshold"], preset["bloom_strength"], preset["bloom_radius"])
             glare.location = (-550, 300)
             links.new(rl.outputs['Image'], glare.inputs['Image'])
 
@@ -425,8 +515,7 @@ class PostProcessingHelpers:
             # ── Brightness / Contrast ────────────────────────────────────────
             bc = nodes.new('CompositorNodeBrightContrast')
             bc.name = _TAG_BRIGHTNESS
-            bc.inputs['Bright'].default_value = preset["brightness"] * 100.0
-            bc.inputs['Contrast'].default_value = (preset["contrast"] - 1.0) * 100.0
+            _bright_contrast_set(bc, preset["brightness"] * 100.0, (preset["contrast"] - 1.0) * 100.0)
             bc.location = (-50, 300)
             links.new(huesat.outputs['Image'], bc.inputs['Image'])
 
@@ -449,16 +538,12 @@ class PostProcessingHelpers:
             # Use an Ellipse Mask to create a radial gradient, then multiply.
             ellipse = nodes.new('CompositorNodeEllipseMask')
             ellipse.name = _TAG_VIGNETTE
-            ellipse.width  = 0.9
-            ellipse.height = 0.9
+            _ellipse_size(ellipse, 0.9, 0.9)
             ellipse.location = (50, 0)
 
             blur_ell = nodes.new('CompositorNodeBlur')
             blur_ell.name = "FO4_PP_VigBlur"
-            blur_ell.filter_type = 'GAUSS'
-            blur_ell.use_relative = True
-            blur_ell.factor_x = 0.15
-            blur_ell.factor_y = 0.15
+            _gauss_blur(blur_ell, scene, 0.15)
             blur_ell.location = (250, 0)
             links.new(ellipse.outputs['Mask'], blur_ell.inputs['Image'])
 
@@ -490,10 +575,9 @@ class PostProcessingHelpers:
                 last_image_socket = defocus.outputs['Image']
 
             # ── Composite output ─────────────────────────────────────────────
-            composite = nodes.new('CompositorNodeComposite')
-            composite.name = _TAG_OUTPUT
+            composite, composite_in = _compositor_output(tree, _TAG_OUTPUT)
             composite.location = (900, 300)
-            links.new(last_image_socket, composite.inputs['Image'])
+            links.new(last_image_socket, composite_in)
 
             preset_label = PRESETS.get(preset_id, {}).get('label', preset_id)
             return True, f"FO4 post-processing compositor set up with preset '{preset_label}'"
@@ -507,9 +591,10 @@ class PostProcessingHelpers:
 
         User-created nodes are not touched.
         """
-        if not scene.use_nodes or not scene.node_tree:
+        tree = _compositor_tree(scene)
+        if not tree:
             return True, "Compositor has no nodes – nothing to remove"
-        PostProcessingHelpers._remove_fo4_nodes(scene.node_tree)
+        PostProcessingHelpers._remove_fo4_nodes(tree)
         return True, "FO4 post-processing nodes removed"
 
     @staticmethod
@@ -519,10 +604,10 @@ class PostProcessingHelpers:
         If the nodes haven't been created yet, :meth:`setup_compositor` is
         called first to build them.
         """
-        if not scene.use_nodes or not scene.node_tree:
+        tree = _compositor_tree(scene)
+        if not tree:
             return PostProcessingHelpers.setup_compositor(scene, preset_id)
 
-        tree = scene.node_tree
         fo4_nodes = {n.name for n in tree.nodes if n.name.startswith("FO4_PP_")}
         if not fo4_nodes:
             return PostProcessingHelpers.setup_compositor(scene, preset_id)
@@ -533,9 +618,7 @@ class PostProcessingHelpers:
         # Glare
         glare = nodes.get(_TAG_GLARE)
         if glare:
-            glare.threshold = preset["bloom_threshold"]
-            glare.mix = max(-1.0, min(0.0, preset["bloom_strength"] - 1.0))
-            glare.size = max(2, min(9, round(2 + preset["bloom_radius"] * 7)))
+            _glare_set(glare, preset["bloom_threshold"], preset["bloom_strength"], preset["bloom_radius"])
 
         # Hue/Sat
         huesat = nodes.get(_TAG_HUE_SAT)
@@ -545,8 +628,7 @@ class PostProcessingHelpers:
         # Brightness/Contrast
         bc = nodes.get(_TAG_BRIGHTNESS)
         if bc:
-            bc.inputs['Bright'].default_value = preset["brightness"] * 100.0
-            bc.inputs['Contrast'].default_value = (preset["contrast"] - 1.0) * 100.0
+            _bright_contrast_set(bc, preset["brightness"] * 100.0, (preset["contrast"] - 1.0) * 100.0)
 
         # Tint mix
         tint = nodes.get(_TAG_TINT_MIX)
@@ -670,10 +752,10 @@ class PostProcessingHelpers:
         Called automatically when any of the ``fo4_pp_*`` scene properties
         change so the compositor preview updates in real time.
         """
-        if not scene.use_nodes or not scene.node_tree:
+        tree = _compositor_tree(scene)
+        if not tree:
             return False, "Compositor not initialised – run 'Setup Compositor' first"
 
-        tree = scene.node_tree
         nodes = tree.nodes
 
         # Convenience wrapper: read scene prop with fallback
@@ -682,9 +764,8 @@ class PostProcessingHelpers:
 
         glare = nodes.get(_TAG_GLARE)
         if glare:
-            glare.threshold = prop("fo4_pp_bloom_threshold", 0.8)
-            glare.mix = max(-1.0, min(0.0, prop("fo4_pp_bloom_strength", 0.4) - 1.0))
-            glare.size = max(2, min(9, round(2 + prop("fo4_pp_bloom_radius", 0.3) * 7)))
+            _glare_set(glare, prop("fo4_pp_bloom_threshold", 0.8), prop("fo4_pp_bloom_strength", 0.4),
+                       prop("fo4_pp_bloom_radius", 0.3))
 
         huesat = nodes.get(_TAG_HUE_SAT)
         if huesat:
@@ -692,8 +773,7 @@ class PostProcessingHelpers:
 
         bc = nodes.get(_TAG_BRIGHTNESS)
         if bc:
-            bc.inputs['Bright'].default_value   = prop("fo4_pp_brightness", 0.0) * 100.0
-            bc.inputs['Contrast'].default_value = (prop("fo4_pp_contrast", 1.0) - 1.0) * 100.0
+            _bright_contrast_set(bc, prop("fo4_pp_brightness", 0.0) * 100.0, (prop("fo4_pp_contrast", 1.0) - 1.0) * 100.0)
 
         tint = nodes.get(_TAG_TINT_MIX)
         if tint:
