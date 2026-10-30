@@ -11,8 +11,8 @@ Full workflow (one operator: FO4_OT_ConvertUE5Asset)
    • Roughness is INVERTED to Smoothness (FO4 = 1 − UE5_Roughness)
 4. Apply all FO4 mesh prep (triangulate, merge doubles, apply transforms, UV)
 5. Auto-generate UCX_ convex collision
-6. Export as NIF via PyNifly → mod staging folder (Data/Meshes/…)
-7. Export matching BGSM material file (Data/Materials/…)
+6. Export as NIF via PyNifly → mod staging folder (Meshes/…)
+7. Export matching BGSM material file (Materials/…)
 8. Convert and save DDS textures (Data/Textures/…) if NVTT/texconv available
 
 Coordinate system differences
@@ -67,8 +67,8 @@ LOD meshes
 ----------
 UE5 typically exports LODs as separate objects named <mesh>_LOD0, _LOD1, etc.
 Each LOD is exported as its own NIF:
-  Data/Meshes/[subpath]/[name]_LOD0.nif
-  Data/Meshes/[subpath]/[name]_LOD1.nif
+  Meshes/[subpath]/[name]_LOD0.nif
+  Meshes/[subpath]/[name]_LOD1.nif
   …
 The main (highest-quality) mesh is exported without a LOD suffix.
 
@@ -494,7 +494,7 @@ class FO4_OT_ConvertUE5Asset(Operator):
         name="Mod Output Folder",
         description=(
             "Your mod's root staging folder (e.g. C:/MO2/mods/MyMod). "
-            "Exports go to [folder]/Data/Meshes/ and [folder]/Data/Materials/. "
+            "Exports go to [folder]/Meshes/ and [folder]/Materials/. "
             "Never writes directly into the game folder."
         ),
         default="",
@@ -503,9 +503,9 @@ class FO4_OT_ConvertUE5Asset(Operator):
     mesh_subpath: StringProperty(
         name="Mesh Sub-path",
         description=(
-            "Relative path under Data/Meshes/ for this asset "
-            "(e.g. 'MyMod/Props' → Data/Meshes/MyMod/Props/). "
-            "Leave blank to put NIFs directly in Data/Meshes/."
+            "Relative path under Meshes/ for this asset "
+            "(e.g. 'MyMod/Props' → Meshes/MyMod/Props/). "
+            "Leave blank to put NIFs directly in Meshes/."
         ),
         default="",
     )
@@ -540,7 +540,7 @@ class FO4_OT_ConvertUE5Asset(Operator):
     )
     export_bgsm: BoolProperty(
         name="Export BGSM",
-        description="Write matching .bgsm material file to Data/Materials/",
+        description="Write matching .bgsm material file to Materials/",
         default=True,
     )
     import_only: BoolProperty(
@@ -699,9 +699,9 @@ class FO4_OT_ConvertUE5Asset(Operator):
                     nif_name  = f"{safe_name}{lod_suffix}.nif"
 
                     if subpath:
-                        nif_rel = os.path.join("Data", "Meshes", subpath, nif_name)
+                        nif_rel = os.path.join("Meshes", subpath, nif_name)
                     else:
-                        nif_rel = os.path.join("Data", "Meshes", nif_name)
+                        nif_rel = os.path.join("Meshes", nif_name)
 
                     abs_nif = os.path.normpath(
                         os.path.join(self.mod_folder, nif_rel)
@@ -719,7 +719,7 @@ class FO4_OT_ConvertUE5Asset(Operator):
                     # ── BGSM export ────────────────────────────────────────────
                     if self.export_bgsm and ok:
                         self._export_bgsm(obj, abs_nif)
-                        obj_steps.append("BGSM exported to Data/Materials/")
+                        obj_steps.append("BGSM exported to Materials/")
 
                 except Exception as e:
                     obj_warnings.append(f"Export error for {obj.name}: {e}")
@@ -784,11 +784,15 @@ class FO4_OT_ConvertUE5Asset(Operator):
                 return False, "none", str(e2)
 
     def _export_bgsm(self, obj, nif_abs: str) -> None:
-        """Write BGSM to Data/Materials/ mirroring the Data/Meshes/ path."""
+        """Write BGSM to Materials/ mirroring the Meshes/ path."""
         try:
             from . import bgsm_helpers
             rel  = os.path.relpath(nif_abs, self.mod_folder).replace("\\", "/")
-            mrel = rel.replace("Data/Meshes/", "Data/Materials/", 1).replace(".nif", ".bgsm")
+            # MO2 mod folders hold Meshes/ and Materials/ directly (no Data/ segment;
+            # see _resolve_nif_path in fo4_ck_cell.py for the original bug report).
+            if rel.lower().startswith("meshes/"):
+                rel = "Materials/" + rel[len("meshes/"):]
+            mrel = rel.replace(".nif", ".bgsm")
             mabs = os.path.normpath(os.path.join(self.mod_folder, mrel))
             os.makedirs(os.path.dirname(mabs), exist_ok=True)
             for slot in obj.material_slots:
@@ -818,13 +822,13 @@ class FO4_OT_BatchConvertUE5Folder(Operator):
 
     Walks the selected folder, converts every .fbx file it finds using the
     same settings, and exports NIFs preserving the relative folder structure
-    inside your mod's Data/Meshes/ directory.
+    inside your mod's Meshes/ directory.
     """
     bl_idname  = "fo4.batch_convert_ue5_folder"
     bl_label   = "Batch Convert UE4/UE5 Folder → FO4 NIFs"
     bl_description = (
         "Convert every FBX in a folder from UE4 or UE5 format to FO4-ready NIFs. "
-        "Preserves relative folder structure inside Data/Meshes/."
+        "Preserves relative folder structure inside Meshes/."
     )
     bl_options = {'REGISTER'}
 
@@ -836,13 +840,13 @@ class FO4_OT_BatchConvertUE5Folder(Operator):
     )
     mod_folder: StringProperty(
         name="Mod Output Folder",
-        description="Your mod staging folder. Structure: [folder]/Data/Meshes/…",
+        description="Your mod staging folder. Structure: [folder]/Meshes/…",
         default="",
         subtype='DIR_PATH',
     )
     mesh_subpath: StringProperty(
         name="Mesh Sub-path",
-        description="Prefix under Data/Meshes/ (e.g. 'MyMod/Props')",
+        description="Prefix under Meshes/ (e.g. 'MyMod/Props')",
         default="",
     )
     ue5_scale: FloatProperty(

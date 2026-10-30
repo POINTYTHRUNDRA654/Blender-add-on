@@ -17,8 +17,8 @@ Full workflow (one operator: FO4_OT_ConvertUnityAsset)
      NO channel inversion needed (unlike UE4/UE5 which uses Roughness).
 4. Apply all FO4 mesh prep (triangulate, merge doubles, apply transforms, UV)
 5. Auto-generate UCX_ collision
-6. Export as NIF via PyNifly → mod staging folder (Data/Meshes/…)
-7. Export matching BGSM material file (Data/Materials/…)
+6. Export as NIF via PyNifly → mod staging folder (Meshes/…)
+7. Export matching BGSM material file (Materials/…)
 
 Coordinate system differences
 ------------------------------
@@ -567,7 +567,7 @@ class FO4_OT_ConvertUnityAsset(Operator):
         name="Mod Output Folder",
         description=(
             "Your mod's root staging folder (e.g. C:/MO2/mods/MyMod). "
-            "Exports go to [folder]/Data/Meshes/ and [folder]/Data/Materials/. "
+            "Exports go to [folder]/Meshes/ and [folder]/Materials/. "
             "Never writes directly into the game folder."
         ),
         default="",
@@ -575,7 +575,7 @@ class FO4_OT_ConvertUnityAsset(Operator):
     )
     mesh_subpath: StringProperty(
         name="Mesh Sub-path",
-        description="Relative path under Data/Meshes/ (e.g. 'MyMod/Props')",
+        description="Relative path under Meshes/ (e.g. 'MyMod/Props')",
         default="",
     )
     mat_type: EnumProperty(
@@ -610,7 +610,7 @@ class FO4_OT_ConvertUnityAsset(Operator):
     )
     export_bgsm: BoolProperty(
         name="Export BGSM",
-        description="Write matching .bgsm to Data/Materials/",
+        description="Write matching .bgsm to Materials/",
         default=True,
     )
     import_only: BoolProperty(
@@ -766,9 +766,9 @@ class FO4_OT_ConvertUnityAsset(Operator):
                     safe   = obj.name.replace(" ", "_")
                     sub    = self.mesh_subpath.strip("/\\")
                     nif_name = f"{safe}{lod_suffix}.nif"
-                    nif_rel  = os.path.join("Data", "Meshes",
+                    nif_rel  = os.path.join("Meshes",
                                             sub, nif_name) if sub else \
-                               os.path.join("Data", "Meshes", nif_name)
+                               os.path.join("Meshes", nif_name)
                     abs_nif  = os.path.normpath(
                         os.path.join(self.mod_folder, nif_rel)
                     )
@@ -781,7 +781,7 @@ class FO4_OT_ConvertUnityAsset(Operator):
                         exported_nifs.append(abs_nif)
                         if self.export_bgsm:
                             self._export_bgsm(obj, abs_nif)
-                            obj_steps.append("BGSM written to Data/Materials/")
+                            obj_steps.append("BGSM written to Materials/")
                     else:
                         obj_warns.append(f"NIF export failed: {msg}")
                 except Exception as e:
@@ -850,7 +850,11 @@ class FO4_OT_ConvertUnityAsset(Operator):
         try:
             from . import bgsm_helpers
             rel  = os.path.relpath(nif_abs, self.mod_folder).replace("\\", "/")
-            mrel = rel.replace("Data/Meshes/", "Data/Materials/", 1).replace(".nif", ".bgsm")
+            # MO2 mod folders hold Meshes/ and Materials/ directly (no Data/ segment;
+            # see _resolve_nif_path in fo4_ck_cell.py for the original bug report).
+            if rel.lower().startswith("meshes/"):
+                rel = "Materials/" + rel[len("meshes/"):]
+            mrel = rel.replace(".nif", ".bgsm")
             mabs = os.path.normpath(os.path.join(self.mod_folder, mrel))
             os.makedirs(os.path.dirname(mabs), exist_ok=True)
             for slot in obj.material_slots:
@@ -879,13 +883,13 @@ class FO4_OT_BatchConvertUnityFolder(Operator):
     Batch-convert a folder of Unity FBX files to FO4 NIFs.
 
     Walks the folder recursively, converts every .fbx, preserves sub-folder
-    structure inside Data/Meshes/.
+    structure inside Meshes/.
     """
     bl_idname  = "fo4.batch_convert_unity_folder"
     bl_label   = "Batch Convert Unity Folder → FO4 NIFs"
     bl_description = (
         "Convert every FBX in a folder from Unity format to FO4-ready NIFs. "
-        "Preserves sub-folder structure inside Data/Meshes/."
+        "Preserves sub-folder structure inside Meshes/."
     )
     bl_options = {'REGISTER'}
 
@@ -902,7 +906,7 @@ class FO4_OT_BatchConvertUnityFolder(Operator):
     )
     mesh_subpath: StringProperty(
         name="Mesh Sub-path",
-        description="Prefix under Data/Meshes/ (e.g. 'MyMod/Unity')",
+        description="Prefix under Meshes/ (e.g. 'MyMod/Unity')",
         default="",
     )
     unity_scale: FloatProperty(
