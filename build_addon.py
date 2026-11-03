@@ -67,6 +67,8 @@ EXCLUDE = {
     "install_addon.bat", "install_addon.ps1",
     # Standalone test files (no use inside Blender)
     "test_addon_integrity.py", "test_vanilla_compare.py",
+    # Separate world-layout tooling (Unity/Unreal/xEdit), not part of the add-on
+    "world_layout",
 }
 
 # Blender version variants
