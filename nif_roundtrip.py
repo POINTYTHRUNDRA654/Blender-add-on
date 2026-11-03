@@ -356,6 +356,53 @@ def _patch_havok_material(filepath, material_name: str) -> tuple:
     return 0, f"material patch found no hknpBSMaterialProperties block to patch"
 
 
+_HULL_MAX_VERTS = 128
+
+
+def _convex_hull_for_havok(collision_obj, sf):
+    """World-space convex hull of *collision_obj* in Havok units, as
+    (verts, triangle faces). Capped at _HULL_MAX_VERTS by decimating the
+    source first, so the shape stays in the size range vanilla uses."""
+    import bmesh
+    import bpy
+
+    def hull_of(mesh_data):
+        bm = bmesh.new()
+        bm.from_mesh(mesh_data)
+        bm.transform(collision_obj.matrix_world)
+        res = bmesh.ops.convex_hull(bm, input=bm.verts[:])
+        bmesh.ops.delete(bm, geom=res.get("geom_interior", []) + res.get("geom_unused", []), context='VERTS')
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        bm.verts.index_update()
+        out = ([tuple(v.co / sf) for v in bm.verts], [[v.index for v in f.verts] for f in bm.faces])
+        bm.free()
+        return out
+
+    verts, faces = hull_of(collision_obj.data)
+    if len(verts) <= _HULL_MAX_VERTS:
+        return verts, faces
+    tmp = collision_obj.copy()
+    tmp.data = collision_obj.data.copy()
+    bpy.context.scene.collection.objects.link(tmp)
+    try:
+        ratio = 1.0
+        for _ in range(6):
+            ratio = max(0.005, ratio * _HULL_MAX_VERTS / len(verts) * 0.9)
+            mod = tmp.modifiers.new("hull_cap", 'DECIMATE')
+            mod.ratio = ratio
+            mesh = tmp.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
+            verts, faces = hull_of(mesh)
+            tmp.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh_clear()
+            tmp.modifiers.remove(mod)
+            if len(verts) <= _HULL_MAX_VERTS:
+                break
+    finally:
+        me = tmp.data
+        bpy.data.objects.remove(tmp, do_unlink=True)
+        bpy.data.meshes.remove(me)
+    return verts, faces
+
+
 def patch_native_collision(exported_path, collision_obj) -> dict:
     """Attach a real FO4 native-physics Havok collision
     (bhkNPCollisionObject -> bhkPhysicsSystem) to a freshly exported NIF's
@@ -422,8 +469,23 @@ def patch_native_collision(exported_path, collision_obj) -> dict:
                 sphere_radius=radius, physics=physics,
             )
         else:
-            verts = [tuple(world_mat @ v.co / sf) for v in collision_obj.data.vertices]
-            faces = [list(p.vertices) for p in collision_obj.data.polygons]
+            if shape_type == 'compressed_mesh':
+                # PyNifly (v27 and v28 alike) writes hknpCompressedMeshShape
+                # with an empty search tree: 0 tree nodes and an empty
+                # triangle bitfield. All 167,285 vanilla compressed-mesh
+                # collisions have both filled, and Creation Kit crashes in
+                # the Havok loader on the empty ones (write to address 0x18
+                # in hknpPhysicsSystemData loading; GSFungusSpore11.nif,
+                # 2026-11-02). Write a real convex hull instead -- the shape
+                # most vanilla plants use (hknpConvexPolytopeShape).
+                verts, faces = _convex_hull_for_havok(collision_obj, sf)
+                shape_type = 'polytope'
+                report["restored"].append(
+                    "exact-mesh collision written as a convex hull "
+                    "(PyNifly cannot build the compressed-mesh tree CK needs)")
+            else:
+                verts = [tuple(world_mat @ v.co / sf) for v in collision_obj.data.vertices]
+                faces = [list(p.vertices) for p in collision_obj.data.polygons]
             radius = 0.0
             if rb and rb.use_margin:
                 radius = rb.collision_margin / sf

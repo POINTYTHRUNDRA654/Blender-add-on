@@ -10838,12 +10838,10 @@ class FO4_OT_GenerateCollisionMesh(Operator):
 
 
 class FO4_OT_AddCustomCollision(Operator):
-    """Duplicate the selected mesh exactly as-is and turn the copy into a
-    Havok mesh-shape collision object -- no convex hull, no decimation, no
-    convex decomposition. Any opening in the source mesh (a cave mouth, a
-    doorway, a tunnel) stays open in the collision too, since the collision
-    IS the source geometry, just triangulated. Use this whenever
-    'Generate Collision Mesh' would wrongly seal an opening shut."""
+    """Duplicate the selected mesh exactly as-is as the collision source.
+    On export it is written as a convex hull: PyNifly writes Havok mesh
+    shapes with an empty search tree, which crashes Creation Kit, so
+    openings (cave mouths, doorways) get sealed in the exported collision"""
     bl_idname = "fo4.add_custom_collision"
     bl_label = "Add Custom Collision (Exact Mesh)"
     bl_options = {'REGISTER', 'UNDO'}
@@ -10851,7 +10849,7 @@ class FO4_OT_AddCustomCollision(Operator):
     collision_type: EnumProperty(
         name="Collision Type",
         description="Only affects friction/restitution/sound preset -- the "
-                    "shape is always an exact mesh copy regardless of type",
+                    "shape is exported as a convex hull of the copy",
         items=_COLLISION_TYPES,
         default='BUILDING',
     )
