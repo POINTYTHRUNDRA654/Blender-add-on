@@ -1153,8 +1153,20 @@ class ExportHelpers:
         (single-piece / legacy / native-import cases) when there are none.
         """
         pieces = [c for c in obj.children if c.get("fo4_collision")]
+        # Hand-modelled pieces: UCX_<name> plus UCX_<name>_<anything>, as
+        # children or scene siblings (the usual way collision blocks around
+        # a doorway or cave mouth are authored).
+        prefix = f"UCX_{obj.name}".upper()
+        seen = {id(p) for p in pieces}
+        for scene in getattr(obj, 'users_scene', []):
+            for o in scene.objects:
+                n = o.name.upper()
+                if (o is not obj and o.type == 'MESH' and id(o) not in seen
+                        and (n == prefix or n.startswith(prefix + "_"))):
+                    pieces.append(o)
+                    seen.add(id(o))
         if pieces:
-            return pieces
+            return sorted(pieces, key=lambda o: o.name)
         single = ExportHelpers._find_collision_mesh(obj)
         return [single] if single is not None else []
 
@@ -1450,13 +1462,12 @@ class ExportHelpers:
                 if not success:
                     return False, f"Validation failed: {', '.join(issues)}"
 
-                # gather objects to export (main mesh + optional collision)
+                # gather objects to export. Collision pieces are NOT handed to
+                # PyNifly: its own attachment does not persist, and the pieces
+                # are attached after export by patch_native_collision_multi.
+                # Passing them in made hand-modelled UCX_ blocks (which lack
+                # PyNifly's collision markers) export as visible shapes.
                 selection = [obj]
-                # only include collision object(s) if the mesh is expected to have one --
-                # ALL pieces of a multi-convex collision, not just the first
-                ctype = getattr(obj, 'fo4_collision_type', 'DEFAULT')
-                if ctype not in ('NONE', 'GRASS', 'MUSHROOM'):
-                    selection.extend(ExportHelpers._find_collision_meshes(obj))
                 # include any weapon-mod/attachment connect points the user
                 # has built under this object -- PyNifly only finds these by
                 # scanning the export-time selection, so they'd be silently
@@ -1743,10 +1754,12 @@ class ExportHelpers:
                     # a leaf mesh shape rather than a NiNode -- see
                     # nif_roundtrip.patch_native_collision for the full story)
                     try:
-                        _coll_for_patch = ExportHelpers._find_collision_mesh(obj)
-                        if _coll_for_patch is not None:
+                        # Every collision piece, not just the first (multi-piece
+                        # collision used to export one piece and drop the rest).
+                        _colls_for_patch = ExportHelpers._find_collision_meshes(obj)
+                        if _colls_for_patch:
                             from . import nif_roundtrip as _nrt
-                            _coll_report = _nrt.patch_native_collision(filepath, _coll_for_patch)
+                            _coll_report = _nrt.patch_native_collision_multi(filepath, _colls_for_patch)
                             _coll_summary = _nrt.summarize(_coll_report)
                             if _coll_summary:
                                 _roundtrip_note += f"  [{_coll_summary}]"
@@ -2364,20 +2377,17 @@ class ExportHelpers:
                             # export_mesh_to_nif does (PyNifly's own
                             # export-side attachment doesn't persist when
                             # targeting a leaf shape -- see
-                            # nif_roundtrip.patch_native_collision). Only
-                            # handled when exactly one collision mesh is
-                            # involved -- patch_native_collision writes a
-                            # single root-level collision block, so a scene
-                            # combining multiple independently-collided
-                            # meshes isn't supported here.
+                            # nif_roundtrip.patch_native_collision). Every
+                            # collision piece of every combined mesh becomes
+                            # one convex body (patch_native_collision_multi).
                             _colls = {
                                 id(c): c for m in meshes
-                                if (c := ExportHelpers._find_collision_mesh(m)) is not None
+                                for c in ExportHelpers._find_collision_meshes(m)
                             }
-                            if len(_colls) == 1:
+                            if _colls:
                                 from . import nif_roundtrip as _nrt
-                                _coll_report = _nrt.patch_native_collision(
-                                    filepath, next(iter(_colls.values())))
+                                _coll_report = _nrt.patch_native_collision_multi(
+                                    filepath, list(_colls.values()))
                                 _coll_summary = _nrt.summarize(_coll_report)
                                 if _coll_summary:
                                     _coll_note = f"  [{_coll_summary}]"

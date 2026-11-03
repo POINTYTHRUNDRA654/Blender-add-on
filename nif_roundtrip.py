@@ -403,6 +403,138 @@ def _convex_hull_for_havok(collision_obj, sf):
     return verts, faces
 
 
+def _block_layout(data: bytes):
+    """(types per block, data offset per block, size per block) of a FO4 NIF."""
+    o = data.index(b'\n') + 1
+    _ver, _endian, _user, nblocks = struct.unpack_from('<IBII', data, o)
+    o += 13
+    bsver = struct.unpack_from('<I', data, o)[0]
+    o += 4
+    for _ in range(4 if bsver >= 103 else 3):
+        o += 1 + data[o]
+    ntypes = struct.unpack_from('<H', data, o)[0]
+    o += 2
+    names = []
+    for _ in range(ntypes):
+        n = struct.unpack_from('<I', data, o)[0]
+        names.append(data[o + 4:o + 4 + n].decode('latin1'))
+        o += 4 + n
+    type_idx = struct.unpack_from(f'<{nblocks}H', data, o)
+    o += 2 * nblocks
+    sizes = struct.unpack_from(f'<{nblocks}I', data, o)
+    o += 4 * nblocks
+    nstrings = struct.unpack_from('<I', data, o)[0]
+    o += 8
+    for _ in range(nstrings):
+        o += 4 + struct.unpack_from('<I', data, o)[0]
+    o += 4 + 4 * struct.unpack_from('<I', data, o)[0]
+    offsets = []
+    for s in sizes:
+        offsets.append(o)
+        o += s
+    return [names[i] for i in type_idx], offsets, list(sizes)
+
+
+def patch_native_collision_multi(exported_path, collision_objs) -> dict:
+    """Attach several convex collision pieces the way vanilla multi-piece
+    collision is built (e.g. HouseKGrndAddonDeckKPostCol02.nif,
+    DoorGarageDeco01.nif): ONE bhkPhysicsSystem holding one body per piece,
+    and one bhkNPCollisionObject per body -- body 0 on the root node, body i
+    on its own child NiNode -- each pointing at that shared system with its
+    body_id. In every vanilla mesh the number of bodies equals the number of
+    collision objects; a single collision object over an N-body system never
+    occurs. This is how openings (doorways, cave mouths) stay open: each
+    piece is convex, the gaps between pieces are not filled.
+
+    PyNifly can pack the N-body system (pack_multi_polytope) and add
+    collision objects, but cannot point a new collision object at an
+    existing physics block, so those two fields are set by a binary patch.
+    """
+    objs = [o for o in (collision_objs or []) if o is not None and o.type == 'MESH']
+    if len(objs) <= 1:
+        return patch_native_collision(exported_path, objs[0] if objs else None)
+    report = {"restored": [], "could_not_restore": []}
+    if _pynifly is None:
+        return report
+    try:
+        from io_scene_nifly.pyn.nifconstants import HAVOC_SCALE_FACTOR, game_collision_sf
+        from io_scene_nifly.pyn.nifdefs import PynBufferTypes, TransformBuf
+        from io_scene_nifly.pyn.bhk_autounpack import CollisionShape, PhysicsProps
+    except Exception as exc:
+        report["could_not_restore"].append(f"Havok collision (PyNifly internals unavailable: {exc})")
+        return report
+
+    try:
+        exp = _load(exported_path)
+        if exp.root.collision_object is not None:
+            return report  # already has one -- don't clobber
+        sf = HAVOC_SCALE_FACTOR * game_collision_sf.get(exp.game, 1.0)
+        first = objs[0]
+        rb = first.rigid_body
+        physics = PhysicsProps(
+            is_dynamic=False,
+            friction=rb.friction if rb else 0.5,
+            restitution=rb.restitution if rb else 0.4,
+            linear_damping=rb.linear_damping if rb else 0.1,
+            angular_damping=rb.angular_damping if rb else 0.05,
+            gravity_factor=first.get('pynPhysGravityFactor', 1.0),
+            max_linear_velocity=first.get('pynPhysMaxLinVel', 104.4),
+            max_angular_velocity=first.get('pynPhysMaxAngVel', 31.57),
+        )
+        shapes = []
+        for o in objs:
+            verts, faces = _convex_hull_for_havok(o, sf)
+            if len(verts) < 4:
+                report["could_not_restore"].append(f"collision piece '{o.name}' (flat or empty, skipped)")
+                continue
+            shapes.append(CollisionShape(
+                shape_type='polytope', name=o.name, transform=None, verts=verts,
+                faces=faces, convex_radius=0.0, children=[], physics=physics))
+        if len(shapes) <= 1:
+            return patch_native_collision(exported_path, objs[0]) if shapes else report
+
+        # flags 128: the value on all 1,401 vanilla landscape bhkNPCollisionObjects
+        kwargs = {"flags": 128, "collision_type": PynBufferTypes.bhkNPCollisionObjectBufType}
+        import inspect
+        try:
+            has_body_id = "body_id" in inspect.signature(exp.root.add_collision).parameters
+        except (TypeError, ValueError):
+            has_body_id = False
+        root_coll = exp.root.add_collision(None, **(dict(kwargs, body_id=0) if has_body_id else kwargs))
+        _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes, parent=root_coll)
+        node_names = []
+        for i in range(1, len(shapes)):
+            xf = TransformBuf()
+            xf.set_identity()
+            name = f"{exp.root.name}_Collision{i:02d}"
+            node = exp.add_node(name, xf, parent=exp.root)
+            node.add_collision(None, **(dict(kwargs, body_id=i) if has_body_id else kwargs))
+            node_names.append(name)
+        exp.save()
+
+        # Point every extra collision object at the shared physics system and
+        # give it its body number, in creation order (body 1, 2, ...).
+        with open(exported_path, "rb") as fh:
+            data = bytearray(fh.read())
+        types, offsets, _sizes = _block_layout(bytes(data))
+        phys = [i for i, t in enumerate(types) if t == 'bhkPhysicsSystem']
+        colls = [i for i, t in enumerate(types) if t == 'bhkNPCollisionObject']
+        if len(phys) != 1 or len(colls) != len(shapes):
+            report["could_not_restore"].append(
+                f"multi-piece collision layout ({len(phys)} physics blocks, {len(colls)} collision objects for {len(shapes)} pieces)")
+            return report
+        for body, ci in enumerate(colls):
+            off = offsets[ci]
+            struct.pack_into('<i', data, off + 6, phys[0])   # data ref (after target i32 + flags u16)
+            struct.pack_into('<I', data, off + 10, body)     # body_id
+        with open(exported_path, "wb") as fh:
+            fh.write(data)
+        report["restored"].append(f"Havok collision ({len(shapes)} convex pieces, vanilla multi-body layout)")
+    except Exception as exc:
+        report["could_not_restore"].append(f"Havok multi-piece collision ({exc})")
+    return report
+
+
 def patch_native_collision(exported_path, collision_obj) -> dict:
     """Attach a real FO4 native-physics Havok collision
     (bhkNPCollisionObject -> bhkPhysicsSystem) to a freshly exported NIF's
@@ -509,7 +641,8 @@ def patch_native_collision(exported_path, collision_obj) -> dict:
         # check so this keeps working whether the installed PyNifly is the
         # older (no body_id) or newer (requires it) build.
         import inspect
-        add_collision_kwargs = {"flags": 0, "collision_type": PynBufferTypes.bhkNPCollisionObjectBufType}
+        # flags 128: the value on all 1,401 vanilla landscape bhkNPCollisionObjects
+        add_collision_kwargs = {"flags": 128, "collision_type": PynBufferTypes.bhkNPCollisionObjectBufType}
         try:
             if "body_id" in inspect.signature(exp.root.add_collision).parameters:
                 add_collision_kwargs["body_id"] = 0
