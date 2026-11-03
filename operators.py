@@ -4000,6 +4000,233 @@ class FO4_OT_SmartWindSetup(Operator):
 
 
 # ── Vegetation Leaf-Card Setup ───────────────────────────────────────────────
+#
+# A mesh loaded from a NIF already has its textures (PyNifly's Diffuse_Texture /
+# Normal_Texture / Specular_Texture nodes) and its .bgsm (BSLSP_Shader_Name).
+# Set Up as Leaf Card used to swap all of that for a new diffuse-only material,
+# so the normal/specular maps and the .bgsm link were lost.  The helpers below
+# add the leaf-card settings (alpha cutout + two-sided) to what is already there.
+
+# Byte offsets in a FO4 (version 2) .bgsm -- see bgsm_helpers._unpack_common.
+_BGSM_ALPHA_REF_OFS = 41    # u8 alpha test reference, 0-255
+_BGSM_ALPHA_TEST_OFS = 42   # u8 alpha test on/off
+_BGSM_TWO_SIDED_OFS = 48    # u8 two-sided on/off
+
+
+def _leaf_diffuse_node(mat):
+    """The image node that holds *mat*'s diffuse texture, or None."""
+    nodes = mat.node_tree.nodes
+    for name in ("Diffuse_Texture", "Diffuse"):
+        n = nodes.get(name)
+        if n is not None and n.type == 'TEX_IMAGE':
+            return n
+    for n in nodes:
+        if n.type == 'BSDF_PRINCIPLED' and n.inputs['Base Color'].is_linked:
+            src = n.inputs['Base Color'].links[0].from_node
+            if src.type == 'TEX_IMAGE':
+                return src
+    return None
+
+
+def _pynifly_node_group(name):
+    """Load one of PyNifly's own shader node groups (e.g. AlphaProperty)."""
+    group = bpy.data.node_groups.get(name)
+    if group is not None:
+        return group
+    try:
+        from io_scene_nifly import blender_defs as _bd
+        path = _os.path.join(_bd.asset_path, "shaders.blend")
+        with bpy.data.libraries.load(path) as (src, dst):
+            if name in src.node_groups:
+                dst.node_groups = [name]
+    except Exception:
+        return None
+    return bpy.data.node_groups.get(name)
+
+
+def _leaf_card_keep_material(mat, threshold, texture_path):
+    """Add alpha cutout + two-sided to *mat* without removing anything.
+
+    Returns short notes for the report.
+    """
+    notes = []
+    mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    diffuse = _leaf_diffuse_node(mat)
+
+    if diffuse is not None and diffuse.image is not None:
+        notes.append(f"kept texture {_os.path.basename(diffuse.image.filepath or diffuse.image.name)}")
+    elif texture_path and _os.path.exists(texture_path):
+        mts = next((n for n in nodes if n.type == 'GROUP' and 'Diffuse' in n.inputs), None)
+        if diffuse is None:
+            diffuse = nodes.new('ShaderNodeTexImage')
+            diffuse.name = diffuse.label = "Diffuse_Texture" if mts else "Diffuse"
+        try:
+            diffuse.image = bpy.data.images.load(texture_path)
+            notes.append(f"texture {_os.path.basename(texture_path)} added")
+        except Exception as exc:
+            notes.append(f"texture load failed ({exc})")
+        if diffuse.image is not None:
+            if mts is not None and not mts.inputs['Diffuse'].is_linked:
+                links.new(diffuse.outputs['Color'], mts.inputs['Diffuse'])
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if bsdf is not None and not bsdf.inputs['Base Color'].is_linked:
+                links.new(diffuse.outputs['Color'], bsdf.inputs['Base Color'])
+    else:
+        notes.append("no diffuse texture yet -- assign one in Material Properties")
+
+    # PyNifly loads a texture with no alpha in use as alpha_mode NONE, which
+    # makes the node's Alpha output a flat 1.0 -- nothing would ever be cut out.
+    if diffuse is not None and diffuse.image is not None and diffuse.image.alpha_mode == 'NONE':
+        diffuse.image.alpha_mode = 'STRAIGHT'
+
+    prev_threshold = mat.alpha_threshold
+    mat.blend_method = 'CLIP'
+    try:
+        mat.shadow_method = 'CLIP'  # removed in Blender 4.2+ (EEVEE Next)
+    except AttributeError:
+        pass
+    mat.alpha_threshold = threshold
+    mat.use_backface_culling = False
+
+    ref = int(round(threshold * 255))
+    mts = next((n for n in nodes if n.type == 'GROUP' and 'Alpha Property' in n.inputs), None)
+    if mts is not None:
+        # PyNifly material: the NIF's NiAlphaProperty is written from the
+        # Alpha Property node on export (shader_io._export_alpha).
+        inp = mts.inputs['Alpha Property']
+        if inp.is_linked:
+            alpha = inp.links[0].from_node
+        else:
+            group = _pynifly_node_group("AlphaProperty")
+            alpha = None
+            if group is not None:
+                alpha = nodes.new('ShaderNodeGroup')
+                alpha.node_tree = group
+                alpha.name, alpha.label = "AlphaProperty", "Alpha Property"
+                alpha.location = (mts.location.x - 300, mts.location.y - 300)
+                links.new(alpha.outputs[0], inp)
+                alpha.inputs['Alpha Blend'].default_value = False
+                # Vanilla foliage NiAlphaProperty (flags 4844): SRC_ALPHA / INV_SRC_ALPHA
+                alpha.inputs['Source Blend Mode'].default_value = 6
+                alpha.inputs['Destination Blend Mode'].default_value = 7
+                mat['NiAlphaProperty_threshold'] = ref
+            else:
+                notes.append("PyNifly's Alpha Property node not found -- NIF cutout not set")
+        if alpha is not None and 'Alpha Test' in alpha.inputs:
+            if diffuse is not None and not alpha.inputs['Alpha'].is_linked:
+                links.new(diffuse.outputs['Alpha'], alpha.inputs['Alpha'])
+            if alpha.inputs['Alpha Test'].default_value:
+                keep = int(alpha.inputs['Alpha Threshold'].default_value)
+                mat.alpha_threshold = keep / 255.0
+                notes.append(f"kept its alpha cutout (threshold {keep})")
+            else:
+                alpha.inputs['Alpha Test'].default_value = True
+                alpha.inputs['Alpha Threshold'].default_value = ref
+                notes.append(f"alpha cutout on (threshold {ref})")
+    else:
+        bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        # Every material reads back as 'HASHED' on Blender 4.2+, so an existing
+        # cutout shows as the BSDF's Alpha already being wired.
+        had_cutout = bsdf is not None and bsdf.inputs['Alpha'].is_linked
+        if had_cutout:
+            mat.alpha_threshold = prev_threshold
+            notes.append(f"kept its alpha cutout (threshold {int(round(prev_threshold * 255))})")
+        else:
+            notes.append(f"alpha cutout on (threshold {ref})")
+        if bsdf is not None and diffuse is not None and diffuse.image is not None \
+                and not bsdf.inputs['Alpha'].is_linked:
+            links.new(diffuse.outputs['Alpha'], bsdf.inputs['Alpha'])
+
+    # PyNifly writes the NIF shader flags from this text property.
+    flags2 = mat.get("Shader_Flags_2")
+    if isinstance(flags2, str) and "DOUBLE_SIDED" not in flags2:
+        mat["Shader_Flags_2"] = f"{flags2} | DOUBLE_SIDED" if flags2.strip() else "DOUBLE_SIDED"
+    notes.append("two-sided")
+    return notes
+
+
+def _leaf_card_material_file(mat):
+    """Full path of the .bgsm *mat* points at, or '' when it can't be found.
+
+    The NIF stores it relative to Materials\\; the mod folder is taken from the
+    material's own texture paths (…\\<mod>\\Textures\\…), then the game Data folder.
+    """
+    stored = mat.get("fo4_bgsm_path") or ""
+    if stored and _os.path.isfile(bpy.path.abspath(stored)):
+        return bpy.path.abspath(stored)
+    rel = str(mat.get("BSLSP_Shader_Name") or "")
+    if not rel.lower().endswith(".bgsm"):
+        return ""
+    parts = [p for p in rel.replace("/", "\\").split("\\") if p]
+    if parts and parts[0].lower() == "materials":
+        parts = parts[1:]
+    roots = []
+    for n in mat.node_tree.nodes:
+        if n.type == 'TEX_IMAGE' and n.image is not None and n.image.filepath:
+            segs = _os.path.normpath(bpy.path.abspath(n.image.filepath)).split(_os.sep)
+            low = [s.lower() for s in segs]
+            if "textures" in low:
+                i = len(low) - 1 - low[::-1].index("textures")
+                roots.append(_os.sep.join(segs[:i]))
+    try:
+        from . import bgsm_helpers as _bh
+        if _bh._game_data_root():
+            roots.append(_bh._game_data_root())
+    except Exception:
+        pass
+    for root in roots:
+        cand = _os.path.join(root, "Materials", *parts)
+        if _os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def _add_leaf_flags_to_bgsm(path, ref):
+    """Switch on alpha test and two-sided in an existing .bgsm, in place.
+
+    Only those bytes change (alpha test reference too, when alpha test was
+    off); every other field is checked unchanged before writing.  The first
+    original is kept as <name>.bgsm.bak.  Game files are never edited.
+    """
+    import shutil as _shutil
+    from . import bgsm_helpers as _bh
+    name = _os.path.basename(path)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        before = _bh.read_bgsm(raw)
+    except Exception as exc:
+        return f"{name}: not a readable FO4 .bgsm ({exc}), left unchanged"
+    missing = [label for label, on in (("alpha test", before.alpha_test),
+                                       ("two-sided", before.two_sided)) if not on]
+    if not missing:
+        return f"{name} already has alpha test + two-sided"
+    gdata = _bh._game_data_root()
+    if gdata and _os.path.normcase(_os.path.abspath(path)).startswith(
+            _os.path.normcase(_os.path.abspath(gdata)) + _os.sep):
+        return f"{name} is a game file, not edited (it has no {' / '.join(missing)})"
+
+    buf = bytearray(raw)
+    if not before.alpha_test:
+        buf[_BGSM_ALPHA_TEST_OFS] = 1
+        buf[_BGSM_ALPHA_REF_OFS] = ref
+    if not before.two_sided:
+        buf[_BGSM_TWO_SIDED_OFS] = 1
+    after = _bh.read_bgsm(bytes(buf))
+    changed = {k for k in before.__dict__ if before.__dict__[k] != after.__dict__[k]}
+    if not after.alpha_test or not after.two_sided or \
+            not changed <= {"alpha_test", "alpha_test_ref", "two_sided"}:
+        return f"{name}: unexpected layout, left unchanged"
+    try:
+        if not _os.path.exists(path + ".bak"):
+            _shutil.copy2(path, path + ".bak")
+        with open(path, "wb") as fh:
+            fh.write(bytes(buf))
+    except OSError as exc:
+        return f"{name}: could not write ({exc})"
+    return f"added {' + '.join(missing)} to {name} (original kept as {name}.bak)"
+
 
 class FO4_OT_SetupLeafCard(Operator):
     """Set up the selected mesh as an FO4 alpha-cutout leaf card.
@@ -4008,9 +4235,13 @@ class FO4_OT_SetupLeafCard(Operator):
     vine leaves).  The 3D stem/trunk/root is a separate mesh that goes through
     normal export.  This operator:
       1. Decimates to a leaf-budget poly count  (default 3 000 tris)
-      2. Creates a two-sided alpha-clip FO4 material
-      3. Optionally loads the source leaf texture
-      4. Applies vegetation wind weights (Z-axis gradient, root→tip)
+      2. Makes the material two-sided alpha-clip.  A mesh that already has
+         materials keeps them, with all their textures and their .bgsm; alpha
+         test + two-sided are added to the existing .bgsm file.  Only a mesh
+         with no material gets a new one.
+      3. Optionally loads the source leaf texture (only where none is set)
+      4. Applies vegetation wind weights (Z-axis gradient, root→tip), except
+         on a mesh loaded from a NIF that already has its vertex colours
       5. Tags the object as VEGETATION so the pipeline classifies it correctly
     """
     bl_idname  = "fo4.setup_leaf_card"
@@ -4056,9 +4287,17 @@ class FO4_OT_SetupLeafCard(Operator):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Leaf / Foliage Texture:")
-        layout.prop(self, "texture_path", text="")
-        layout.prop(self, "alpha_threshold")
+        obj = context.active_object
+        if obj and obj.type == 'MESH' and any(m for m in obj.data.materials):
+            layout.label(text="Keeps the mesh's textures and .bgsm, adds cutout + two-sided",
+                         icon='INFO')
+            layout.label(text="Leaf Texture (only used where none is set):")
+            layout.prop(self, "texture_path", text="")
+            layout.prop(self, "alpha_threshold", text="Threshold (parts with no cutout yet)")
+        else:
+            layout.label(text="Leaf / Foliage Texture:")
+            layout.prop(self, "texture_path", text="")
+            layout.prop(self, "alpha_threshold")
         layout.separator()
         row = layout.row(align=True)
         row.prop(self, "apply_decimate")
@@ -4102,6 +4341,54 @@ class FO4_OT_SetupLeafCard(Operator):
             steps.append("UV map created (Smart UV Project)")
 
         # ── 3. Alpha-clip material ────────────────────────────────────────────
+        existing = []
+        for _m in obj.data.materials:
+            if _m is not None and _m not in existing:
+                existing.append(_m)
+        if existing:
+            ref = int(round(self.alpha_threshold * 255))
+            for mat in existing:
+                notes = _leaf_card_keep_material(mat, self.alpha_threshold, self.texture_path)
+                steps.append(f"{mat.name}: " + ", ".join(notes))
+                bgsm = _leaf_card_material_file(mat)
+                if bgsm:
+                    steps.append(_add_leaf_flags_to_bgsm(bgsm, ref))
+                elif str(mat.get("BSLSP_Shader_Name") or "").lower().endswith(".bgsm"):
+                    steps.append(f"{_os.path.basename(mat['BSLSP_Shader_Name'])} not found on disk, "
+                                 "so it was not checked")
+        else:
+            self._new_leaf_material(obj, steps)
+
+        # ── 4. Wind weights ────────────────────────────────────────────────────
+        # A mesh loaded from a NIF with vertex colours already carries its wind
+        # (vertex colour alpha); a new Wind group would replace it on export.
+        from_nif = any(m.get("BSLSP_Shader_Name") for m in existing)
+        if from_nif and obj.data.color_attributes:
+            steps.append("Wind: kept the mesh's own vertex colours")
+        else:
+            try:
+                from . import animation_helpers as _ah
+                ok, msg = _ah.AnimationHelpers.generate_wind_weights(
+                    obj, group_name="Wind", axis=self.wind_axis, invert=False
+                )
+                steps.append("Wind weights: " + ("applied ✓" if ok else msg))
+            except Exception as exc:
+                steps.append(f"Wind weights skipped ({exc})")
+
+        # ── 5. Tag as vegetation ───────────────────────────────────────────────
+        # fo4_mesh_type is a real RNA EnumProperty -- must use attribute
+        # assignment, not bracket/custom-property assignment (which silently
+        # creates a separate, unrelated custom property the export pipeline
+        # never reads).
+        obj.fo4_mesh_type = "VEGETATION"
+        obj["fo4_leaf_card"] = True
+
+        summary = " | ".join(steps)
+        self.report({'INFO'}, f"Leaf card ready: {summary}")
+        return {'FINISHED'}
+
+    def _new_leaf_material(self, obj, steps):
+        """New two-sided alpha-clip material for a mesh that has none."""
         mat_name = f"{obj.name}_LeafCard"
         mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(mat_name)
         mat.use_nodes = True
@@ -4145,33 +4432,8 @@ class FO4_OT_SetupLeafCard(Operator):
             links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
         links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
 
-        if obj.data.materials:
-            obj.data.materials[0] = mat
-        else:
-            obj.data.materials.append(mat)
+        obj.data.materials.append(mat)
         steps.append("Alpha-clip leaf material set up")
-
-        # ── 4. Wind weights ────────────────────────────────────────────────────
-        try:
-            from . import animation_helpers as _ah
-            ok, msg = _ah.AnimationHelpers.generate_wind_weights(
-                obj, group_name="Wind", axis=self.wind_axis, invert=False
-            )
-            steps.append("Wind weights: " + ("applied ✓" if ok else msg))
-        except Exception as exc:
-            steps.append(f"Wind weights skipped ({exc})")
-
-        # ── 5. Tag as vegetation ───────────────────────────────────────────────
-        # fo4_mesh_type is a real RNA EnumProperty -- must use attribute
-        # assignment, not bracket/custom-property assignment (which silently
-        # creates a separate, unrelated custom property the export pipeline
-        # never reads).
-        obj.fo4_mesh_type = "VEGETATION"
-        obj["fo4_leaf_card"] = True
-
-        summary = " | ".join(steps)
-        self.report({'INFO'}, f"Leaf card ready: {summary}")
-        return {'FINISHED'}
 
 
 # RigNet Auto-Rigging Operators
