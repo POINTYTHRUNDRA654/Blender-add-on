@@ -436,19 +436,24 @@ def _block_layout(data: bytes):
 
 
 def patch_native_collision_multi(exported_path, collision_objs) -> dict:
-    """Attach several convex collision pieces the way vanilla multi-piece
-    collision is built (e.g. HouseKGrndAddonDeckKPostCol02.nif,
-    DoorGarageDeco01.nif): ONE bhkPhysicsSystem holding one body per piece,
-    and one bhkNPCollisionObject per body -- body 0 on the root node, body i
-    on its own child NiNode -- each pointing at that shared system with its
-    body_id. In every vanilla mesh the number of bodies equals the number of
-    collision objects; a single collision object over an N-body system never
-    occurs. This is how openings (doorways, cave mouths) stay open: each
-    piece is convex, the gaps between pieces are not filled.
+    """Attach several convex collision pieces, each as its own one-body
+    bhkPhysicsSystem on its own bhkNPCollisionObject (piece 0 on the root
+    node, piece i on a child NiNode). This is how openings (doorways, cave
+    mouths) stay open: each piece is convex, the gaps between pieces are not
+    filled.
 
-    PyNifly can pack the N-body system (pack_multi_polytope) and add
-    collision objects, but cannot point a new collision object at an
-    existing physics block, so those two fields are set by a binary patch.
+    One system per piece is the layout vanilla precombined meshes use (up to
+    590 one-body systems in one NIF, body_id 0, flags 128 each). A single
+    shared N-body system (the HouseKGrndAddonDeckKPostCol02 layout) is NOT
+    used: PyNifly's N-body writer (pack_multi_polytope) writes the
+    referencedObjects array 16 bytes apart where Havok reads 8, and CK
+    asserts "Instance should have already been created"
+    (bhknpcollisionobject.cpp line 611) and crashes when such a mesh is
+    placed -- seen 2026-11-02 on a 320-piece building. The one-body writer
+    is the one CK already loaded on a plant.
+
+    PyNifly writes body_id 0xFFFFFFFF on these collision objects; the binary
+    patch below sets body_id 0 and checks each points at its own system.
     """
     objs = [o for o in (collision_objs or []) if o is not None and o.type == 'MESH']
     if len(objs) <= 1:
@@ -500,36 +505,46 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
             has_body_id = "body_id" in inspect.signature(exp.root.add_collision).parameters
         except (TypeError, ValueError):
             has_body_id = False
-        root_coll = exp.root.add_collision(None, **(dict(kwargs, body_id=0) if has_body_id else kwargs))
-        _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes, parent=root_coll)
-        node_names = []
+        coll_kwargs = dict(kwargs, body_id=0) if has_body_id else kwargs
+        root_coll = exp.root.add_collision(None, **coll_kwargs)
+        _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes[:1], parent=root_coll)
         for i in range(1, len(shapes)):
             xf = TransformBuf()
             xf.set_identity()
-            name = f"{exp.root.name}_Collision{i:02d}"
-            node = exp.add_node(name, xf, parent=exp.root)
-            node.add_collision(None, **(dict(kwargs, body_id=i) if has_body_id else kwargs))
-            node_names.append(name)
+            node = exp.add_node(f"{exp.root.name}_Collision{i:02d}", xf, parent=exp.root)
+            coll = node.add_collision(None, **coll_kwargs)
+            _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes[i:i + 1], parent=coll)
         exp.save()
 
-        # Point every extra collision object at the shared physics system and
-        # give it its body number, in creation order (body 1, 2, ...).
+        # Each collision object must point at its own one-body system with
+        # body_id 0. PyNifly writes the system right after its collision
+        # object (as vanilla does); fall back to that if the ref is not set.
         with open(exported_path, "rb") as fh:
             data = bytearray(fh.read())
         types, offsets, _sizes = _block_layout(bytes(data))
-        phys = [i for i, t in enumerate(types) if t == 'bhkPhysicsSystem']
         colls = [i for i, t in enumerate(types) if t == 'bhkNPCollisionObject']
-        if len(phys) != 1 or len(colls) != len(shapes):
+        phys = [i for i, t in enumerate(types) if t == 'bhkPhysicsSystem']
+        if len(phys) != len(shapes) or len(colls) != len(shapes):
             report["could_not_restore"].append(
                 f"multi-piece collision layout ({len(phys)} physics blocks, {len(colls)} collision objects for {len(shapes)} pieces)")
             return report
-        for body, ci in enumerate(colls):
+        used = set()
+        for ci in colls:
             off = offsets[ci]
-            struct.pack_into('<i', data, off + 6, phys[0])   # data ref (after target i32 + flags u16)
-            struct.pack_into('<I', data, off + 10, body)     # body_id
+            dref = struct.unpack_from('<i', data, off + 6)[0]
+            if not (0 <= dref < len(types) and types[dref] == 'bhkPhysicsSystem') and ci + 1 < len(types) \
+                    and types[ci + 1] == 'bhkPhysicsSystem':
+                dref = ci + 1
+            if not (0 <= dref < len(types) and types[dref] == 'bhkPhysicsSystem') or dref in used:
+                report["could_not_restore"].append("multi-piece collision (could not link each piece to its own physics system)")
+                return report
+            used.add(dref)
+            struct.pack_into('<H', data, off + 4, 128)     # flags (after target i32)
+            struct.pack_into('<i', data, off + 6, dref)    # data ref
+            struct.pack_into('<I', data, off + 10, 0)      # body_id
         with open(exported_path, "wb") as fh:
             fh.write(data)
-        report["restored"].append(f"Havok collision ({len(shapes)} convex pieces, vanilla multi-body layout)")
+        report["restored"].append(f"Havok collision ({len(shapes)} convex pieces, one physics system each)")
     except Exception as exc:
         report["could_not_restore"].append(f"Havok multi-piece collision ({exc})")
     return report
