@@ -408,9 +408,16 @@ class NVTTHelpers:
                     "-nologo",      # suppress version banner
                     "-m", "0",      # generate full mip chain (FO4 requirement)
                     "-f", texconv_format,
-                    "-o", out_dir,
-                    input_path,
                 ]
+                # texconv treats PNG/TGA/JPG input as sRGB and, for a non-sRGB
+                # output format like BC1_UNORM, converts it to linear -- FO4
+                # wants the stored values unchanged. Measured 2026-11-02: a
+                # diffuse averaging 0.168 came out 0.050, and a normal map's
+                # (0.25, 0.50) came out (0.05, 0.22). -srgb (in and out) keeps
+                # the values as-is and still writes DXT1/DXT5/BC5/BC7_UNORM.
+                if os.path.splitext(input_path)[1].lower() not in ('.exr', '.hdr'):
+                    cmd.append("-srgb")
+                cmd += ["-o", out_dir, input_path]
 
             result = subprocess.run(
                 cmd,

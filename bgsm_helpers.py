@@ -1571,7 +1571,14 @@ def _bgsm_targets_via_pynifly(filepath, meshes):
         s = shapes.get(_norm(m.name)) or shapes.get(_norm(m.get("fo4_original_name")))
         if s is None:
             return None
-        sname = str(getattr(s, "shader_name", "") or "").replace("/", "\\")
+        # PyNifly keeps the material path on the shader block (shape.shader.name);
+        # shapes have no shader_name, so reading only that made every shape
+        # look like "no .bgsm" and no new material was ever written (v5.4.0-5.4.4).
+        try:
+            sname = str(getattr(s, "shader_name", "") or getattr(s.shader, "name", "") or "")
+        except Exception:
+            sname = ""
+        sname = sname.replace("/", "\\")
         tex_rel = ""
         try:
             tex_rel = str((s.shader.textures or {}).get("Diffuse", "") or "")

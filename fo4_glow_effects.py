@@ -635,7 +635,8 @@ def bake_glow_map_sequence(obj, output_dir: str,
             for png in baked:
                 import subprocess
                 subprocess.run(
-                    [texconv, "-f", "BC3_UNORM", "-o", output_dir, png],
+                    # -srgb: keep the PNG's values (see nvtt_helpers.convert_to_dds)
+                    [texconv, "-f", "BC3_UNORM", "-srgb", "-o", output_dir, png],
                     capture_output=True, timeout=30,
                 )
     except Exception:

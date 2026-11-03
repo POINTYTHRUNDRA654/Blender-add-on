@@ -158,7 +158,8 @@ def _convert_to_dds(result: dict, output_dir: str, base_name: str) -> dict:
         png = result.get(map_type)
         if png and os.path.isfile(png):
             try:
-                subprocess.run([texconv, "-y", "-f", fmt, "-o", output_dir, png],
+                # -srgb: keep the PNG's values (see nvtt_helpers.convert_to_dds)
+                subprocess.run([texconv, "-y", "-f", fmt, "-srgb", "-o", output_dir, png],
                                capture_output=True, timeout=60)
                 dds = png.replace(".png", ".dds")
                 if os.path.isfile(dds):

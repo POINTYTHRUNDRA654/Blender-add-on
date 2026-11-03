@@ -90,13 +90,26 @@ _LOD_RATIOS = {
     "LOD3": 0.08,
 }
 
-# FO4 recommended max triangles per LOD level
+# Max triangles per generated LOD level. Measured on 900 vanilla object-LOD
+# NIFs (Meshes\LOD\, 2026-11-02): a typical _LOD_0 is 8 tris (p90 125), whole
+# downtown buildings use 150-450, and the heaviest real _LOD_0 is the USS
+# Constitution at 2,210. The old 8000/3000/1000 caps were 3-30x vanilla.
 _LOD_MAX_TRIS = {
     "LOD0": 65535,
-    "LOD1": 8000,
-    "LOD2": 3000,
-    "LOD3": 1000,
+    "LOD1": 1500,
+    "LOD2": 500,
+    "LOD3": 150,
 }
+
+# Shell LODs: voxel size = object diagonal / this, per level, and the baked
+# texture size per level. Coarser voxels drop thinner detail (tendrils,
+# railings) -- invisible at LOD distance -- and fuse loose pieces into one skin.
+# The voxel has to suit the triangle budget: on GSMutatedHouse01 (12-view
+# silhouette overlap with the original) 1500 tris scored 0.83 at /50 but 0.77
+# at /100 and 0.56 at /150; 500 tris 0.83 at /35; 150 tris 0.87 at /25.
+# Plain decimation scored 0.81 / 0.61 / 0.08 at the same budgets.
+_SHELL_VOXEL_DIV = {"LOD1": 50, "LOD2": 35, "LOD3": 25}
+_SHELL_TEX_SIZE = {"LOD1": 1024, "LOD2": 512, "LOD3": 256}
 
 
 # ── LOD helpers ───────────────────────────────────────────────────────────────
@@ -119,6 +132,10 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
     new_obj.data = new_mesh
     new_obj.name = lod_name
     new_mesh.name = lod_name
+    # The source's original NIF drives a post-export round-trip patch (root
+    # name, BSXFlags, alpha) meant for that NIF, not for a LOD of it.
+    if "fo4_source_nif" in new_obj:
+        del new_obj["fo4_source_nif"]
     bpy.context.collection.objects.link(new_obj)
 
     # Explicitly carry material slots from source (handles both DATA- and
@@ -180,6 +197,377 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
         f"({ratio*100:.0f}% of original)"
     )
     return new_obj, msg
+
+
+def _world_bounds(obj):
+    from mathutils import Vector
+    pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return mn, mx
+
+
+def generate_lod_shell(source_obj, lod_name: str, target_tris: int,
+                       voxel_div: int) -> "tuple[object, str]":
+    """Build a LOD as one closed, simplified skin around *source_obj*.
+
+    Decimate (generate_lod_mesh) works on clean hard-surface props but shreds
+    meshes made of many thin or separate pieces -- a plant-covered building
+    came out as loose floating shards at every level (seen 2026-11-02 on
+    GSMutatedHouse01). Here the mesh is voxel-remeshed first, which fuses the
+    pieces into one surface and drops detail thinner than a voxel, then small
+    leftover islands are removed and the skin is decimated to *target_tris*
+    and given fresh UVs for bake_lod_textures.
+
+    Returns (new_obj, message), or (None, reason) when the remesh lost the
+    object's shape (e.g. a long thin fence thinner than one voxel) so the
+    caller can fall back to plain decimation.
+    """
+    import bmesh as _bmesh
+    import math as _math
+
+    mn, mx = _world_bounds(source_obj)
+    diag = (mx - mn).length
+    if diag <= 0:
+        return None, "object has no size"
+    voxel = diag / max(4, int(voxel_div))
+
+    new_mesh = source_obj.data.copy()
+    new_obj = source_obj.copy()
+    new_obj.data = new_mesh
+    new_obj.name = lod_name
+    new_mesh.name = lod_name
+    for _k in ("fo4_source_nif",):
+        if _k in new_obj:
+            del new_obj[_k]
+    bpy.context.collection.objects.link(new_obj)
+    new_obj.modifiers.clear()
+    new_obj.vertex_groups.clear()
+    if new_obj.data.shape_keys:
+        new_obj.shape_key_clear()
+
+    def _apply(mod):
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.context.view_layer.objects.active = new_obj
+        new_obj.select_set(True)
+        return bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    rm = new_obj.modifiers.new("FO4_LOD_Remesh", 'REMESH')
+    rm.mode = 'VOXEL'
+    rm.voxel_size = voxel
+    if 'FINISHED' not in _apply(rm):
+        bpy.data.objects.remove(new_obj, do_unlink=True)
+        return None, "voxel remesh did not run"
+
+    bm = _bmesh.new()
+    bm.from_mesh(new_obj.data)
+    bm.faces.ensure_lookup_table()
+    islands, seen = [], set()
+    for f in bm.faces:
+        if f.index in seen:
+            continue
+        stack, isle = [f], []
+        seen.add(f.index)
+        while stack:
+            cur = stack.pop()
+            isle.append(cur)
+            for e in cur.edges:
+                for nf in e.link_faces:
+                    if nf.index not in seen:
+                        seen.add(nf.index)
+                        stack.append(nf)
+        islands.append(isle)
+    total = len(bm.faces)
+    small = [f for isle in islands if len(isle) < 0.01 * total for f in isle]
+    if small and len(small) < total:
+        _bmesh.ops.delete(bm, geom=small, context='FACES')
+    bm.to_mesh(new_obj.data)
+    bm.free()
+    new_obj.data.update()
+
+    rmn, rmx = _world_bounds(new_obj)
+    if not new_obj.data.polygons or any(
+            (rmx[i] - rmn[i]) < 0.6 * (mx[i] - mn[i]) for i in range(3)):
+        bpy.data.objects.remove(new_obj, do_unlink=True)
+        return None, (f"voxel remesh at {voxel:.3g} lost the shape "
+                      "(parts thinner than one voxel)")
+
+    tris_now = len(new_obj.data.polygons) * 2  # remesh output is quads
+    if tris_now > target_tris:
+        dm = new_obj.modifiers.new("FO4_LOD_Decimate", 'DECIMATE')
+        dm.decimate_type = 'COLLAPSE'
+        dm.ratio = max(0.001, target_tris / tris_now)
+        _apply(dm)
+
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = new_obj
+    new_obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.quads_convert_to_tris()
+    bpy.ops.uv.smart_project(angle_limit=_math.radians(66), island_margin=0.003)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    for poly in new_obj.data.polygons:
+        poly.use_smooth = True
+
+    new_obj["fo4_lod_voxel"] = voxel
+    n_tris = len(new_obj.data.polygons)
+    return new_obj, (f"LOD '{lod_name}': {n_tris} triangles "
+                     f"(solid shell, voxel {voxel:.3g})")
+
+
+def _lod_rel_dir(source_mat, fallback_sub: str) -> str:
+    """Folder under Materials\\LOD\\ and Textures\\LOD\\ for an asset's LOD
+    files, matching vanilla (materials\\LOD\\Architecture\\Skybridge\\...,
+    LOD\\Architecture\\Shacks\\ShackLOD01_d.dds): the source material's own
+    folder under Materials\\, else the mesh sub-path."""
+    name = (source_mat.get("BSLSP_Shader_Name", "") if source_mat else "") or ""
+    parts = [p for p in re.split(r"[\\/]+", name) if p]
+    if len(parts) >= 2 and parts[0].lower() == "materials":
+        return "\\".join(parts[1:-1])
+    return "\\".join(p for p in re.split(r"[\\/]+", fallback_sub or "") if p)
+
+
+def _flat_image(name, size, rgba):
+    img = bpy.data.images.new(name, size, size, alpha=False)
+    img.generated_color = rgba
+    return img
+
+
+def _average_color(img):
+    try:
+        small = img.copy()
+        small.scale(1, 1)
+        px = tuple(small.pixels[:4])
+        bpy.data.images.remove(small)
+        return (px[0], px[1], px[2], 1.0)
+    except Exception:
+        return (0.25, 0.25, 0.25, 1.0)
+
+
+def bake_lod_textures(source_obj, lod_obj, tex_size: int, textures_root: str,
+                      rel_dir: str, base: str) -> "tuple[dict, list]":
+    """Bake *source_obj*'s diffuse colour and surface shape onto *lod_obj*'s
+    own UVs (Cycles, selected-to-active) and save them as DDS in
+    <textures_root>\\LOD\\<rel_dir>\\<base>_d/_n/_s.dds.
+
+    Returns ({'Diffuse': path, 'Normal': path, 'Specular': path}, notes).
+    A slot whose DDS conversion failed keeps its PNG and says so in notes --
+    FO4 cannot load PNG, so the caller reports it instead of claiming success.
+    """
+    import os as _os
+    import tempfile as _tf
+    from . import nvtt_helpers as _nv
+
+    scene = bpy.context.scene
+    mn, mx = _world_bounds(lod_obj)
+    span = (mx - mn).length
+    out_dir = _os.path.join(textures_root, "LOD", *[p for p in rel_dir.split("\\") if p])
+    _os.makedirs(out_dir, exist_ok=True)
+
+    def _diffuse_of(mat):
+        if mat and mat.use_nodes:
+            for n in mat.node_tree.nodes:
+                if n.type == 'TEX_IMAGE' and n.image and "diffuse" in (n.label or n.name).lower():
+                    return n.image
+        return None
+
+    # Bake through plain stand-in materials: the imported FO4 node group
+    # bakes solid black in Cycles (seen 2026-11-02 on GSMutatedHouse01).
+    # Originals go back in the finally block below.
+    orig_slot_mats = [slot.material for slot in source_obj.material_slots]
+    stand_ins = []
+    src_diffuse = None
+    for slot in source_obj.material_slots:
+        img = _diffuse_of(slot.material)
+        src_diffuse = src_diffuse or img
+        sm = bpy.data.materials.new(f"{base}_src_bake")
+        sm.use_nodes = True
+        bsdf = next(n for n in sm.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+        if img is not None:
+            tn = sm.node_tree.nodes.new('ShaderNodeTexImage')
+            tn.image = img
+            sm.node_tree.links.new(tn.outputs['Color'], bsdf.inputs['Base Color'])
+        stand_ins.append(sm)
+    fill = _average_color(src_diffuse) if src_diffuse else (0.25, 0.25, 0.25, 1.0)
+
+    images = {
+        "Diffuse": _flat_image(f"{base}_d", tex_size, fill),
+        "Normal": _flat_image(f"{base}_n", tex_size, (0.5, 0.5, 1.0, 1.0)),
+    }
+    images["Normal"].colorspace_settings.name = 'Non-Color'
+
+    bake_mat = bpy.data.materials.new(f"{base}_bake")
+    bake_mat.use_nodes = True
+    tnode = bake_mat.node_tree.nodes.new('ShaderNodeTexImage')
+    bake_mat.node_tree.nodes.active = tnode
+    lod_obj.data.materials.clear()
+    lod_obj.data.materials.append(bake_mat)
+
+    saved = dict(engine=scene.render.engine, sel=list(bpy.context.selected_objects),
+                 active=bpy.context.view_layer.objects.active,
+                 hide_src=source_obj.hide_render, hide_lod=lod_obj.hide_render)
+    b = scene.render.bake
+    saved_bake = {k: getattr(b, k) for k in (
+        "use_selected_to_active", "use_cage", "cage_extrusion", "max_ray_distance",
+        "margin", "use_pass_direct", "use_pass_indirect", "use_pass_color",
+        "normal_space", "normal_r", "normal_g", "normal_b")}
+    notes = []
+    try:
+        for slot, sm in zip(source_obj.material_slots, stand_ins):
+            slot.material = sm
+        scene.render.engine = 'CYCLES'
+        saved["samples"] = scene.cycles.samples
+        scene.cycles.samples = 8
+        source_obj.hide_render = False
+        lod_obj.hide_render = False
+        bpy.ops.object.select_all(action='DESELECT')
+        source_obj.select_set(True)
+        lod_obj.select_set(True)
+        bpy.context.view_layer.objects.active = lod_obj
+        b.use_selected_to_active = True
+        b.use_cage = False
+        # The shell sits within about one voxel of the original surface. Rays
+        # starting much further out than that hit the outermost spikes first
+        # (span/40 baked 63% near-black on GSMutatedHouse01 vs 25% at this).
+        voxel = float(lod_obj.get("fo4_lod_voxel", span / 50.0))
+        b.cage_extrusion = voxel * 1.5
+        b.max_ray_distance = voxel * 4.0
+        b.margin = max(2, tex_size // 128)
+
+        tnode.image = images["Diffuse"]
+        b.use_pass_direct = False
+        b.use_pass_indirect = False
+        b.use_pass_color = True
+        bpy.ops.object.bake(type='DIFFUSE')
+
+        tnode.image = images["Normal"]
+        b.normal_space = 'TANGENT'
+        # FO4 normal maps are DirectX-style (green flipped vs Blender's OpenGL),
+        # same convention as fo4_unity_converter / fo4_ue5_converter.
+        b.normal_r, b.normal_g, b.normal_b = 'POS_X', 'NEG_Y', 'POS_Z'
+        bpy.ops.object.bake(type='NORMAL')
+    finally:
+        for k, v in saved_bake.items():
+            try:
+                setattr(b, k, v)
+            except Exception:
+                pass
+        if "samples" in saved:
+            scene.cycles.samples = saved["samples"]
+        scene.render.engine = saved["engine"]
+        source_obj.hide_render = saved["hide_src"]
+        lod_obj.hide_render = saved["hide_lod"]
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in saved["sel"]:
+            try:
+                o.select_set(True)
+            except Exception:
+                pass
+        bpy.context.view_layer.objects.active = saved["active"]
+        lod_obj.data.materials.clear()
+        bpy.data.materials.remove(bake_mat)
+        for slot, om in zip(source_obj.material_slots, orig_slot_mats):
+            slot.material = om
+        for sm in stand_ins:
+            bpy.data.materials.remove(sm)
+
+    # Specular: R = specular, G = smoothness. A dull, flat map -- LOD is seen
+    # from far away, and the source's own _s layout no longer matches these UVs.
+    images["Specular"] = _flat_image(f"{base}_s", 64, (0.1, 0.15, 0.0, 1.0))
+
+    paths = {}
+    tmp = _tf.mkdtemp(prefix="fo4lod_")
+    for slot, suffix in (("Diffuse", "_d"), ("Normal", "_n"), ("Specular", "_s")):
+        img = images[slot]
+        png = _os.path.join(tmp, f"{base}{suffix}.png")
+        img.filepath_raw = png
+        img.file_format = 'PNG'
+        img.save()
+        dds = _os.path.join(out_dir, f"{base}{suffix}.dds")
+        try:
+            ok, msg = _nv.NVTTHelpers.convert_to_dds(png, dds, slot=slot)
+        except Exception as exc:
+            ok, msg = False, str(exc)
+        if ok and _os.path.isfile(dds):
+            bpy.data.images.remove(img)
+            paths[slot] = dds
+        else:
+            keep = _os.path.join(out_dir, f"{base}{suffix}.png")
+            import shutil as _sh
+            _sh.copy2(png, keep)
+            bpy.data.images.remove(img)
+            paths[slot] = keep
+            notes.append(f"{base}{suffix}: DDS conversion failed ({msg}); saved PNG, "
+                         "which FO4 cannot load -- set texconv in the add-on preferences")
+    return paths, notes
+
+
+def make_lod_material(source_mat, lod_obj, tex_paths: dict, bgsm_rel: str,
+                      opaque: bool) -> "object":
+    """Give *lod_obj* its own copy of *source_mat* pointing at the LOD
+    textures and at its own materials\\LOD\\... .bgsm.
+
+    The NIF's material name decides which .bgsm the game and LOD generators
+    read, and a .bgsm overrides the NIF's texture slots -- so a LOD that kept
+    the source's material name would still draw the full-size 4K textures no
+    matter what the NIF itself references (found on 2026-11-02's house LODs).
+    """
+    import os as _os
+    mat = source_mat.copy() if source_mat else bpy.data.materials.new(lod_obj.name)
+    mat.name = _os.path.splitext(_os.path.basename(bgsm_rel))[0]
+    mat["BSLSP_Shader_Name"] = bgsm_rel
+    if "fo4_bgsm_path" in mat:
+        del mat["fo4_bgsm_path"]
+    if "BSShaderTextureSet_RootMaterialPath" in mat:
+        del mat["BSShaderTextureSet_RootMaterialPath"]
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    for slot, path in tex_paths.items():
+        rel = path.replace("/", "\\")
+        idx = rel.lower().rfind("\\textures\\")
+        rel = rel[idx + len("\\textures\\"):] if idx >= 0 else _os.path.basename(rel)
+        mat[f"BSShaderTextureSet_{slot}"] = rel
+        node = next((n for n in nodes if n.type == 'TEX_IMAGE'
+                     and slot.lower() in (n.label or n.name).lower()), None)
+        if node is None:
+            node = nodes.new('ShaderNodeTexImage')
+            node.name = node.label = f"{slot}_Texture"
+        node.image = bpy.data.images.load(path, check_existing=True)
+        if slot != "Diffuse":
+            node.image.colorspace_settings.name = 'Non-Color'
+    if opaque:
+        for n in [n for n in nodes if n.type == 'GROUP' and "alpha" in (n.label or n.name).lower()]:
+            nodes.remove(n)
+        if "pyn_synthetic_alpha_from_bgsm" in mat:
+            del mat["pyn_synthetic_alpha_from_bgsm"]
+        mat.blend_method = 'OPAQUE'
+    lod_obj.data.materials.clear()
+    lod_obj.data.materials.append(mat)
+    return mat
+
+
+def resolve_mod_root(folder: str) -> "tuple[str, str]":
+    """The MO2 mod folder itself when *folder* points inside it.
+
+    Picking the mod's Textures\\LOD folder as the output (an easy slip, since
+    that is where LOD textures end up) wrote Meshes\\ and Textures\\ trees
+    INSIDE Textures\\LOD\\, where nothing loads them (seen 2026-11-02).
+    Returns (root, note); note is '' when *folder* was already the root.
+    """
+    import os as _os
+    norm = _os.path.normpath(folder)
+    parts = norm.split(_os.sep)
+    idx = next((i for i, p in enumerate(parts)
+                if i > 0 and p.lower() in ("meshes", "textures", "materials")), None)
+    if idx is None:
+        return norm, ""
+    root = _os.sep.join(parts[:idx])
+    if len(parts[0]) == 2 and parts[0].endswith(":") and idx == 1:
+        root += _os.sep
+    return root, (f"Mod Output Folder pointed inside the mod ({parts[idx]}\\...); "
+                  f"using the mod folder {root}")
 
 
 # ── Texture baking setup ──────────────────────────────────────────────────────
@@ -499,6 +887,25 @@ def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
                 new_img.filepath_raw = out_path
                 new_img.file_format = 'PNG'
                 new_img.save()
+                # FO4 cannot load PNG: convert to DDS beside it and point the
+                # material at the DDS so the NIF and .bgsm reference it.
+                try:
+                    from . import nvtt_helpers as _nv
+                    _dds = os.path.splitext(out_path)[0] + ".dds"
+                    _slot = "Normal" if stem.lower().endswith("_n") else (
+                        "Specular" if stem.lower().endswith("_s") else "Diffuse")
+                    _ok_dds, _dds_msg = _nv.NVTTHelpers.convert_to_dds(out_path, _dds, slot=_slot)
+                except Exception as _exc:
+                    _ok_dds, _dds_msg = False, str(_exc)
+                if _ok_dds and os.path.isfile(_dds):
+                    new_img.filepath = _dds
+                    try:
+                        os.remove(out_path)
+                    except OSError:
+                        pass
+                else:
+                    skipped.append(f"{stem}: DDS conversion failed ({_dds_msg}); kept PNG, "
+                                   "which FO4 cannot load")
                 # Mark this image as an addon-generated LOD texture so a
                 # future re-run treats it as already-downscaled instead of
                 # downscaling it again (see the fo4_lod_generated check
@@ -517,6 +924,7 @@ def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
     return True, (
         f"{len(shared_cache)} shared LOD texture(s) created, "
         f"applied to {processed} texture slot(s) across {len(lod_objects)} LOD object(s)"
+        + (" -- " + "; ".join(skipped) if skipped else "")
     )
 
 
@@ -737,6 +1145,13 @@ def generate_billboard_lod(source_obj, billboard_name: str, tex_size: int = 512)
             pass
         new_obj["fo4_billboard"] = True
         new_obj["PYN_GAME"] = "FO4"
+        # Built in the source's units (metres after an FO4 import), so it
+        # needs the source's ×70 export tag too -- without it the exporter
+        # guessed "already game units" and the billboard shipped at 1/70
+        # size (22 units across for a 1,570-unit house, seen 2026-11-02).
+        for _k in ("fo4_unit_scale", "fo4_scale_applied"):
+            if _k in source_obj:
+                new_obj[_k] = source_obj[_k]
 
         msg = (
             f"Billboard '{billboard_name}' generated: "
@@ -843,9 +1258,23 @@ class FO4_OT_GenerateLODs(Operator):
         description="Export each LOD as a separate NIF to mod folder",
         default=True,
     )
-    lod1_ratio: FloatProperty(name="LOD1 Ratio", default=0.30, min=0.05, max=0.95)
-    lod2_ratio: FloatProperty(name="LOD2 Ratio", default=0.12, min=0.01, max=0.50)
-    lod3_ratio: FloatProperty(name="LOD3 Ratio", default=0.08, min=0.005, max=0.20)
+    lod1_ratio: FloatProperty(name="LOD1 Ratio", default=0.30, min=0.0005, max=0.95)
+    lod2_ratio: FloatProperty(name="LOD2 Ratio", default=0.12, min=0.0002, max=0.50)
+    lod3_ratio: FloatProperty(name="LOD3 Ratio", default=0.08, min=0.0001, max=0.20)
+    lod_method: EnumProperty(
+        name="LOD Method",
+        items=[
+            ('SHELL', "Solid Shell + Baked Texture",
+             "Fuse the mesh into one simplified skin and bake its look onto "
+             "a small LOD texture. Best for buildings, rocks, plant clusters "
+             "and anything made of many thin or loose pieces"),
+            ('DECIMATE', "Decimate",
+             "Remove triangles from the mesh itself and reuse its UVs with a "
+             "downscaled texture. Fine for simple, solid hard-surface props; "
+             "breaks thin or separate pieces into loose shards"),
+        ],
+        default='SHELL',
+    )
     generate_billboard: BoolProperty(
         name="Billboard (Farthest)",
         description=(
@@ -854,9 +1283,11 @@ class FO4_OT_GenerateLODs(Operator):
             "decimation -- matching real FO4 assets (verified against "
             "BlastedForestBurntTreeUpright01 and the exported reference "
             "folder: e.g. Meshes/Landscape/Trees/TreeMapleForest01_LOD_FLAT.nif, "
-            "sitting next to the source mesh, NOT under Meshes/LOD/)"
+            "sitting next to the source mesh, NOT under Meshes/LOD/). Only "
+            "two vanilla files use this (both maple trees), so it is on by "
+            "default for vegetation only"
         ),
-        default=True,
+        default=False,
     )
     billboard_tex_size: EnumProperty(
         name="Billboard Texture",
@@ -963,6 +1394,7 @@ class FO4_OT_GenerateLODs(Operator):
             self.collision_method = (
                 'EXACT_MESH' if src_class in _VEGETATION_CLASSES else 'CONVEX_LOD3'
             )
+            self.generate_billboard = src_class in _VEGETATION_CLASSES
 
         return context.window_manager.invoke_props_dialog(self, width=460)
 
@@ -994,6 +1426,8 @@ class FO4_OT_GenerateLODs(Operator):
             box.label(text="Use PyNifly to generate skinned-mesh LODs with bone re-binding.")
 
         layout.separator()
+
+        layout.prop(self, "lod_method")
 
         # ── LOD ratios ────────────────────────────────────────────────────────
         row = layout.row()
@@ -1102,6 +1536,12 @@ class FO4_OT_GenerateLODs(Operator):
                 f"'{_clean_subpath or '(none)'}')."
             )
 
+        mod_folder = bpy.path.abspath(self.mod_folder).strip() if self.mod_folder else ""
+        if mod_folder:
+            mod_folder, _root_note = resolve_mod_root(mod_folder)
+            if _root_note:
+                self.report({'INFO'}, _root_note)
+
         # ── Get/create LOD collection ─────────────────────────────────────────
         lod_col = bpy.data.collections.get("FO4_LODs")
         if not lod_col:
@@ -1145,6 +1585,7 @@ class FO4_OT_GenerateLODs(Operator):
                 )
 
             lod_objects = []
+            n_src_tris = sum(len(p.loop_indices) - 2 for p in obj.data.polygons)
             for lod_key, ratio in lods_to_gen:
                 lod_name = f"{obj.name}_{lod_key}"
                 # Remove existing LOD with same name
@@ -1153,7 +1594,17 @@ class FO4_OT_GenerateLODs(Operator):
                     bpy.data.objects.remove(existing, do_unlink=True)
 
                 try:
-                    lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name)
+                    lod_obj = None
+                    if self.lod_method == 'SHELL' and not is_skinned:
+                        target = max(12, min(_LOD_MAX_TRIS[lod_key], int(ratio * n_src_tris)))
+                        lod_obj, msg = generate_lod_shell(
+                            obj, lod_name, target, _SHELL_VOXEL_DIV[lod_key])
+                        if lod_obj is None:
+                            steps.append(f"{obj.name} {lod_key}: {msg} -- used Decimate instead")
+                        else:
+                            lod_obj["fo4_lod_shell"] = True
+                    if lod_obj is None:
+                        lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name)
                     # Move to LOD collection
                     for c in list(lod_obj.users_collection):
                         c.objects.unlink(lod_obj)
@@ -1305,10 +1756,50 @@ class FO4_OT_GenerateLODs(Operator):
                     self.report({'WARNING'},
                         f"{obj.name}: LOD3 not generated — enable 'LOD3 (8%)' to use it as collision source.")
 
+            # ── LOD textures + materials, BEFORE the NIFs are written ──────────
+            # Each LOD gets its own materials\LOD\...\<Name>LOD<n>.bgsm and
+            # Textures\LOD\... textures, like vanilla (ShackLOD01.BGSM ->
+            # LOD/Architecture/Shacks/ShackLOD01_d.dds). This used to run
+            # after export, so the NIFs kept the source's material name and
+            # the game drew the full 4K textures on every LOD.
+            if lod_objects and not is_skinned:
+                import tempfile as _tf
+                src_mat = obj.active_material
+                rel_dir = _lod_rel_dir(src_mat, _clean_subpath)
+                textures_root = (os.path.join(mod_folder, "Textures") if mod_folder
+                                 else _tf.mkdtemp(prefix="fo4lod_tex_"))
+                safe = re.sub(r"[^A-Za-z0-9_]+", "_", obj.name)
+                decimated = [o for o in lod_objects if not o.get("fo4_lod_shell")]
+                if decimated:
+                    _ok, tex_msg = create_lod_textures(
+                        decimated, scale_factor=0.25, textures_root=textures_root)
+                    steps.append(tex_msg)
+                for lod_obj in lod_objects:
+                    lod_key = lod_obj.get("fo4_lod_level", "LOD1")
+                    base = f"{safe}LOD{int(lod_key[-1]) - 1}"
+                    bgsm_rel = "materials\\LOD\\" + (rel_dir + "\\" if rel_dir else "") + base + ".bgsm"
+                    if lod_obj.get("fo4_lod_shell"):
+                        if src_mat is None:
+                            steps.append(f"⚠ {lod_obj.name}: source has no material, nothing to bake")
+                            continue
+                        try:
+                            size = _SHELL_TEX_SIZE.get(lod_key, 512)
+                            tex_paths, notes = bake_lod_textures(
+                                obj, lod_obj, size, textures_root, rel_dir, base)
+                            make_lod_material(src_mat, lod_obj, tex_paths, bgsm_rel, opaque=True)
+                            steps.extend(notes)
+                            steps.append(f"{lod_obj.name}: baked {size}px textures -> "
+                                         f"{os.path.dirname(tex_paths['Diffuse'])}")
+                        except Exception as e:
+                            self.report({'WARNING'}, f"LOD texture bake failed for {lod_obj.name}: {e}")
+                    elif lod_obj.active_material is not None:
+                        lod_obj.active_material["BSLSP_Shader_Name"] = bgsm_rel
+                        lod_obj.active_material.name = base
+
             # ── Export NIFs ───────────────────────────────────────────────────────
             # Skinned meshes are excluded: the Decimate modifier strips the skin
             # bind and the resulting NIF would be broken.  Use PyNifly for skinned LODs.
-            if self.export_nifs and self.mod_folder and lod_objects and not is_skinned:
+            if self.export_nifs and mod_folder and lod_objects and not is_skinned:
                 try:
                     from . import export_helpers
                     for lod_obj in lod_objects:
@@ -1344,10 +1835,10 @@ class FO4_OT_GenerateLODs(Operator):
                         # (confirmed against the user's real mod folder
                         # layout) -- not mixed in next to the full-res mesh.
                         nif_path = os.path.normpath(os.path.join(
-                            self.mod_folder, "Meshes", "LOD",
+                            mod_folder, "Meshes", "LOD",
                             sub, nif_name
                         ) if sub else os.path.join(
-                            self.mod_folder, "Meshes", "LOD", nif_name
+                            mod_folder, "Meshes", "LOD", nif_name
                         ))
                         os.makedirs(os.path.dirname(nif_path), exist_ok=True)
 
@@ -1392,7 +1883,7 @@ class FO4_OT_GenerateLODs(Operator):
                     bb_obj["fo4_object_type"] = src_class
                     steps.append(bb_msg)
 
-                    if self.export_nifs and self.mod_folder:
+                    if self.export_nifs and mod_folder:
                         from . import export_helpers as _eh_bb
                         sub = _clean_subpath
                         # Real convention (verified against the exported
@@ -1402,9 +1893,9 @@ class FO4_OT_GenerateLODs(Operator):
                         # LOD0 source mesh -- NOT under Meshes/LOD/ like
                         # LOD1/2/3 above.
                         bb_nif_path = os.path.normpath(os.path.join(
-                            self.mod_folder, "Meshes", sub, f"{billboard_name}.nif"
+                            mod_folder, "Meshes", sub, f"{billboard_name}.nif"
                         ) if sub else os.path.join(
-                            self.mod_folder, "Meshes", f"{billboard_name}.nif"
+                            mod_folder, "Meshes", f"{billboard_name}.nif"
                         ))
                         os.makedirs(os.path.dirname(bb_nif_path), exist_ok=True)
 
@@ -1426,21 +1917,6 @@ class FO4_OT_GenerateLODs(Operator):
             total_lod_count += len(lod_objects)
             if lod_objects and not is_skinned:
                 all_lod_objects.extend(lod_objects)
-
-        # ── Downscale/share textures across every target's LOD objects ────────
-        # Real assets give their real-mesh LOD levels a dedicated, much
-        # smaller shared texture instead of the full-resolution hero one (see
-        # create_lod_textures's own docstring for the reference-asset
-        # evidence). One shared pass over every target's LOD objects together
-        # (not one pass per target) so pieces from the same NIF that
-        # reference the same source texture (e.g. a trunk and its vines both
-        # using the same bark diffuse) end up sharing one LOD atlas instead
-        # of each target separately downscaling its own copy.
-        if all_lod_objects:
-            _ok, tex_msg = create_lod_textures(
-                all_lod_objects, scale_factor=0.25,
-                textures_root=os.path.join(self.mod_folder, "Textures") if self.mod_folder else "")
-            steps.append(tex_msg)
 
         # ── Texture / material info ───────────────────────────────────────────
         # Report which textures are confirmed on the LOD objects (now the
