@@ -195,6 +195,31 @@ def _activation_op(layout, cls_name, idname, text, icon='NONE'):
     hasattr(bpy.types, cls_name)  # guard check (result intentionally unused)
     return layout.operator(idname, text=text, icon=icon)
 
+
+class _PendingOpProps:
+    """Stand-in for the properties of an operator that is not registered yet."""
+
+    def __setattr__(self, name, value):
+        pass
+
+    def __getattr__(self, name):
+        return None
+
+
+def _op_props(layout, idname, **kwargs):
+    """``layout.operator()`` for buttons whose properties are set right after.
+
+    Operators from Phase 2 modules (ai_gen_operators, fo4_armor_animation,
+    fo4_ss2_plot_builder, ...) register ~3 s after Blender starts.  Until then
+    ``layout.operator()`` still draws the button but returns None, so
+    ``layout.operator(...).slot = x`` raised AttributeError and aborted the
+    whole panel's draw (seen live 2026-11-03 on the LOD & Collision panel).
+    The button is drawn either way, per the rule above; only the property
+    writes are skipped until the operator exists.
+    """
+    props = layout.operator(idname, **kwargs)
+    return props if props is not None else _PendingOpProps()
+
 # ──────────────────────────────────────────────────────────────────────────
 # PyTorch availability - simple external-install check.
 # Auto-installation inside Blender has been removed; users point the addon
@@ -1814,7 +1839,7 @@ class FO4_PT_CreaturePipeline(_FO4SubPanel):
         imp.label(text="Skeletons: Deathclaw / Radroach / Ghoul / Super Mutant", icon='DOT')
         imp.label(text="Import Skeleton + Skin Weights + Partitions = ON", icon='DOT')
         imp.prop(context.scene, "fo4_creature_type_choice", text="")
-        imp.operator("fo4.copy_creature_template", text="Copy Creature Type Template", icon='COPYDOWN').creature_type = context.scene.fo4_creature_type_choice
+        _op_props(imp, "fo4.copy_creature_template", text="Copy Creature Type Template", icon='COPYDOWN').creature_type = context.scene.fo4_creature_type_choice
 
         # ── Bind + transfer ──────────────────────────────────────────────
         layout.separator()
@@ -1832,7 +1857,7 @@ class FO4_PT_CreaturePipeline(_FO4SubPanel):
         part.label(text="Step 5 — Partition (if gore needed)", icon='GROUP_VERTEX')
         part.enabled = has_mesh
         part.prop(context.scene, "fo4_sbp_slot_choice", text="Slot")
-        part.operator("fo4.add_dismember_partition", text="Add Partition", icon='PLUS').slot = context.scene.fo4_sbp_slot_choice
+        _op_props(part, "fo4.add_dismember_partition", text="Add Partition", icon='PLUS').slot = context.scene.fo4_sbp_slot_choice
 
         # ── Export ───────────────────────────────────────────────────────
         layout.separator()
@@ -1886,7 +1911,7 @@ class FO4_PT_LODCollisionPipeline(_FO4SubPanel):
         sub = col_box.column(align=True)
         sub.enabled = has_mesh
         sub.prop(context.scene, "fo4_collision_type_choice", text="Type")
-        sub.operator("fo4.setup_collision_mesh", text="Mark as Collision Mesh", icon='META_CUBE').collision_type = context.scene.fo4_collision_type_choice
+        _op_props(sub, "fo4.setup_collision_mesh", text="Mark as Collision Mesh", icon='META_CUBE').collision_type = context.scene.fo4_collision_type_choice
 
         # ── pyNIF collision export ───────────────────────────────────────
         layout.separator()
@@ -1902,7 +1927,7 @@ class FO4_PT_LODCollisionPipeline(_FO4SubPanel):
         bgsm_box = layout.box()
         bgsm_box.label(text="Generate BGSM Material File", icon='MATERIAL')
         bgsm_box.prop(context.scene, "fo4_bgsm_template_choice", text="")
-        bgsm_box.operator("fo4.generate_bgsm_file", text="Save .bgsm File", icon='FILE_TICK').template = context.scene.fo4_bgsm_template_choice
+        _op_props(bgsm_box, "fo4.generate_bgsm_file", text="Save .bgsm File", icon='FILE_TICK').template = context.scene.fo4_bgsm_template_choice
         bgsm_box.label(text="Fill DDS paths in NifSkope / Material Editor", icon='DOT')
 
         # ── Materials reminder ───────────────────────────────────────────
@@ -1957,7 +1982,7 @@ class FO4_PT_RiggedArmorPipeline(_FO4SubPanel):
         col = layout.column(align=True)
         col.enabled = has_mesh
         col.prop(context.scene, "fo4_sbp_slot_choice", text="Slot")
-        col.operator("fo4.add_dismember_partition", text="Add Partition Slot", icon='PLUS').slot = context.scene.fo4_sbp_slot_choice
+        _op_props(col, "fo4.add_dismember_partition", text="Add Partition Slot", icon='PLUS').slot = context.scene.fo4_sbp_slot_choice
 
         layout.separator()
         layout.label(text="Step 6b — Cloth / Strap physics bones (optional):", icon='PHYSICS')
@@ -2560,7 +2585,7 @@ class FO4_PT_AdvisorPanel(_FO4SubPanel):
             row = mossy_box.row(align=True)
             # use_llm=True triggers AI analysis via Mossy (the only AI
             # backend this addon supports -- see advisor_helpers.query_mossy).
-            op = row.operator("fo4.advisor_analyze", text="Ask Mossy for Advice", icon='LIGHT_HEMI')
+            op = _op_props(row, "fo4.advisor_analyze", text="Ask Mossy for Advice", icon='LIGHT_HEMI')
             op.use_llm = True
             _activation_op(mossy_box, 'WM_OT_MossyCheckHttp', "wm.mossy_check_http",
                             "Check Mossy HTTP", icon='QUESTION')
@@ -2591,7 +2616,7 @@ class FO4_PT_AdvisorPanel(_FO4SubPanel):
         box = layout.box()
         box.label(text="Scene Analysis", icon='INFO')
         row = box.row(align=True)
-        op = row.operator("fo4.advisor_analyze", text="Analyze (Local)", icon='SHADERFX')
+        op = _op_props(row, "fo4.advisor_analyze", text="Analyze (Local)", icon='SHADERFX')
         op.use_llm = False
         if not use_mossy:
             box.label(text="Enable 'Use Mossy as AI Advisor' above for AI analysis", icon='ERROR')
@@ -2600,13 +2625,13 @@ class FO4_PT_AdvisorPanel(_FO4SubPanel):
         fixes = layout.box()
         fixes.label(text="Quick Fixes", icon='MODIFIER')
         row = fixes.row()
-        op = row.operator("fo4.advisor_quick_fix", text="Apply Transforms", icon='ORIENTATION_VIEW')
+        op = _op_props(row, "fo4.advisor_quick_fix", text="Apply Transforms", icon='ORIENTATION_VIEW')
         op.action = 'APPLY_TRANSFORMS'
         row = fixes.row()
-        op = row.operator("fo4.advisor_quick_fix", text="Auto Smooth + Shade", icon='SHADING_RENDERED')
+        op = _op_props(row, "fo4.advisor_quick_fix", text="Auto Smooth + Shade", icon='SHADING_RENDERED')
         op.action = 'SHADE_SMOOTH_AUTOSMOOTH'
         row = fixes.row()
-        op = row.operator("fo4.advisor_quick_fix", text="Validate Export", icon='CHECKMARK')
+        op = _op_props(row, "fo4.advisor_quick_fix", text="Validate Export", icon='CHECKMARK')
         op.action = 'VALIDATE_EXPORT'
 
         # ── Info / KB ────────────────────────────────────────────────────
@@ -3000,7 +3025,7 @@ class FO4_PT_GameAssetsLibraryPanel(_FO4SubPanel):
 
         row = paths_box.row(align=True)
         row.prop(scene, "fo4_asset_lib_path", text="All Assets")
-        op = row.operator("fo4.set_asset_lib_path", text="", icon='FILE_FOLDER')
+        op = _op_props(row, "fo4.set_asset_lib_path", text="", icon='FILE_FOLDER')
         op.slot = 'all'
 
         sep_box = paths_box.box()
@@ -3010,17 +3035,17 @@ class FO4_PT_GameAssetsLibraryPanel(_FO4SubPanel):
 
         row = sep_col.row(align=True)
         row.prop(scene, "fo4_asset_lib_mesh_path", text="Meshes")
-        op = row.operator("fo4.set_asset_folder_path", text="", icon='FILE_FOLDER')
+        op = _op_props(row, "fo4.set_asset_folder_path", text="", icon='FILE_FOLDER')
         op.slot = 'meshes'
 
         row = sep_col.row(align=True)
         row.prop(scene, "fo4_asset_lib_tex_path", text="Textures")
-        op = row.operator("fo4.set_asset_folder_path", text="", icon='FILE_FOLDER')
+        op = _op_props(row, "fo4.set_asset_folder_path", text="", icon='FILE_FOLDER')
         op.slot = 'textures'
 
         row = sep_col.row(align=True)
         row.prop(scene, "fo4_asset_lib_mat_path", text="Materials")
-        op = row.operator("fo4.set_asset_folder_path", text="", icon='FILE_FOLDER')
+        op = _op_props(row, "fo4.set_asset_folder_path", text="", icon='FILE_FOLDER')
         op.slot = 'materials'
 
         scan_row = paths_box.row(align=True)
@@ -3557,7 +3582,7 @@ class FO4_PT_AutomationQuickPanel(_FO4SubPanel):
             wf_box.label(text="Save/Load Workflow", icon='FILE_TICK')
             wf_box.prop(context.scene, "fo4_workflow_preset_name", text="Name")
             wf_row = wf_box.row(align=True)
-            save_op = wf_row.operator("fo4.save_workflow_settings", text="Save Workflow", icon='FILE_TICK')
+            save_op = _op_props(wf_row, "fo4.save_workflow_settings", text="Save Workflow", icon='FILE_TICK')
             save_op.preset_name = context.scene.fo4_workflow_preset_name
             wf_row.operator_menu_enum("fo4.load_workflow_settings", "preset_name",
                                        text="Load Workflow", icon='FILE_FOLDER')
@@ -3938,7 +3963,7 @@ class FO4_PT_ArmorClothingPanel(_FO4SubPanel):
         preset_row = auto_box.row(align=True)
         preset_row.scale_y = 0.85
         for _preset_text in ("flowing cape", "long robe", "leather skirt", "chest plate armor"):
-            preset_row.operator("fo4.set_armor_preset", text=_preset_text).preset = _preset_text
+            _op_props(preset_row, "fo4.set_armor_preset", text=_preset_text).preset = _preset_text
 
         layout.separator()
 
@@ -5232,7 +5257,7 @@ class FO4_PT_NPCAnimPanel(_FO4SubPanel):
             grp = pre.column(align=True); grp.label(text=group_label + ":")
             row = grp.row(align=True)
             for btn_label, preset in items:
-                op = row.operator("fo4.set_npc_preset", text=btn_label)
+                op = _op_props(row, "fo4.set_npc_preset", text=btn_label)
                 op.preset = preset
         kw = box.box(); kw.label(text="Keywords (combine freely):", icon='INFO')
         col = kw.column(align=True); col.scale_y = 0.72
@@ -5272,19 +5297,19 @@ class FO4_PT_WeaponPanel(_FO4SubPanel):
         for label, preset in [("10mm Pistol","10mm pistol handgun"),
                                ("Pipe Pistol","pipe pistol"),
                                ("Combat Rifle","combat rifle assault")]:
-            op = row.operator("fo4.set_weapon_preset", text=label); op.preset = preset
+            op = _op_props(row, "fo4.set_weapon_preset", text=label); op.preset = preset
         row2 = guns.row(align=True)
         for label, preset in [("Hunting Rifle","hunting rifle sniper"),
                                ("Shotgun","double barrel shotgun"),
                                ("Launcher","rocket missile launcher")]:
-            op = row2.operator("fo4.set_weapon_preset", text=label); op.preset = preset
+            op = _op_props(row2, "fo4.set_weapon_preset", text=label); op.preset = preset
         melee = pre.column(align=True); melee.label(text="Melee:")
         row3 = melee.row(align=True)
         for label, preset in [("Combat Knife","combat knife blade"),
                                ("Baseball Bat","baseball bat blunt"),
                                ("Pipe Wrench","pipe wrench blunt"),
                                ("Frag Grenade","frag grenade thrown")]:
-            op = row3.operator("fo4.set_weapon_preset", text=label); op.preset = preset
+            op = _op_props(row3, "fo4.set_weapon_preset", text=label); op.preset = preset
         kw = box.box(); kw.label(text="Keywords:", icon='INFO')
         col = kw.column(align=True); col.scale_y = 0.72
         for line in ["pistol/handgun/revolver  →  Pistol + reload + slide",
@@ -5338,13 +5363,13 @@ class FO4_PT_GlowEffectsPanel(_FO4SubPanel):
         light_row = pre.row(align=True)
         for label, preset in [("Pulse","pulsate heartbeat"),("Breathe","breathe inhale exhale"),
                                ("Flicker","organic flicker bioluminescent"),("Aurora","aurora flow shimmer")]:
-            op = light_row.operator("fo4.set_glow_preset", text=label, icon='LIGHT'); op.preset = preset
+            op = _op_props(light_row, "fo4.set_glow_preset", text=label, icon='LIGHT'); op.preset = preset
         spore_row = pre.row(align=True)
         for label, preset in [("Spore Cloud","spore cloud drift float upward"),
                                ("Toxic Puff","toxic spore puff affect NPC poison"),
                                ("Mushroom","mushroom spore puff particle flicker"),
                                ("Rainbow","rainbow hue cycle color")]:
-            op = spore_row.operator("fo4.set_glow_preset", text=label, icon='PARTICLES'); op.preset = preset
+            op = _op_props(spore_row, "fo4.set_glow_preset", text=label, icon='PARTICLES'); op.preset = preset
         out = box.box(); out.label(text="Output (Papyrus/baked textures):", icon='FILE_FOLDER')
         out.prop(scene, "fo4_glow_output", text="")
         btn = box.column(align=True); btn.scale_y = 1.3
@@ -5395,7 +5420,7 @@ class FO4_PT_ESPGeneratorPanel(_FO4SubPanel):
         box.prop(scene, "fo4_esp_output",  text="Output Folder")
         box.prop(scene, "fo4_esp_xedit",   text="Also write xEdit script (.pas)")
         go = box.row(); go.scale_y = 1.4; go.enabled = len(selected) > 0
-        go_op = go.operator("fo4.generate_esp", text=f"Generate ESP ({len(selected)} objects)", icon='FILE_NEW')
+        go_op = _op_props(go, "fo4.generate_esp", text=f"Generate ESP ({len(selected)} objects)", icon='FILE_NEW')
         go_op.plugin_name = scene.fo4_plugin_name
         go_op.author      = scene.fo4_esp_author
         go_op.output_dir  = scene.fo4_esp_output
@@ -5429,7 +5454,7 @@ class FO4_PT_TextureGeneratorPanel(_FO4SubPanel):
         for i in range(0, len(presets), 4):
             row = pre.row(align=True)
             for label, desc in presets[i:i+4]:
-                op = row.operator("fo4.set_texture_preset", text=label); op.preset = desc
+                op = _op_props(row, "fo4.set_texture_preset", text=label); op.preset = desc
         go = box.row(); go.scale_y = 1.3
         go.operator("fo4.generate_texture", text="Generate Texture Set (diffuse + normal + spec)", icon='IMAGE_DATA')
 
@@ -5449,7 +5474,7 @@ class FO4_PT_BatchToolsPanel(_FO4SubPanel):
         exp.prop(scene, "fo4_batch_output",   text="Output Folder")
         exp.prop(scene, "fo4_batch_fo4_prep", text="Apply FO4 Prep")
         go = exp.row(); go.scale_y = 1.3; go.enabled = len(selected) > 0
-        go_op = go.operator("fo4.batch_export", text=f"Export {len(selected)} Objects as NIFs", icon='FILE_NEW')
+        go_op = _op_props(go, "fo4.batch_export", text=f"Export {len(selected)} Objects as NIFs", icon='FILE_NEW')
         go_op.output_dir     = scene.fo4_batch_output
         go_op.apply_fo4_prep = scene.fo4_batch_fo4_prep
         lod = layout.box(); lod.label(text="Batch LOD Generate + Export", icon='MOD_DECIM')
@@ -5457,7 +5482,7 @@ class FO4_PT_BatchToolsPanel(_FO4SubPanel):
         pre = layout.box(); pre.label(text="Workflow Presets", icon='PRESET')
         pre.prop(scene, "fo4_workflow_preset_name", text="Name")
         row = pre.row(align=True)
-        save_op = row.operator("fo4.save_workflow_settings", text="Save Current Settings", icon='FILE_TICK')
+        save_op = _op_props(row, "fo4.save_workflow_settings", text="Save Current Settings", icon='FILE_TICK')
         save_op.preset_name = scene.fo4_workflow_preset_name
         row.operator_menu_enum("fo4.load_workflow_settings", "preset_name",
                                 text="Load Preset", icon='FILE_FOLDER')
@@ -5481,7 +5506,7 @@ class FO4_PT_SS2PlotBuilderPanel(_FO4SubPanel):
         guide.prop(scene, "fo4_ss2_front_axis", text="Front Direction")
         row = guide.row(align=True)
         for code, label, _ in _ss2_size_items():
-            op = row.operator("fo4.add_plot_boundary_guide", text=label)
+            op = _op_props(row, "fo4.add_plot_boundary_guide", text=label)
             op.size = code
             op.front_axis = scene.fo4_ss2_front_axis
         hint = guide.column(align=True); hint.scale_y = 0.72
@@ -5495,7 +5520,7 @@ class FO4_PT_SS2PlotBuilderPanel(_FO4SubPanel):
         row.prop(scene, "fo4_ss2_tag_level", text="Level")
         row.prop(scene, "fo4_ss2_tag_stage", text="Stage")
         stage.prop(scene, "fo4_ss2_tag_final")
-        tag_op = stage.operator("fo4.assign_plot_stage", text="Tag Selected as Stage", icon='CHECKMARK')
+        tag_op = _op_props(stage, "fo4.assign_plot_stage", text="Tag Selected as Stage", icon='CHECKMARK')
         tag_op.level = scene.fo4_ss2_tag_level
         tag_op.stage = scene.fo4_ss2_tag_stage
         tag_op.is_final = scene.fo4_ss2_tag_final
@@ -5519,7 +5544,7 @@ class FO4_PT_SS2PlotBuilderPanel(_FO4SubPanel):
         row.prop(scene, "fo4_ss2_spawn_level_ui", text="Level")
         row.prop(scene, "fo4_ss2_spawn_stage_start_ui", text="Start")
         row.prop(scene, "fo4_ss2_spawn_stage_end_ui", text="End")
-        spawn_op = spawn.operator("fo4.add_plot_spawn_marker", text="Add Spawn Marker at Cursor", icon='ADD')
+        spawn_op = _op_props(spawn, "fo4.add_plot_spawn_marker", text="Add Spawn Marker at Cursor", icon='ADD')
         spawn_op.level = scene.fo4_ss2_spawn_level_ui
         spawn_op.stage_start = scene.fo4_ss2_spawn_stage_start_ui
         spawn_op.stage_end = scene.fo4_ss2_spawn_stage_end_ui
@@ -5585,12 +5610,12 @@ class FO4_PT_WorkshopPanel(_FO4SubPanel):
                 ("LIGHTING","Lighting"),("DECORATIONS","Decorations"),("MISC","Misc")]
         row = cobj.row(align=True)
         for code, label in cats[:5]:
-            op = row.operator("fo4.generate_workshop_stubs", text=label)
+            op = _op_props(row, "fo4.generate_workshop_stubs", text=label)
             op.category = code
             op.plugin_name = scene.fo4_plugin_name
         row2 = cobj.row(align=True)
         for code, label in cats[5:]:
-            op = row2.operator("fo4.generate_workshop_stubs", text=label)
+            op = _op_props(row2, "fo4.generate_workshop_stubs", text=label)
             op.category = code
             op.plugin_name = scene.fo4_plugin_name
 
@@ -5663,14 +5688,14 @@ class FO4_PT_WeatherInteriorPanel(_FO4SubPanel):
         row = wbox.row(align=True)
         for wtype, label in [("RAIN","Rain"),("SNOW","Snow"),("ASH","Ash"),
                               ("RAD_STORM","Rad Storm"),("FOG","Fog"),("BLIZZARD","Blizzard")]:
-            op = row.operator("fo4.add_weather_particles", text=label); op.weather_type = wtype
+            op = _op_props(row, "fo4.add_weather_particles", text=label); op.weather_type = wtype
         ibox = layout.box(); ibox.label(text="Interior Cell Helpers", icon='HOME')
         ibox.label(text="Auto-place lights above floor surfaces:")
         row2 = ibox.row(align=True)
         for ltype, label in [("INTERIOR_WARM","Warm"),("INTERIOR_COOL","Cool"),
                               ("VAULT_FLUORO","Vault"),("NEON_RED","Neon R"),
                               ("NEON_BLUE","Neon B"),("CANDLE","Candle"),("RADIOACTIVE","Rad")]:
-            op = row2.operator("fo4.place_interior_lights", text=label); op.light_preset = ltype
+            op = _op_props(row2, "fo4.place_interior_lights", text=label); op.light_preset = ltype
         ibox.operator("fo4.add_room_snap_grid", text="Add Room Snap Grid", icon='SNAP_GRID')
 
 
