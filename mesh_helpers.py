@@ -1164,7 +1164,11 @@ class MeshHelpers:
                 f"Fixed {len(unweighted)} unweighted vertex/vertices – "
                 f"assigned each to nearest bone"
             )
-        elif MeshHelpers._looks_like_vegetation(obj):
+        elif MeshHelpers._looks_like_vegetation(obj) and obj.vertex_groups.get("Wind") is not None \
+                and not obj.get("fo4_no_wind"):
+            # Only re-grade a Wind group that already exists (wind was applied
+            # and some vertices lost their weight). Creating one here for any
+            # plant used to turn every exported plant into a wind mesh.
             # No armature, and this object is actually vegetation/foliage --
             # FO4 wind animation is driven by a single per-vertex weight channel:
             #   0.0 (blue)  = base / roots – no movement

@@ -997,17 +997,35 @@ class AnimationHelpers:
         )
 
     @staticmethod
-    def set_static_wind_weight(mesh_obj, group_name="Wind"):
-        """Mark *mesh_obj* as fully static -- no wind sway anywhere.
+    def wind_enabled(obj) -> bool:
+        """True only when wind was actually applied to *obj*: a "Wind" vertex
+        group AND a material whose BGSM tree flag is on, and not marked
+        "no wind". The tree flag is what makes FO4 run the wind shader;
+        a Wind group alone used to turn every exported plant into a
+        BSLeafAnimNode wind mesh with no tree shader to match."""
+        if obj is None or getattr(obj, "type", "") != 'MESH':
+            return False
+        if obj.get("fo4_no_wind"):
+            return False
+        if not obj.vertex_groups.get("Wind"):
+            return False
+        return any(s.material is not None and bool(s.material.get("fo4_bgsm_tree"))
+                   for s in getattr(obj, "material_slots", []))
 
-        Some FO4 assets (e.g. a vine wrapped tight around a creature/prop)
-        still need the "Wind" vertex group + vertex-alpha channel present --
-        the shader expects it -- but must never actually move, unlike normal
-        vegetation's root-anchored/tip-swaying gradient from
-        :meth:`generate_wind_weights`. Writes a single uniform weight across
-        every vertex instead of a gradient, then pushes it through
-        :meth:`apply_wind_vertex_colors` so 'VERTEX_ALPHA' reads solid
-        "anchored" everywhere.
+    @staticmethod
+    def set_static_wind_weight(mesh_obj, group_name="Wind"):
+        """Vertex colors without wind: keep the mesh's RGB vertex colors (the
+        tint they add to the texture), make vertex alpha fully solid, and
+        remove everything that makes FO4 treat the mesh as wind foliage.
+
+        Without the tree flag FO4 does not read vertex alpha as sway: it is
+        transparency, the way vanilla uses it to fade lichen and decal edges.
+        This used to write a near-zero "anchored" alpha (0.001, saved as 0)
+        and leave the Wind group in place, so a "static" plant exported with
+        alpha 0 on every vertex under a BSLeafAnimNode wind root.
+
+        Result on export: NiNode root, Vertex Colors flag on, alpha 1.0,
+        BGSM tree flag off.
 
         **Returns:** ``(success: bool, message: str)``
         """
@@ -1019,20 +1037,36 @@ class AnimationHelpers:
 
         mesh = mesh_obj.data
         vg = mesh_obj.vertex_groups.get(group_name)
-        if vg is None:
-            vg = mesh_obj.vertex_groups.new(name=group_name)
+        if vg is not None:
+            mesh_obj.vertex_groups.remove(vg)
+        for key in ("fo4_wind_amplitude", "fo4_wind_period", "fo4_wind_alpha_scale"):
+            if key in mesh_obj:
+                del mesh_obj[key]
+        mesh_obj["fo4_no_wind"] = True
 
-        # Same 0.001 floor used by generate_wind_weights -- pure 0.0 is
-        # treated as "unweighted" by PyNifly's exporter and hard-errors.
-        for i in range(len(mesh.vertices)):
-            vg.add([i], 0.001, 'REPLACE')
-
-        # Static means no wind shader either (see apply_vegetation_wind).
         for _slot in getattr(mesh_obj, "material_slots", []):
-            if _slot.material is not None and _slot.material.get("fo4_bgsm_tree"):
+            if _slot.material is not None:
                 _slot.material["fo4_bgsm_tree"] = False
 
-        return AnimationHelpers.apply_wind_vertex_colors(mesh_obj, group_name=group_name)
+        # PyNifly exports VERTEX_ALPHA's grey value as the vertex alpha when the
+        # attribute exists (see apply_wind_vertex_colors), so make it solid white.
+        va = mesh.color_attributes.get("VERTEX_ALPHA")
+        if va is not None:
+            for item in va.data:
+                item.color = (1.0, 1.0, 1.0, 1.0)
+
+        # Keep existing RGB tint; only make alpha solid. A mesh with no color
+        # data gets plain white so the flag has something neutral to multiply.
+        ca = mesh.color_attributes.get("Col")
+        created = ca is None
+        if ca is None:
+            ca = mesh.color_attributes.new(name="Col", type='FLOAT_COLOR', domain='POINT')
+        for item in ca.data:
+            r, g, b, _a = item.color
+            item.color = (1.0, 1.0, 1.0, 1.0) if created else (r, g, b, 1.0)
+        mesh.update()
+        what = "white vertex colors added" if created else "vertex colors kept"
+        return True, f"'{mesh_obj.name}': {what}, alpha solid, no wind (exports with a normal NiNode root)"
 
     @staticmethod
     def apply_wind_vertex_colors(mesh_obj, group_name="Wind", attr_name="Col", alpha_scale=None):
@@ -1195,6 +1229,8 @@ class AnimationHelpers:
         vc_note = f" | {vc_msg}" if not vc_ok else ""
 
         mesh_obj["fo4_object_type"]    = "VEGETATION"
+        if "fo4_no_wind" in mesh_obj:
+            del mesh_obj["fo4_no_wind"]
         mesh_obj["fo4_wind_amplitude"] = amplitude
         mesh_obj["fo4_wind_period"]    = period
 

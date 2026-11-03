@@ -3640,9 +3640,9 @@ class FO4_OT_BatchFixWindVertexColors(Operator):
 
 
 class FO4_OT_BatchSetStaticNoWind(Operator):
-    """Mark all selected meshes as fully static -- no wind sway anywhere, ever"""
+    """Vertex colors with no wind on every selected mesh"""
     bl_idname = "fo4.batch_set_static_no_wind"
-    bl_label = "Batch: No Wind (Static, Solid)"
+    bl_label = "Batch: Vertex Colors, No Wind (Static)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -3907,17 +3907,10 @@ class FO4_OT_FixWindVertexColors(Operator):
 
 
 class FO4_OT_SetStaticNoWind(Operator):
-    """Mark a mesh as fully static -- no wind sway anywhere, ever.
-
-    Use this for geometry that must NOT animate (e.g. a vine wrapped tight
-    around a creature or prop) but still needs the vertex-alpha channel
-    present because the FO4 shader expects it. Unlike 'Vegetation Wind
-    (Vertex Groups)', which writes a root-anchored/tip-swaying gradient,
-    this writes one uniform 'fully anchored' value across every vertex --
-    solid, no gradient, no movement in-game.
-    """
+    """Keep vertex colors (their tint on the texture) with no wind: solid
+    alpha, no Wind group, BGSM tree flag off, normal NiNode root on export."""
     bl_idname  = "fo4.set_static_no_wind"
-    bl_label   = "No Wind (Static, Solid)"
+    bl_label   = "Vertex Colors, No Wind (Static)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):

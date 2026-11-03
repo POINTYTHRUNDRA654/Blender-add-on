@@ -2265,7 +2265,7 @@ class FO4_PT_AnimationPanel(_FO4SubPanel):
         type_col.operator("fo4.fix_wind_vertex_colors",
                           text="Fix Wind Vertex Colors (stops breathing)", icon='VPAINT_HLT')
         type_col.operator("fo4.set_static_no_wind",
-                          text="No Wind (Static, Solid)", icon='LOCKED')
+                          text="Vertex Colors, No Wind (Static)", icon='LOCKED')
 
         type_col.separator(factor=0.4)
         type_col.label(text="Creatures / Characters (armature):", icon='ARMATURE_DATA')

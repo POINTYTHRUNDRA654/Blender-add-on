@@ -659,7 +659,15 @@ def patch_wind_root_node(exported_path, obj=None, original_path=None) -> dict:
         except Exception:
             original_is_leafanim = False
 
-    if not (has_wind_group or original_is_leafanim):
+    try:
+        from .animation_helpers import AnimationHelpers as _AH
+        wind_on = _AH.wind_enabled(obj) if obj is not None else False
+        no_wind = bool(obj is not None and obj.get("fo4_no_wind"))
+    except Exception:
+        wind_on, no_wind = has_wind_group, False
+    # A Wind group alone is not enough: without a tree material the root would
+    # say "wind" while the shader does not. Marked no-wind never gets it.
+    if no_wind or not (wind_on or original_is_leafanim):
         return report
 
     if not exported_path or not os.path.isfile(exported_path):
