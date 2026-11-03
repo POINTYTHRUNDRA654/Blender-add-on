@@ -547,49 +547,56 @@ class MeshHelpers:
 
     @staticmethod
     def unify_material_slots(obj):
-        """Consolidate all material slots to the one with the most loaded textures.
+        """Merge the material slots a join left behind that add nothing.
 
-        After joining two meshes that had different materials, each mesh's faces
-        still point to their original slot. This reassigns every face to the slot
-        with the most TEX_IMAGE nodes that have loaded images, then removes the
-        empty/duplicate slots.
+        After joining meshes, faces from an empty slot, from a material with no
+        texture, or from a material showing exactly the same texture files as
+        the best-textured slot are moved onto that slot, and those slots are
+        removed.  A slot whose material has textures of its own (a leaf card
+        joined to a trunk, say) keeps its faces and its material.  This used to
+        put every face on one material and delete all the others, which took
+        those textures off the mesh.
+
+        Returns the number of slots removed.
         """
         if not obj or obj.type != 'MESH' or len(obj.material_slots) <= 1:
             return 0  # nothing to do
 
-        # Score each slot by number of loaded TEX_IMAGE nodes
-        best_idx, best_score = 0, -1
-        for i, slot in enumerate(obj.material_slots):
-            mat = slot.material
-            score = 0
-            if mat and mat.use_nodes and mat.node_tree:
-                score = sum(
-                    1 for n in mat.node_tree.nodes
-                    if n.type == 'TEX_IMAGE' and n.image is not None
-                )
-            if score > best_score:
-                best_score, best_idx = score, i
+        def _texture_files(mat):
+            if not (mat and mat.use_nodes and mat.node_tree):
+                return frozenset()
+            return frozenset(
+                bpy.path.abspath(n.image.filepath or n.image.name).lower()
+                for n in mat.node_tree.nodes
+                if n.type == 'TEX_IMAGE' and n.image is not None
+            )
 
+        files = [_texture_files(s.material) for s in obj.material_slots]
+        best_idx = max(range(len(files)), key=lambda i: len(files[i]))
         best_mat = obj.material_slots[best_idx].material
+        merge = {
+            i for i, slot in enumerate(obj.material_slots)
+            if i != best_idx and (slot.material is None or slot.material == best_mat
+                                  or not files[i] or files[i] == files[best_idx])
+        }
+        if not merge:
+            return 0
 
-        # Put best material in slot 0 and point all faces there
-        obj.material_slots[0].material = best_mat
         was_edit = (obj.mode == 'EDIT')
-        if not was_edit:
-            bpy.ops.object.mode_set(mode='EDIT')
-        bm = bmesh.from_edit_mesh(obj.data)
-        for face in bm.faces:
-            face.material_index = 0
-        bmesh.update_edit_mesh(obj.data)
-        if not was_edit:
+        if was_edit:
             bpy.ops.object.mode_set(mode='OBJECT')
+        for poly in obj.data.polygons:
+            if poly.material_index in merge:
+                poly.material_index = best_idx
 
-        # Remove all slots beyond slot 0
+        # Highest index first, so the indices still to remove stay valid.
         removed = 0
-        while len(obj.material_slots) > 1:
-            obj.active_material_index = len(obj.material_slots) - 1
+        for i in sorted(merge, reverse=True):
+            obj.active_material_index = i
             bpy.ops.object.material_slot_remove()
             removed += 1
+        if was_edit:
+            bpy.ops.object.mode_set(mode='EDIT')
 
         return removed
 
@@ -2753,7 +2760,7 @@ class SmartPresets:
                 mat = texture_helpers.TextureHelpers.setup_fo4_material(obj)
                 for tex in candidates:
                     tex_type = texture_helpers.TextureHelpers.detect_fo4_texture_type(str(tex))
-                    texture_helpers.TextureHelpers.install_texture(obj, str(tex), tex_type)
+                    texture_helpers.TextureHelpers.install_texture(obj, str(tex), tex_type, replace=False)
                 return mat
         print("[FO4] Import: no textures found near the asset — mesh imported untextured")
 
@@ -2935,7 +2942,7 @@ class SmartPresets:
         mat = texture_helpers.TextureHelpers.setup_fo4_material(obj)
         for tex in abs_paths:
             tex_type = texture_helpers.TextureHelpers.detect_fo4_texture_type(tex)
-            texture_helpers.TextureHelpers.install_texture(obj, tex, tex_type)
+            texture_helpers.TextureHelpers.install_texture(obj, tex, tex_type, replace=False)
 
 
 class FO4_OT_AddCompoundCollision(bpy.types.Operator):

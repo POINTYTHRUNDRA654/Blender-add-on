@@ -1370,7 +1370,10 @@ def bgsm_to_blender_mat(data: BGSMData, mat) -> None:
         return
 
     mat.use_nodes = True
-    mat.use_backface_culling = not bool(data.shader_flags2 & SF2_DOUBLE_SIDED)
+    # The .bgsm file stores two-sided as its own field; read_bgsm never fills
+    # the (NIF-side) shader_flags2 bit, so reading only that made every
+    # imported .bgsm one-sided -- leaf cards lost their back faces.
+    mat.use_backface_culling = not (data.two_sided or bool(data.shader_flags2 & SF2_DOUBLE_SIDED))
 
     # Alpha settings
     if data.alpha_test:
@@ -1383,6 +1386,17 @@ def bgsm_to_blender_mat(data: BGSMData, mat) -> None:
 
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
+
+    # A material PyNifly built from a NIF keeps its own FO4 shader group and
+    # texture nodes. Building the Principled setup below on it used to plug a
+    # new BSDF into the output, unplugging the NIF shader and its textures.
+    try:
+        from .texture_helpers import TextureHelpers as _TH
+    except ImportError:
+        _TH = None
+    if _TH is not None and _TH._pynifly_shader(mat) is not None:
+        mat["fo4_bgsm_smoothness_orig"] = data.smoothness
+        return
 
     # Get or create Principled BSDF
     pbsdf = None
@@ -1442,7 +1456,7 @@ def bgsm_to_blender_mat(data: BGSMData, mat) -> None:
     if out_node is None:
         out_node = nodes.new('ShaderNodeOutputMaterial')
         out_node.location = (300, 300)
-    if not pbsdf.outputs[0].links:
+    if not pbsdf.outputs[0].links and not out_node.inputs[0].links:
         links.new(pbsdf.outputs[0], out_node.inputs[0])
 
     # Create / update texture image nodes and wire them to the BSDF
@@ -2105,20 +2119,14 @@ def import_bgsm_for_object(obj, bgsm_path: str) -> tuple[bool, str]:
                 obj.data.materials.append(mat)
             else:
                 existing = obj.active_material
-                has_tex_nodes = (
-                    existing is not None
-                    and existing.use_nodes
-                    and existing.node_tree is not None
-                    and any(n.type == 'TEX_IMAGE' and n.image is not None
-                            for n in existing.node_tree.nodes)
-                )
-                if has_tex_nodes:
-                    # Existing material already has images loaded (e.g. from NIF
-                    # import).  Apply BGSM properties to it in-place so we keep
-                    # the textures the user can already see.
+                if existing is not None:
+                    # Apply the BGSM to the material the mesh already has, in
+                    # place. Swapping it for a new one (done whenever it had no
+                    # loaded image, e.g. a NIF whose textures weren't found)
+                    # dropped its texture paths and .bgsm link.
                     mat = existing
                 else:
-                    # Empty or nodeless slot — replace with the BGSM material.
+                    # Empty slot -- fill it with the BGSM material.
                     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(mat_name)
                     obj.active_material = mat
             bgsm_to_blender_mat(data, mat)

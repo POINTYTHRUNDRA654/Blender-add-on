@@ -217,29 +217,31 @@ def apply_displacement_to_mesh(obj, filepath, strength=0.5):
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
         
-        # Clear existing nodes
-        nodes.clear()
-        
-        # Create nodes
-        output = nodes.new('ShaderNodeOutputMaterial')
-        output.location = (400, 0)
-        
-        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-        bsdf.location = (0, 0)
-        
+        # Add the displacement to the material's existing nodes. This used to
+        # clear the node tree first, wiping the mesh's textures and shader.
+        output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        if output is None:
+            output = nodes.new('ShaderNodeOutputMaterial')
+            output.location = (400, 0)
+        if not output.inputs['Surface'].is_linked:
+            bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+            bsdf.location = (0, 0)
+            links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+
         # Create displacement nodes
         displacement = nodes.new('ShaderNodeDisplacement')
-        displacement.location = (200, -300)
+        displacement.location = (output.location.x - 200, output.location.y - 300)
         displacement.inputs['Scale'].default_value = strength
-        
+
         img_texture = nodes.new('ShaderNodeTexImage')
-        img_texture.location = (-300, -300)
+        img_texture.location = (displacement.location.x - 300, displacement.location.y)
         img_texture.image = img
         img_texture.image.colorspace_settings.name = 'Non-Color'
-        
-        # Link nodes
-        links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+
         links.new(img_texture.outputs['Color'], displacement.inputs['Height'])
+        if output.inputs['Displacement'].is_linked:
+            return True, (f"Displacement nodes added to {obj.name}, not connected: "
+                          "the material already has a displacement input")
         links.new(displacement.outputs['Displacement'], output.inputs['Displacement'])
         
         # Set material displacement method. Blender 4.2 moved this from the

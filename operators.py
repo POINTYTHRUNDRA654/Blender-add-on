@@ -2403,67 +2403,45 @@ class FO4_OT_AutoConnectArmorTextures(Operator):
                 break
         return found
 
+    _ROLE_SLOT = {"diffuse": "Diffuse", "normal": "Normal", "spec": "Specular", "glow": "Glow"}
+
     def _setup_material(self, obj, tex_map):
-        """Create/update the active material on obj with Principled BSDF + found textures."""
-        mat = obj.active_material
+        """Put the found textures into the slots of the mesh's material that
+        have no working texture yet.  The material, the textures it already
+        shows and its shader wiring are kept -- this used to plug a new
+        Principled BSDF into the output (unplugging a NIF material's own
+        shader) and re-point Base Color/Normal at the found files.
+        Returns (added roles, kept roles)."""
+        th = texture_helpers.TextureHelpers
+        mat = obj.active_material or next((m for m in obj.data.materials if m), None)
         if mat is None:
             mat = bpy.data.materials.new(name=obj.name + "_MAT")
             if obj.data.materials:
-                obj.data.materials[0] = mat
+                idx = obj.active_material_index
+                obj.data.materials[idx if 0 <= idx < len(obj.data.materials) else 0] = mat
             else:
                 obj.data.materials.append(mat)
-
         mat.use_nodes = True
-        nodes  = mat.node_tree.nodes
-        links  = mat.node_tree.links
 
-        # Guarantee a Principled BSDF output
-        bsdf = nodes.get("Principled BSDF") or next(
-            (n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-        if bsdf is None:
-            bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-        out  = nodes.get("Material Output") or next(
-            (n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
-        if out and not bsdf.outputs["BSDF"].is_linked:
-            links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
-        added = []
-        x_pos = bsdf.location.x - 400
-
+        added, kept = [], []
         for role, filepath in tex_map.items():
-            suf_meta = next(
-                ((role2, lbl, cs) for suf, (role2, lbl, cs) in self._SUFFIXES.items()
-                 if role2 == role and filepath.lower().endswith(suf)),
-                (role, role.title() + " Texture", "Non-Color" if role != "diffuse" else "sRGB"),
-            )
-            _, lbl, cs = suf_meta
-
-            img = bpy.data.images.get(filepath) or bpy.data.images.load(filepath)
+            slot = self._ROLE_SLOT.get(role)
+            if slot is None:
+                continue
+            node = th._find_slot_node(mat, slot)
+            if node is not None and th._image_works(node.image):
+                kept.append(role)
+                continue
+            cs = next((c for suf, (r, _l, c) in self._SUFFIXES.items()
+                       if r == role and filepath.lower().endswith(suf)),
+                      "sRGB" if role == "diffuse" else "Non-Color")
+            if node is None:
+                node = th._ensure_texture_slot_node(mat, slot)
+            img = bpy.data.images.load(filepath, check_existing=True)
             img.colorspace_settings.name = cs
-
-            # Reuse an existing tex node for this role or create a new one
-            tex_node = next(
-                (n for n in nodes
-                 if n.type == 'TEX_IMAGE' and n.label == lbl), None)
-            if tex_node is None:
-                tex_node = nodes.new("ShaderNodeTexImage")
-                tex_node.label = lbl
-                tex_node.location = (x_pos, bsdf.location.y - added.__len__() * 280)
-            tex_node.image = img
-
-            if role == "diffuse":
-                links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
-                links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
-            elif role == "normal":
-                nmap = nodes.new("ShaderNodeNormalMap")
-                nmap.location = (x_pos + 180, tex_node.location.y)
-                links.new(tex_node.outputs["Color"], nmap.inputs["Color"])
-                links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
-            elif role in ("spec", "glow"):
-                links.new(tex_node.outputs["Color"], bsdf.inputs["Specular IOR Level"])
-
+            node.image = img
             added.append(role)
-        return added
+        return added, kept
 
     def execute(self, context):
         obj = context.active_object
@@ -2493,10 +2471,11 @@ class FO4_OT_AutoConnectArmorTextures(Operator):
             )
             return {'CANCELLED'}
 
-        added = self._setup_material(obj, tex_map)
+        added, kept = self._setup_material(obj, tex_map)
+        kept_note = f"; kept existing {', '.join(kept)}" if kept else ""
         self.report(
             {'INFO'},
-            f"Connected {len(added)} texture(s) for '{obj.name}': {', '.join(added)}"
+            f"Connected {len(added)} texture(s) for '{obj.name}': {', '.join(added) or 'none'}{kept_note}"
         )
         return {'FINISHED'}
 
@@ -2875,9 +2854,9 @@ class FO4_OT_SolidifyMesh(Operator):
 
 
 class FO4_OT_UnifyMaterialSlots(Operator):
-    """Reassign all faces to the material slot with the most loaded textures and remove duplicates.
-    Use this after joining two meshes that had different materials — it fixes the
-    half-textured / half-black result by consolidating everything onto one material."""
+    """Merge empty, untextured and duplicate material slots into the best-textured one.
+    Use this after joining meshes — it fixes the half-textured / half-black result.
+    Materials with textures of their own keep their faces and are not removed."""
     bl_idname = "fo4.unify_material_slots"
     bl_label = "Unify Material Slots"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2967,9 +2946,13 @@ class FO4_OT_SetupTextures(Operator):
                 return {'FINISHED'}
 
         try:
+            had_material = any(m for m in obj.data.materials)
             mat = texture_helpers.TextureHelpers.setup_fo4_material(obj)
-            self.report({'INFO'}, f"Created FO4 material: {mat.name}")
-            _notify(f"Material created: {mat.name}", 'INFO')
+            if had_material:
+                self.report({'INFO'}, f"Kept the existing material '{mat.name}' (nothing replaced)")
+            else:
+                self.report({'INFO'}, f"Created FO4 material: {mat.name}")
+                _notify(f"Material created: {mat.name}", 'INFO')
         except Exception as e:
             self.report({'ERROR'}, f"Failed to create material: {str(e)}")
             return {'CANCELLED'}
@@ -3013,12 +2996,19 @@ class FO4_OT_InstallTexture(Operator):
             if nvtt_helpers:
                 fmt = nvtt_helpers.NVTTHelpers.get_fo4_dds_format(self.texture_type)
                 dds_path = os.path.splitext(self.filepath)[0] + '.dds'
-                conv_ok, conv_msg = nvtt_helpers.NVTTHelpers.convert_to_dds(
-                    self.filepath, dds_path, compression_format=fmt
-                )
+                if os.path.exists(dds_path):
+                    # Never write over a .dds already there; install the picked
+                    # file as-is (export converts it into the mod, add-only).
+                    conv_ok, conv_msg = False, f"{os.path.basename(dds_path)} already exists (kept, not replaced)"
+                else:
+                    conv_ok, conv_msg = nvtt_helpers.NVTTHelpers.convert_to_dds(
+                        self.filepath, dds_path, compression_format=fmt
+                    )
                 if conv_ok:
                     install_path = dds_path
                     self.report({'INFO'}, f"Auto-converted to DDS ({fmt.upper()}): {os.path.basename(dds_path)}")
+                elif os.path.exists(dds_path):
+                    self.report({'INFO'}, f"Not converted: {conv_msg}. Installing the picked file as-is.")
                 else:
                     self.report(
                         {'WARNING'},
@@ -5114,17 +5104,15 @@ class FO4_OT_ExportCKAssetBundle(Operator):
                         # against (a correct 2K texture silently overwritten
                         # by a 512 one on re-export). This copy path went
                         # through a plain shutil.copy2 with no such check.
-                        if (_os.path.exists(dst)
-                                and _os.path.normcase(_os.path.normpath(dst)) != src_norm
-                                and nvtt_helpers
-                                and nvtt_helpers.is_texture_size_downgrade(dst, src)):
-                            warns.append(
-                                f"{obj.name}: skipped '{_os.path.basename(src)}' — the file "
-                                f"already at {dst} is higher resolution than the texture "
-                                f"currently loaded in Blender. Not overwriting it; delete "
-                                f"the existing file first if replacing it with a smaller "
-                                f"one is intentional."
-                            )
+                        # Export only adds textures: a file already at the
+                        # destination is never replaced (the size check alone
+                        # still let any same-or-larger file overwrite it).
+                        if _os.path.normcase(_os.path.normpath(dst)) == src_norm:
+                            continue
+                        _keep = bgsm_helpers.keep_existing_reason(dst, "textures", src) \
+                            if bgsm_helpers else ("kept existing file" if _os.path.exists(dst) else "")
+                        if _keep:
+                            warns.append(f"{obj.name}: {_keep}")
                             continue
                         try:
                             shutil.copy2(src, dst)
@@ -9933,16 +9921,21 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                     mat = obj.data.materials[0]
                     if mat and mat.use_nodes:
                         nodes = mat.node_tree.nodes
-                        # Look for an existing Image Texture node to replace, or add one
+                        # Fill an empty Image Texture node, or add a new
+                        # unconnected one. This used to overwrite whichever
+                        # image node came first -- often the diffuse or normal.
                         tex_node = next(
-                            (n for n in nodes if n.type == 'TEX_IMAGE'), None
+                            (n for n in nodes if n.type == 'TEX_IMAGE' and n.image is None), None
                         )
                         if tex_node is None:
                             tex_node = nodes.new('ShaderNodeTexImage')
                             tex_node.location = (-300, 300)
+                            note = "added as a new image node (not connected; existing textures kept)"
+                        else:
+                            note = f"loaded into the empty image node '{tex_node.name}'"
                         tex_node.image = img
                         self.report({'INFO'},
-                            f"Loaded texture '{filename}' and applied to material '{mat.name}'"
+                            f"Loaded texture '{filename}' into material '{mat.name}': {note}"
                         )
                     else:
                         self.report({'INFO'},
@@ -11334,7 +11327,7 @@ class FO4_OT_CombineVegetationMeshes(Operator):
     
     merge_materials: BoolProperty(
         name="Merge Materials",
-        description="Combine materials into one (better performance)",
+        description="Merge duplicate and untextured material slots (materials with their own textures are kept)",
         default=True
     )
     
@@ -11381,9 +11374,10 @@ class FO4_OT_CombineVegetationMeshes(Operator):
             success, message = mesh_helpers.MeshHelpers.optimize_mesh(combined_obj)
             
             if self.merge_materials and len(combined_obj.data.materials) > 1:
-                # Keep only the first material for better performance
-                while len(combined_obj.data.materials) > 1:
-                    combined_obj.data.materials.pop()
+                # Merge only slots that add nothing (empty, untextured or the
+                # same textures). Popping every slot but the first used to put
+                # the leaves/stems that had their own textures on the wrong one.
+                mesh_helpers.MeshHelpers.unify_material_slots(combined_obj)
             
             # Generate LOD if requested
             if self.generate_lod:
@@ -15260,14 +15254,6 @@ class FO4_OT_SetupHDMaterial(Operator):
         ),
         default=False,
     )
-    replace_existing: bpy.props.BoolProperty(
-        name="Replace Existing Material",
-        description=(
-            "If the object already has a material, replace it with a fresh "
-            "HD material.  Disable to skip objects that already have a material."
-        ),
-        default=True,
-    )
 
     @classmethod
     def poll(cls, context):
@@ -15293,7 +15279,8 @@ class FO4_OT_SetupHDMaterial(Operator):
         layout.prop(self, "emission_strength")
         layout.prop(self, "roughness")
         layout.prop(self, "use_alpha_clip")
-        layout.prop(self, "replace_existing")
+        if any(m for m in context.active_object.data.materials):
+            layout.label(text="Keeps the existing material and its textures", icon='INFO')
 
     def execute(self, context):
         obj = context.active_object
@@ -15301,21 +15288,17 @@ class FO4_OT_SetupHDMaterial(Operator):
             self.report({'ERROR'}, "No mesh object selected")
             return {'CANCELLED'}
 
-        # Skip if the object already has a material and replace_existing is off.
-        if obj.data.materials and not self.replace_existing:
-            self.report({'INFO'},
-                f"'{obj.name}' already has a material – skipped "
-                "(enable 'Replace Existing Material' to override)"
-            )
-            return {'FINISHED'}
-
-        # Build the material.
+        # A material the mesh already has is kept, with its textures; the HD
+        # settings below are added to it.  ("Replace Existing Material" used
+        # to swap it for an empty one, on by default.)
+        had_material = any(m for m in obj.data.materials)
         if texture_helpers:
-            mat = texture_helpers.TextureHelpers.setup_fo4_material(obj, force=self.replace_existing)
+            mat = texture_helpers.TextureHelpers.setup_fo4_material(obj)
+        elif had_material:
+            mat = obj.active_material or next(m for m in obj.data.materials if m)
         else:
             # Minimal fallback – create a plain Principled BSDF material.
-            mat_name = f"{obj.name}_HD_Material"
-            mat = bpy.data.materials.new(name=mat_name)
+            mat = bpy.data.materials.new(name=f"{obj.name}_HD_Material")
             mat.use_nodes = True
             if obj.data.materials:
                 obj.data.materials[0] = mat
@@ -15327,6 +15310,7 @@ class FO4_OT_SetupHDMaterial(Operator):
             return {'CANCELLED'}
 
         # ── PBR defaults ──────────────────────────────────────────────────────
+        # Only on inputs no texture drives, so nothing already wired changes.
         pbsdf = None
         for node in mat.node_tree.nodes:
             if node.type == 'BSDF_PRINCIPLED':
@@ -15335,26 +15319,29 @@ class FO4_OT_SetupHDMaterial(Operator):
 
         if pbsdf:
             rough = pbsdf.inputs.get("Roughness")
-            if rough:
+            if rough and not rough.is_linked:
                 rough.default_value = self.roughness
 
             # Emission strength (applied to the emission channel; the actual
-            # glow is only visible after installing a _g.dds image).
+            # glow is only visible after installing a _g.dds image).  An
+            # existing glow is never turned down.
             emit_str = pbsdf.inputs.get("Emission Strength")
-            if emit_str:
+            if emit_str and not emit_str.is_linked and (
+                    not had_material or self.emission_strength > emit_str.default_value):
                 emit_str.default_value = self.emission_strength
 
-            # Metallic set to 0 by default (non-metallic PBR baseline).
+            # Metallic set to 0 by default (non-metallic PBR baseline) on a new material.
             metallic = pbsdf.inputs.get("Metallic")
-            if metallic:
+            if metallic and not metallic.is_linked and not had_material:
                 metallic.default_value = 0.0
 
         # ── Alpha settings for vegetation ────────────────────────────────────
+        # Alpha Clip off leaves an existing material's cutout as it is.
         if self.use_alpha_clip:
             mat.blend_method = 'CLIP'
             mat.alpha_threshold = 0.5
             mat.use_backface_culling = False
-        else:
+        elif not had_material:
             mat.blend_method = 'OPAQUE'
             mat.use_backface_culling = True
 
@@ -15362,7 +15349,10 @@ class FO4_OT_SetupHDMaterial(Operator):
         # "glowmap" hint ensures SF1_EMIT_ENABLED + SF2_GLOW_MAP are written
         # even before the _g.dds image is loaded into the Glow node.
         try:
-            mat["fo4_shader_type"] = "glowmap" if self.emission_strength > 0.0 else "default"
+            if self.emission_strength > 0.0:
+                mat["fo4_shader_type"] = "glowmap"
+            elif not mat.get("fo4_shader_type"):
+                mat["fo4_shader_type"] = "default"
         except Exception:
             pass
 
@@ -15375,7 +15365,7 @@ class FO4_OT_SetupHDMaterial(Operator):
             " • Emission = 0 (install _g.dds then raise Emission Strength)"
         )
         msg = (
-            f"HD material created on '{obj.name}': "
+            f"HD material {'set up on existing material of' if had_material else 'created on'} '{obj.name}': "
             f"Roughness={self.roughness:.2f}."
             f"{alpha_note}"
             f"{glow_note}"

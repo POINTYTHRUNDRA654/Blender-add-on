@@ -516,25 +516,33 @@ class MaterialBrowser:
         preset = MaterialBrowser.get_preset(preset_id)
 
         try:
-            mat = MaterialBrowser._build_material(obj.name, preset, preset_id)
-
-            # Apply to the active material slot (or create one) so callers
-            # that read back via obj.active_material after apply_preset()
-            # see the material that was actually written.
-            if obj.data.materials:
-                idx = obj.active_material_index
-                if not (0 <= idx < len(obj.data.materials)):
-                    idx = 0
-                obj.data.materials[idx] = mat
-                obj.active_material_index = idx
+            existing = obj.active_material
+            if existing is not None:
+                # Add the preset to the material the mesh already has. This
+                # used to swap it for a new preset material, which removed the
+                # mesh's textures and .bgsm link.
+                mat = existing
+                MaterialBrowser._apply_to_existing(mat, preset, preset_id)
             else:
-                obj.data.materials.append(mat)
+                mat = MaterialBrowser._build_material(obj.name, preset, preset_id)
+                # Fill the active (empty) slot, or add one, so callers that
+                # read back via obj.active_material see this material.
+                if obj.data.materials:
+                    idx = obj.active_material_index
+                    if not (0 <= idx < len(obj.data.materials)):
+                        idx = 0
+                    obj.data.materials[idx] = mat
+                    obj.active_material_index = idx
+                else:
+                    obj.data.materials.append(mat)
 
             # Store preset ID as a custom property for export scripts
             obj["fo4_material_preset"] = preset_id
 
-            # Set backface culling according to preset
-            mat.use_backface_culling = not preset["two_sided"]
+            # Set backface culling according to preset (a new material only;
+            # an existing two-sided material stays two-sided)
+            if existing is None:
+                mat.use_backface_culling = not preset["two_sided"]
 
             label = preset["label"]
             return True, f"Applied material preset '{label}' to {obj.name}"
@@ -559,13 +567,50 @@ class MaterialBrowser:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _apply_to_existing(mat, preset: dict, preset_id: str) -> None:
+        """Add *preset* to an existing material without removing anything:
+        its shader hints and metadata are set, alpha cutout / two-sided are
+        switched on (never off), and Principled values only change on inputs
+        no texture drives.  Nodes are never cleared or rewired."""
+        mat.use_nodes = True
+        if preset["alpha_mode"] == "CLIP":
+            mat.blend_method = 'CLIP'
+            mat.alpha_threshold = preset["alpha_threshold"]
+        elif preset["alpha_mode"] == "BLEND" and mat.blend_method == 'OPAQUE':
+            mat.blend_method = 'BLEND'
+        if preset["two_sided"]:
+            mat.use_backface_culling = False
+
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is not None:
+            def _set(name, value):
+                sock = bsdf.inputs.get(name)
+                if sock is not None and not sock.is_linked:
+                    sock.default_value = value
+            _set('Base Color', (*preset["base_color"], 1.0))
+            _set('Roughness', preset["roughness"])
+            _set('Metallic', preset["metallic"])
+            if preset["emission_strength"] > 0:
+                _set('Emission Strength', preset["emission_strength"])
+                em_color = bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
+                if em_color is not None and not em_color.is_linked:
+                    em_color.default_value = (*preset["base_color"], 1.0)
+
+        mat["fo4_shader_type"]   = preset["fo4_shader"]
+        mat["fo4_preset_id"]     = preset_id
+        mat["fo4_texture_hint"]  = preset["texture_hint"]
+        mat["fo4_two_sided"]     = preset["two_sided"]
+
+    @staticmethod
     def _build_material(obj_name: str, preset: dict, preset_id: str):
         """Build and return a Blender material from a preset dict."""
         mat_name = f"{obj_name}_FO4_{preset_id}"
 
-        # Re-use existing material with this name if already present
-        if mat_name in bpy.data.materials:
-            bpy.data.materials.remove(bpy.data.materials[mat_name])
+        # Drop a leftover material of this name only if nothing uses it;
+        # otherwise Blender names the new one .001 and the old one stays.
+        old = bpy.data.materials.get(mat_name)
+        if old is not None and old.users == 0:
+            bpy.data.materials.remove(old)
 
         mat = bpy.data.materials.new(name=mat_name)
         mat.use_nodes = True

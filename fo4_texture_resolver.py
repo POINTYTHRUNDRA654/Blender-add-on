@@ -206,7 +206,8 @@ def _get_principled(mat):
         out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
         if out is None:
             out = nt.nodes.new('ShaderNodeOutputMaterial')
-        nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+        if not out.inputs['Surface'].is_linked:  # never unplug the material's own shader
+            nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
     return bsdf
 
 
@@ -442,10 +443,12 @@ def preferred_roots(context=None):
 # PyNifly builds every imported FO4 shape's material around its own
 # "Fallout 4 MTS" node group, with image nodes named after the NIF texture
 # slots and wired into the group's inputs.
+# PyNifly's names (shader_io.import_glowmap, "Fallout 4 MTS" in its shaders.blend):
+# the glow slot is Glow_Map_Texture -> 'Glow Map', not Glow_Texture -> 'Glow'.
 _PYN_NODE = {'diffuse': 'Diffuse_Texture', 'normal': 'Normal_Texture',
-             'specular': 'Specular_Texture', 'glow': 'Glow_Texture'}
+             'specular': 'Specular_Texture', 'glow': 'Glow_Map_Texture'}
 _PYN_INPUT = {'diffuse': 'Diffuse', 'normal': 'Normal',
-              'specular': 'Smooth Spec', 'glow': 'Glow'}
+              'specular': 'Smooth Spec', 'glow': 'Glow Map'}
 _NIF_PROP = {'diffuse': 'BSShaderTextureSet_Diffuse', 'normal': 'BSShaderTextureSet_Normal',
              'specular': 'BSShaderTextureSet_Specular', 'glow': 'BSShaderTextureSet_Glow'}
 _BGSM_ATTR = {'diffuse': 'diffuse_texture', 'normal': 'normal_texture',

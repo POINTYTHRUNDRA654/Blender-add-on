@@ -1082,6 +1082,9 @@ class FO4_OT_PipelineTextures(Operator):
                                 self.output_dir,
                                 os.path.splitext(os.path.basename(src))[0] + ".dds"
                             )
+                            if os.path.exists(dst):
+                                steps.append(f"Kept existing {os.path.basename(dst)} (not replaced)")
+                                continue
                             ok, msg = nvtt_helpers.NVTTHelpers.convert_to_dds(src, dst)
                             if ok:
                                 converted += 1

@@ -50,35 +50,24 @@ class TextureHelpers:
     def setup_fo4_material(obj, force=False):
         """Setup a Fallout 4 compatible material for the object.
 
-        If the object already carries a material with a *loaded* diffuse texture
-        (e.g. one PyNifly or Blender's FBX/OBJ/GLTF importer just built from a
-        game or mod asset), that material is returned unchanged instead of being
-        cleared and rebuilt.  This prevents imported textures from being wiped;
-        a fresh FO4 node graph is only created for untextured meshes.
+        A material the object already has is never replaced: it is returned
+        as-is, with its textures, its .bgsm link and its node graph untouched.
+        A fresh FO4 node graph is only built for a mesh with no material.
 
-        Pass *force=True* to always build a brand-new material regardless of
-        what the object already has -- used by FO4_OT_SetupHDMaterial's
-        "Replace Existing Material" checkbox, which previously had no effect
-        here: it only gated whether this function got called at all, and once
-        called, this early-return always kept the existing textured material
-        anyway, silently ignoring "replace".
+        The old check only recognised a Principled BSDF fed by a loaded image,
+        so a mesh loaded from a NIF (PyNifly's own "Fallout 4 MTS" shader, no
+        Principled BSDF) or one whose texture files weren't found got its
+        material swapped for an empty one by every caller of this function.
+
+        *force* is kept for compatibility and no longer replaces anything.
         """
         if obj.type != 'MESH':
             return None
 
-        if not force:
-            for _slot in obj.material_slots:
-                _m = _slot.material
-                if not (_m and _m.use_nodes):
-                    continue
-                for _node in _m.node_tree.nodes:
-                    if _node.type == 'BSDF_PRINCIPLED':
-                        _sock = _node.inputs.get('Base Color')
-                        if (_sock and _sock.links
-                                and _sock.links[0].from_node.type == 'TEX_IMAGE'
-                                and _sock.links[0].from_node.image is not None
-                                and _sock.links[0].from_node.image.has_data):
-                            return _m
+        existing = obj.active_material or next(
+            (m for m in obj.data.materials if m is not None), None)
+        if existing is not None:
+            return existing
 
         # Create new material
         mat_name = f"{obj.name}_FO4_Material"
@@ -256,8 +245,10 @@ class TextureHelpers:
 
         bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
         if bsdf is not None:
+            # Leave a glow that is already wired in alone.
             strength = bsdf.inputs.get('Emission Strength')
-            if strength:
+            emit_col = bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
+            if strength and not strength.is_linked and not (emit_col and emit_col.is_linked):
                 strength.default_value = 0.0
             subsurface = bsdf.inputs.get('Subsurface Weight') or bsdf.inputs.get('Subsurface')
             if subsurface:
@@ -369,19 +360,22 @@ class TextureHelpers:
         # folder got silently overwritten by a 512 one, because this copy
         # only ever checked whether source == destination, never what was
         # already there.
+        # A file already at the destination is never written over (the old
+        # check only refused a lower-resolution replacement).  The same file
+        # is simply reused; a different one stays, and the texture is used
+        # from where the user picked it.
         if os.path.exists(dest_path):
+            import filecmp
             try:
-                from . import nvtt_helpers as _nvtt_mod
-            except ImportError:
-                from .. import nvtt_helpers as _nvtt_mod
-            if _nvtt_mod.is_texture_size_downgrade(dest_path, texture_path):
-                print(
-                    f"[FO4 Add-on] Not installing '{texture_path}' over "
-                    f"'{dest_path}' -- the existing file is higher resolution. "
-                    f"Delete it first if replacing it with a smaller texture "
-                    f"is intentional."
-                )
-                return texture_path  # keep the original, don't touch dest
+                if filecmp.cmp(dest_path, texture_path, shallow=False):
+                    return dest_path
+            except OSError:
+                pass
+            print(
+                f"[FO4 Add-on] Not copying '{texture_path}' over the existing "
+                f"'{dest_path}' -- existing files are never replaced."
+            )
+            return texture_path
 
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -391,8 +385,90 @@ class TextureHelpers:
         except Exception:
             return texture_path  # copy failed -- fall back to the original path
 
+    # PyNifly (io_scene_nifly) builds a NIF material around its own FO4 shader
+    # group: image nodes named <Slot>_Texture feeding these group inputs
+    # (names checked against PyNifly's shaders.blend, "Fallout 4 MTS").
+    _PYN_SLOT = {
+        'Diffuse':  ('Diffuse_Texture',  'Diffuse'),
+        'Normal':   ('Normal_Texture',   'Normal'),
+        'Specular': ('Specular_Texture', 'Smooth Spec'),
+        'Glow':     ('Glow_Map_Texture', 'Glow Map'),
+    }
+
     @staticmethod
-    def install_texture(obj, texture_path, texture_type='DIFFUSE'):
+    def _pynifly_shader(mat):
+        """PyNifly's FO4 shader group driving *mat*'s output, or None."""
+        for n in mat.node_tree.nodes:
+            if n.type != 'OUTPUT_MATERIAL':
+                continue
+            surf = n.inputs.get('Surface')
+            if surf is not None and surf.is_linked:
+                src = surf.links[0].from_node
+                if src.type == 'GROUP' and 'Diffuse' in src.inputs \
+                        and 'Alpha Property' in src.inputs:
+                    return src
+        return None
+
+    @staticmethod
+    def _bsdf_slot_socket(bsdf, node_name):
+        """The Principled BSDF input a FO4 texture slot feeds."""
+        if node_name == 'Diffuse':
+            return bsdf.inputs.get('Base Color')
+        if node_name == 'Normal':
+            return bsdf.inputs.get('Normal')
+        if node_name == 'Specular':
+            return bsdf.inputs.get('Specular IOR Level') or bsdf.inputs.get('Specular')
+        if node_name == 'Glow':
+            return bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
+        if node_name == 'Environment':
+            return bsdf.inputs.get('Metallic')
+        return None
+
+    @staticmethod
+    def _find_slot_node(mat, node_name):
+        """The image node already serving texture slot *node_name*, or None:
+        the FO4-named node, PyNifly's node, or whichever image node already
+        feeds that slot's shader input."""
+        nodes = mat.node_tree.nodes
+        n = nodes.get(node_name)
+        if n is not None and n.type == 'TEX_IMAGE':
+            return n
+        pyn = TextureHelpers._PYN_SLOT.get(node_name)
+        if pyn:
+            n = nodes.get(pyn[0])
+            if n is not None and n.type == 'TEX_IMAGE':
+                return n
+        group = TextureHelpers._pynifly_shader(mat)
+        sock = None
+        if group is not None:
+            sock = group.inputs.get(pyn[1]) if pyn else None
+        else:
+            bsdf = next((x for x in nodes if x.type == 'BSDF_PRINCIPLED'), None)
+            if bsdf is not None:
+                sock = TextureHelpers._bsdf_slot_socket(bsdf, node_name)
+        if sock is not None and sock.is_linked:
+            src = sock.links[0].from_node
+            if src.type == 'NORMAL_MAP' and src.inputs['Color'].is_linked:
+                src = src.inputs['Color'].links[0].from_node
+            if src.type == 'TEX_IMAGE':
+                return src
+        return None
+
+    @staticmethod
+    def _image_works(img):
+        """True when *img* has pixels to show: packed, or its file exists."""
+        if img is None:
+            return False
+        try:
+            if img.packed_file is not None:
+                return True
+            fp = bpy.path.abspath(img.filepath) if img.filepath else ""
+            return bool(fp) and os.path.isfile(fp)
+        except Exception:
+            return False
+
+    @staticmethod
+    def install_texture(obj, texture_path, texture_type='DIFFUSE', replace=True):
         """Install a texture into the object's material.
 
         *texture_type* accepts both the FO4 node-name convention (``'Diffuse'``,
@@ -402,28 +478,31 @@ class TextureHelpers:
         and *texture_type* is omitted, :meth:`detect_fo4_texture_type` will
         auto-detect the type from the FO4 filename suffix.
 
-        Works on any mesh regardless of whether its material already has the
-        FO4 node layout -- if there's no material, or the target texture-slot
-        node doesn't exist yet (e.g. the mesh still has its original imported
-        material), one is created and wired to the right Principled BSDF
-        socket automatically instead of refusing to install.
+        The texture goes into the node that already serves that slot (an FO4
+        "Diffuse" node, PyNifly's "Diffuse_Texture", or whatever image already
+        feeds the shader input); a node is only added when the slot has none,
+        and it is only plugged into a shader input nothing else uses.  The
+        material, its other textures and its shader wiring are never replaced.
+
+        *replace=False* (used by automatic steps such as import) keeps a slot
+        that already shows a working texture.  The Install Texture button
+        passes True: putting the chosen file into that slot is what it is for.
         """
         if not os.path.exists(texture_path):
             return False, f"Texture file not found: {texture_path}"
 
-        # Copy the texture into the FO4 Data folder if it isn't already there.
-        # A texture loaded straight from wherever the user picked it (their
-        # Downloads folder, an artist's source-art path on a completely
-        # different machine, etc.) gets that exact absolute path baked into
-        # the NIF's shader block on export -- Fallout 4 only resolves
-        # Data\Textures\-relative paths, so an un-copied texture silently
-        # fails to load in-game (and often in NifSkope's Textured view too).
-        texture_path = TextureHelpers._ensure_texture_in_data_folder(obj, texture_path)
-
-        if not obj.data.materials:
+        mat = obj.active_material or next(
+            (m for m in obj.data.materials if m is not None), None)
+        if mat is None:
             mat = bpy.data.materials.new(name=f"{obj.name}_FO4_Material")
-            obj.data.materials.append(mat)
-        mat = obj.active_material or obj.data.materials[0]
+            if obj.data.materials:
+                # Fill the empty slot rather than adding another one.
+                idx = obj.active_material_index
+                if not (0 <= idx < len(obj.data.materials)):
+                    idx = 0
+                obj.data.materials[idx] = mat
+            else:
+                obj.data.materials.append(mat)
         mat.use_nodes = True
 
         # Auto-detect type from filename suffix if caller left it at the default
@@ -435,7 +514,6 @@ class TextureHelpers:
         # Normalise to the internal node-name key (upper-case enum).
         texture_type = texture_type.upper()
 
-        # Find the appropriate texture node
         node_name_map = {
             'DIFFUSE':     'Diffuse',
             'NORMAL':      'Normal',
@@ -450,19 +528,25 @@ class TextureHelpers:
         if not node_name:
             return False, f"Unknown texture type: {texture_type}"
 
-        # Find (or build) the texture node -- always ensure the specific
-        # slot this call was asked for exists, regardless of whatever else
-        # the material's node graph already looks like.
-        tex_node = mat.node_tree.nodes.get(node_name)
-        if not tex_node:
+        tex_node = TextureHelpers._find_slot_node(mat, node_name)
+        if tex_node is not None and not replace and TextureHelpers._image_works(tex_node.image):
+            return True, (f"Kept the existing {node_name} texture "
+                          f"({os.path.basename(tex_node.image.filepath or tex_node.image.name)})")
+
+        # Copy the texture into the FO4 Data folder if it isn't already there.
+        # A texture loaded straight from wherever the user picked it (their
+        # Downloads folder, an artist's source-art path on a completely
+        # different machine, etc.) gets that exact absolute path baked into
+        # the NIF's shader block on export -- Fallout 4 only resolves
+        # Data\Textures\-relative paths, so an un-copied texture silently
+        # fails to load in-game (and often in NifSkope's Textured view too).
+        texture_path = TextureHelpers._ensure_texture_in_data_folder(obj, texture_path)
+
+        if tex_node is None:
             tex_node = TextureHelpers._ensure_texture_slot_node(mat, node_name)
         else:
-            # The node already existed (e.g. from an earlier install) -- still
-            # re-verify/re-establish its wiring into the BSDF every time. A
-            # node that exists but sits unwired (e.g. a later FBX re-import
-            # reset Base Color back to the original broken texture, orphaning
-            # this node) would otherwise silently get a new image loaded into
-            # it while staying invisible in the viewport.
+            # Plug an existing but unplugged slot node back in -- only into an
+            # input nothing else is using.
             TextureHelpers._wire_texture_slot_node(mat, node_name, tex_node)
 
         try:
@@ -480,21 +564,37 @@ class TextureHelpers:
 
     @staticmethod
     def _ensure_texture_slot_node(mat, node_name):
-        """Create a `node_name`-named ShaderNodeTexImage on *mat* and wire it
-        into the appropriate Principled BSDF socket, for whichever FO4 slot
-        `node_name` represents. Used by :meth:`install_texture` when the
-        material doesn't already have that slot's node (e.g. it's still the
-        mesh's original imported material, never run through
-        :meth:`setup_fo4_material`)."""
+        """Add a texture node for slot *node_name* to *mat* and plug it into
+        that slot's shader input if the input is free.  Used when the material
+        has no node for the slot yet.  On a PyNifly material the node follows
+        PyNifly's naming and feeds its FO4 shader group; a Principled BSDF is
+        only added (and connected to the output) when the material has no
+        shader at all."""
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
+
+        group = TextureHelpers._pynifly_shader(mat)
+        if group is not None:
+            pyn = TextureHelpers._PYN_SLOT.get(node_name)
+            tex_node = nodes.new('ShaderNodeTexImage')
+            tex_node.name = tex_node.label = pyn[0] if pyn else node_name
+            tex_node.location = (group.location.x - 500, group.location.y - 300)
+            sock = group.inputs.get(pyn[1]) if pyn else None
+            if sock is not None and not sock.is_linked:
+                links.new(tex_node.outputs['Color'], sock)
+            uv = nodes.get('UV_Converter')
+            if uv is not None and uv.outputs.get('Vector'):
+                links.new(uv.outputs['Vector'], tex_node.inputs['Vector'])
+            return tex_node
+
         bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
         if bsdf is None:
             bsdf = nodes.new('ShaderNodeBsdfPrincipled')
             out = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
             if out is None:
                 out = nodes.new('ShaderNodeOutputMaterial')
-            links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+            if not out.inputs['Surface'].is_linked:
+                links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
 
         tex_node = nodes.new('ShaderNodeTexImage')
         tex_node.name = node_name
@@ -506,55 +606,55 @@ class TextureHelpers:
 
     @staticmethod
     def _wire_texture_slot_node(mat, node_name, tex_node):
-        """(Re-)establish the link from *tex_node* into the Principled BSDF
-        socket for whichever FO4 slot *node_name* represents. Idempotent and
-        safe to call even if the node is already correctly wired --
-        ``links.new`` simply replaces whatever was previously connected to
-        the target socket, which is exactly what's needed to recover a node
-        that got silently disconnected (e.g. a later FBX re-import resetting
-        Base Color back to the original, possibly-broken texture node).
-        """
+        """Plug *tex_node* into the Principled BSDF input for slot *node_name*
+        -- only when that input is free (or already fed by this node).  An
+        input another texture already drives is left as it is."""
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
         bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
         if bsdf is None:
             return
 
+        def _free(sock):
+            return sock is not None and not sock.is_linked
+
         if node_name == 'Diffuse':
-            links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-            alpha_input = bsdf.inputs.get('Alpha')
-            if alpha_input and not alpha_input.is_linked:
-                links.new(tex_node.outputs['Alpha'], alpha_input)
+            base = bsdf.inputs.get('Base Color')
+            if _free(base):
+                links.new(tex_node.outputs['Color'], base)
+                alpha_input = bsdf.inputs.get('Alpha')
+                if _free(alpha_input):
+                    links.new(tex_node.outputs['Alpha'], alpha_input)
         elif node_name == 'Normal':
+            normal_input = bsdf.inputs.get('Normal')
             nmap = next(
                 (n for n in nodes if n.type == 'NORMAL_MAP'
                  and n.inputs['Color'].is_linked
                  and n.inputs['Color'].links[0].from_node is tex_node),
                 None,
             )
-            if nmap is None:
+            if nmap is None and _free(normal_input):
                 nmap = nodes.new('ShaderNodeNormalMap')
                 nmap.location = (tex_node.location.x + 200, tex_node.location.y)
-            links.new(tex_node.outputs['Color'], nmap.inputs['Color'])
-            normal_input = bsdf.inputs.get('Normal')
-            if normal_input:
+                links.new(tex_node.outputs['Color'], nmap.inputs['Color'])
+            if nmap is not None and _free(normal_input):
                 links.new(nmap.outputs['Normal'], normal_input)
         elif node_name == 'Specular':
             spec_input = bsdf.inputs.get('Specular IOR Level') or bsdf.inputs.get('Specular')
-            if spec_input:
+            if _free(spec_input):
                 links.new(tex_node.outputs['Color'], spec_input)
         elif node_name == 'Glow':
             emission_input = bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
-            if emission_input:
+            if _free(emission_input):
                 links.new(tex_node.outputs['Color'], emission_input)
                 strength = bsdf.inputs.get('Emission Strength')
-                if strength:
+                if strength and not strength.is_linked and strength.default_value == 0.0:
                     strength.default_value = 1.0
         elif node_name == 'Environment':
             metallic_input = bsdf.inputs.get('Metallic')
-            if metallic_input:
+            if _free(metallic_input):
                 links.new(tex_node.outputs['Color'], metallic_input)
-    
+
     @staticmethod
     def validate_textures(obj):
         """Validate textures for Fallout 4 compatibility"""
