@@ -955,7 +955,7 @@ def install_niftools(blender_version: str = "3.6") -> tuple[bool, str]:
 # Pinned to the PyNifly release this add-on is tested against.  "latest" moved
 # to V30.x on 2026-10-27, which has not been tested with our import/export
 # code; bump this tag only after re-running the NIF round-trip tests.
-PYNIFLY_TESTED_TAG = "V27.0.0"
+PYNIFLY_TESTED_TAG = "V30.2.0"
 _PYNIFLY_LATEST_API = (
     f"https://api.github.com/repos/BadDogSkyrim/PyNifly/releases/tags/{PYNIFLY_TESTED_TAG}"
 )

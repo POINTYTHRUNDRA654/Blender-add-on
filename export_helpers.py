@@ -460,7 +460,7 @@ class ExportHelpers:
     def _build_pynifly_export_kwargs(filepath):
         """Assemble kwargs for PyNifly (by BadDog) for Fallout 4 NIF export.
 
-        Bundled version: PyNifly V27.0.0 (io_scene_nifly_V27.0.0.zip).
+        Tested version: PyNifly V30.2.0 (the option notes below were written against V27.0.0; V30.2.0 only adds export_all_bones).
         Installed automatically from bundled/ on first addon load (BadDog's permission).
 
         V27.0.0 ExportSettings defaults and our overrides:
@@ -1168,6 +1168,48 @@ class ExportHelpers:
                   "(e.g. to 4096x4096) before using this mesh in the CK.")
 
     @staticmethod
+    def _hide_siblings_from_pynifly(obj, keep):
+        """Hide everything else visible under *obj*'s top-level parent and
+        return what was hidden (see _unhide_objects).
+
+        PyNifly 30.1+ exports a selected shape's whole nif: the root and
+        everything visible under it. Single-object export means just *obj*,
+        and the siblings were not in the game-unit session either, so they
+        came out at Blender-metre size (AmmoBoxNotSkinned's lid at 0.25
+        instead of 17.73, 2026-11-03). PyNifly skips hidden objects.
+        """
+        top = obj
+        while top.parent is not None:
+            top = top.parent
+        if top is obj:
+            return []
+        keep = set(keep)
+        p = obj
+        while p is not None:
+            keep.add(p)
+            p = p.parent
+        hidden = []
+        for o in top.children_recursive:
+            if o in keep:
+                continue
+            try:
+                if o.hide_get():
+                    continue
+                o.hide_set(True)
+                hidden.append(o)
+            except RuntimeError:
+                pass  # not in this view layer
+        return hidden
+
+    @staticmethod
+    def _unhide_objects(objs):
+        for o in objs:
+            try:
+                o.hide_set(False)
+            except (ReferenceError, RuntimeError):
+                pass
+
+    @staticmethod
     def _hide_collision_from_pynifly(meshes):
         """Remove ``pynCollisionTarget`` from *meshes* for the PyNifly call.
 
@@ -1558,9 +1600,11 @@ class ExportHelpers:
                 for _sn in _stage_notes:
                     print(f"[FO4Export] new texture: {_sn}")
                 _hidden_coll = []
+                _hidden_siblings = []
                 try:
                     if exporter == "pynifly":
                         _hidden_coll = ExportHelpers._hide_collision_from_pynifly([obj])
+                        _hidden_siblings = ExportHelpers._hide_siblings_from_pynifly(obj, selection)
                         kwargs = ExportHelpers._build_pynifly_export_kwargs(filepath)
                         result = ExportHelpers._call_nif_export(
                             bpy.ops.export_scene.pynifly, kwargs,
@@ -1576,6 +1620,7 @@ class ExportHelpers:
                         exporter_label = "Niftools v0.1.1"
                 finally:
                     ExportHelpers._restore_collision_for_pynifly(_hidden_coll)
+                    ExportHelpers._unhide_objects(_hidden_siblings)
                     _unstage_new_textures(_staged)
                     ExportHelpers._restore_emissive_after_export(_emissive_restore)
 

@@ -1,6 +1,6 @@
 # Bundled Dependencies
 
-## PyNifly (io_scene_nifly) — download separately (tested with V27.0.0)
+## PyNifly (io_scene_nifly) — download separately (tested with V30.2.0)
 
 **Author:** BadDog (BadDogSkyrim)  
 **Repository:** https://github.com/BadDogSkyrim/PyNifly  

@@ -25,7 +25,7 @@ If anything here is wrong or missing, please open an issue or PR.
   own buttons; underneath, PyNifly reads and writes the NIF files, and our
   texture, material, scale and export tools are built around it. PyNifly is
   not included in our download; please get it from BadDog's releases page
-  (this release was tested with V27.0.0). Full credit and thanks to BadDog.
+  (this release was tested with V30.2.0). Full credit and thanks to BadDog.
 - **Blender** by the Blender Foundation — https://www.blender.org — GNU GPL v2+.
 
 ## Shipped inside this add-on
