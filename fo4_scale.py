@@ -50,6 +50,71 @@ def _depth(obj) -> int:
     return d
 
 
+# PyNifly shows a collision's Havok convex radius with two modifiers, both in
+# the units the object had at import (game units): a "bhkPush" geometry-nodes
+# push-out (node group "bhkPushOut_<radius>", radius in its "Radius" input)
+# and a "bhkBevel" bevel. It writes the radius back on export from
+# rigid_body.collision_margin. Left alone, a ÷70 import drew the hull 0.7 m
+# fatter on every side (a 0.78 m vine inside a 2.1 m dome, 2026-11-03), so
+# these scale with the object.
+_PUSH_GROUP_PREFIX = "bhkPushOut_"
+
+
+def _radius_state(o):
+    """What _scale_collision_radius changes on *o*, for putting back exactly."""
+    rb = getattr(o, "rigid_body", None)
+    mods = [(m, m.node_group if m.type == 'NODES' else m.width)
+            for m in getattr(o, "modifiers", [])
+            if (m.type == 'NODES' and m.node_group is not None
+                and m.node_group.name.startswith(_PUSH_GROUP_PREFIX))
+            or (m.type == 'BEVEL' and m.name.startswith("bhkBevel"))]
+    return (rb.collision_margin if rb else None), mods
+
+
+def _restore_radius_state(o, state):
+    margin, mods = state
+    if margin is not None and getattr(o, "rigid_body", None):
+        o.rigid_body.collision_margin = margin
+    for m, value in mods:
+        if m.type == 'NODES':
+            _set_push_group(m, value)
+        else:
+            m.width = value
+
+
+def _set_push_group(mod, group):
+    mod.node_group = group
+    radius = group.interface.items_tree.get("Radius")
+    if radius is not None:
+        try:
+            # Blender 5.1 keeps a per-modifier input value that overrides the
+            # group default; 5.2 dropped those, so this may not exist.
+            mod[radius.identifier] = radius.default_value
+        except Exception:
+            pass
+
+
+def _scale_collision_radius(o, f):
+    rb = getattr(o, "rigid_body", None)
+    if rb is not None:
+        rb.collision_margin = rb.collision_margin * f
+    for m, value in _radius_state(o)[1]:
+        if m.type == 'BEVEL':
+            m.width = value * f
+            continue
+        radius_item = value.interface.items_tree.get("Radius")
+        if radius_item is None:
+            continue
+        new_radius = radius_item.default_value * f
+        name = f"{_PUSH_GROUP_PREFIX}{new_radius:.4f}"
+        group = bpy.data.node_groups.get(name)
+        if group is None:
+            group = value.copy()
+            group.name = name
+            group.interface.items_tree["Radius"].default_value = new_radius
+        _set_push_group(m, group)
+
+
 def _scale_world(context, objects, factor, *, copy_data=False):
     """Scale *objects* by *factor* around the world origin, baking the scale
     into mesh/armature data so every object ends with scale (1,1,1) (empties
@@ -85,6 +150,7 @@ def _scale_world(context, objects, factor, *, copy_data=False):
             o.data.transform(Matrix.Diagonal((sca.x, sca.y, sca.z, 1.0)), shape_keys=True)
             o.data.update()
             o.matrix_world = Matrix.LocRotScale(loc, rot, (1.0, 1.0, 1.0))
+            _scale_collision_radius(o, (sca.x + sca.y + sca.z) / 3.0)
         elif o.type == 'ARMATURE' and o.data is not None:
             if copy_data:
                 swapped[o] = o.data
@@ -214,6 +280,7 @@ class GameUnitSession:
                 o.matrix_basis.copy(),
                 o.matrix_parent_inverse.copy(),
                 [pb.location.copy() for pb in o.pose.bones] if (o.type == 'ARMATURE' and o.pose) else None,
+                _radius_state(o) if o.type == 'MESH' else None,
             )
         self._swapped = _scale_world(self.context, self.objects, self.factor, copy_data=True)
         self._applied = True
@@ -238,11 +305,13 @@ class GameUnitSession:
             except Exception:
                 pass
         for o in sorted(self._saved, key=_depth):
-            basis, parent_inv, pose_locs = self._saved[o]
+            basis, parent_inv, pose_locs, radius_state = self._saved[o]
             o.matrix_parent_inverse = parent_inv
             o.matrix_basis = basis
             if pose_locs is not None and o.pose is not None:
                 for pb, loc in zip(o.pose.bones, pose_locs):
                     pb.location = loc
+            if radius_state is not None:
+                _restore_radius_state(o, radius_state)
         self.context.view_layer.update()
         self._applied = False
