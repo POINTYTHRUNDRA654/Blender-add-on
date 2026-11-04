@@ -1135,6 +1135,38 @@ class ExportHelpers:
         return None
 
     @staticmethod
+    def _hide_collision_from_pynifly(meshes):
+        """Remove ``pynCollisionTarget`` from *meshes* for the PyNifly call.
+
+        PyNifly finds collision through that property (nif/collision.py,
+        export_collisions) and packs it itself. Its compressed-mesh packer
+        asserts at 255 triangles, so a collision over that killed the whole
+        export: "pack_compressed_mesh: max 255 quads per section (got 335)",
+        a Meshy GLB with a hull-fallback custom collision, 2026-11-03. The
+        collision is attached after export by patch_native_collision_multi
+        (as a convex hull the Creation Kit can load), so PyNifly does not
+        need to see it. Only targets that patch will write are hidden.
+        Returns (mesh, target) pairs for _restore_collision_for_pynifly.
+        """
+        hidden = []
+        for m in meshes:
+            target = m.get("pynCollisionTarget")
+            if not target:
+                continue
+            if any(c.name == target for c in ExportHelpers._find_collision_meshes(m)):
+                del m["pynCollisionTarget"]
+                hidden.append((m, target))
+        return hidden
+
+    @staticmethod
+    def _restore_collision_for_pynifly(hidden):
+        for m, target in hidden:
+            try:
+                m["pynCollisionTarget"] = target
+            except ReferenceError:
+                pass
+
+    @staticmethod
     def _find_collision_meshes(obj):
         """Return ALL collision objects associated with *obj*, as a list.
 
@@ -1492,8 +1524,10 @@ class ExportHelpers:
                 _staged, _stage_notes = _stage_new_textures([obj], filepath)
                 for _sn in _stage_notes:
                     print(f"[FO4Export] new texture: {_sn}")
+                _hidden_coll = []
                 try:
                     if exporter == "pynifly":
+                        _hidden_coll = ExportHelpers._hide_collision_from_pynifly([obj])
                         kwargs = ExportHelpers._build_pynifly_export_kwargs(filepath)
                         result = ExportHelpers._call_nif_export(
                             bpy.ops.export_scene.pynifly, kwargs,
@@ -1508,6 +1542,7 @@ class ExportHelpers:
                         )
                         exporter_label = "Niftools v0.1.1"
                 finally:
+                    ExportHelpers._restore_collision_for_pynifly(_hidden_coll)
                     _unstage_new_textures(_staged)
                     ExportHelpers._restore_emissive_after_export(_emissive_restore)
 
@@ -2303,13 +2338,10 @@ class ExportHelpers:
                 added_mods_per_obj[obj.name] = added_mods
                 obj.select_set(True)
 
-                # Include the associated collision mesh(es) so they are embedded
-                # in the same NIF file rather than being left behind -- ALL
-                # pieces of a multi-convex collision, not just the first.
-                ctype = getattr(obj, 'fo4_collision_type', 'DEFAULT')
-                if ctype not in ('NONE', 'GRASS', 'MUSHROOM'):
-                    for _coll in ExportHelpers._find_collision_meshes(obj):
-                        _coll.select_set(True)
+                # Collision meshes are NOT selected: they are attached after
+                # export by patch_native_collision_multi (see
+                # _hide_collision_from_pynifly), and a selected UCX_ that
+                # PyNifly does not claim as collision exports as a visible shape.
                 # Include any weapon-mod/attachment connect points built
                 # under this object -- see _find_connect_points for why.
                 for cp in ExportHelpers._find_connect_points(obj):
@@ -2324,10 +2356,6 @@ class ExportHelpers:
             bpy.ops.object.select_all(action='DESELECT')
             for obj in meshes:
                 obj.select_set(True)
-                ctype = getattr(obj, 'fo4_collision_type', 'DEFAULT')
-                if ctype not in ('NONE', 'GRASS', 'MUSHROOM'):
-                    for _coll in ExportHelpers._find_collision_meshes(obj):
-                        _coll.select_set(True)
                 for cp in ExportHelpers._find_connect_points(obj):
                     cp.select_set(True)
 
@@ -2357,10 +2385,15 @@ class ExportHelpers:
                 try:
                     import time as _time_mod2
                     _export_start2 = _time_mod2.time()
-                    result = ExportHelpers._call_nif_export(
-                        call, kwargs,
-                        active_object=meshes[0], selected_objects=list(bpy.context.selected_objects),
-                    )
+                    _hidden_coll = (ExportHelpers._hide_collision_from_pynifly(meshes)
+                                    if exporter == "pynifly" else [])
+                    try:
+                        result = ExportHelpers._call_nif_export(
+                            call, kwargs,
+                            active_object=meshes[0], selected_objects=list(bpy.context.selected_objects),
+                        )
+                    finally:
+                        ExportHelpers._restore_collision_for_pynifly(_hidden_coll)
                     # PyNifly returns empty set() on success; only {'CANCELLED'}
                     # signals failure. But that's not proof the file was
                     # actually written (see export_mesh_to_nif's identical
