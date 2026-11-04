@@ -913,6 +913,28 @@ def _bgsm_texture_ref(path: str) -> str:
     return p
 
 
+def _pynifly_alpha_settings(mat):
+    """(alpha_test, alpha_test_ref 0-255, alpha_blend) from the PyNifly
+    "AlphaProperty" node feeding the material's shader, or None if the
+    material has none."""
+    if not getattr(mat, "use_nodes", False) or not mat.node_tree:
+        return None
+    for node in mat.node_tree.nodes:
+        sock = node.inputs.get("Alpha Property") if hasattr(node, "inputs") else None
+        if sock is None or not sock.is_linked:
+            continue
+        src = sock.links[0].from_node
+        ins = getattr(src, "inputs", {})
+        if "Alpha Test" in ins and "Alpha Threshold" in ins:
+            blend = ins.get("Alpha Blend")
+            return (
+                bool(ins["Alpha Test"].default_value),
+                max(0, min(255, int(round(ins["Alpha Threshold"].default_value)))),
+                bool(blend.default_value) if blend is not None else False,
+            )
+    return None
+
+
 def _get_image_node_path(mat, node_name: str) -> str:
     """Return the filepath of the image node for *node_name* in *mat*.
 
@@ -1093,7 +1115,20 @@ def blender_mat_to_bgsm(mat, is_lod: bool = False) -> BGSMData:
     # texture_helpers.setup_vegetation_material sets exactly 'CLIP', so
     # checking for only that value here never matched and every plant/
     # foliage BGSM silently lost its alpha cutout on export.
-    if mat.blend_method in ('CLIP', 'HASHED'):
+    pyn_alpha = _pynifly_alpha_settings(mat)
+    if pyn_alpha is not None:
+        # PyNifly-imported material: its AlphaProperty node is the real
+        # setting (and what the viewport shows). PyNifly parks
+        # mat.alpha_threshold at 1 ("not using the material's alpha
+        # threshold"), so reading that wrote alpha test ref 255 and the mesh
+        # vanished in NifSkope/CK, leaving only its outline (GSRoots01,
+        # 2026-11-03: real ref 24).
+        test, ref, blend = pyn_alpha
+        data.alpha_test = test
+        if test:
+            data.alpha_test_ref = ref
+        _set_alpha_blend_mode(data, ALPHA_BLEND_STANDARD if blend else ALPHA_BLEND_NONE)
+    elif mat.blend_method in ('CLIP', 'HASHED'):
         data.alpha_test = True
         data.alpha_test_ref = int((mat.alpha_threshold or 0.5) * 255)
         _set_alpha_blend_mode(data, ALPHA_BLEND_NONE)

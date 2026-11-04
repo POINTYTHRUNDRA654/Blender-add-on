@@ -57,6 +57,20 @@ def _texture_names(material: bpy.types.Material) -> list[str]:
     return names
 
 
+def _uses_texture_alpha(material: bpy.types.Material) -> bool:
+    """True if an image texture's Alpha output is wired into the material
+    (PyNifly's AlphaProperty node or a direct link to an Alpha input)."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return False
+    for node in material.node_tree.nodes:
+        if node.type != "TEX_IMAGE" or not getattr(node, "image", None):
+            continue
+        alpha_out = node.outputs.get("Alpha")
+        if alpha_out is not None and alpha_out.is_linked:
+            return True
+    return False
+
+
 def _set_enum_if_possible(owner, key: str, value: str) -> None:
     if not hasattr(owner, key):
         return
@@ -587,7 +601,10 @@ class FO4_OT_RunMaterialIntelligence(Operator):
 
                 tex_names = _texture_names(mat)
                 has_glow = any("_g." in n or "glow" in n for n in tex_names)
-                has_alpha = any("_d." in n or "diffuse" in n or "albedo" in n for n in tex_names)
+                # A cutout only when the material really uses its texture
+                # alpha. Every material with a "_d" texture used to count,
+                # which switched opaque meshes to alpha clip.
+                has_alpha = _uses_texture_alpha(mat)
                 metal_hint = any(x in mat.name.lower() for x in ("metal", "steel", "chrome", "weapon"))
                 if has_glow:
                     glow_tagged += 1
