@@ -405,6 +405,15 @@ _PHASE2_MODULES = list(filter(_filter, [
 # Keep a combined list for unregister()
 modules = _PHASE1_MODULES + [m for m in _PHASE2_MODULES if m not in _PHASE1_MODULES]
 
+# AI helpers register at the end of Phase 2 (see _register_phase2); the ones
+# that did are kept here so unregister() undoes them too.
+_AI_HELPER_NAMES = [
+    "hunyuan3d_helpers", "hymotion_helpers", "zoedepth_helpers",
+    "realesrgan_helpers", "rignet_helpers", "instantngp_helpers",
+    "imageto3d_helpers", "shap_e_helpers", "point_e_helpers",
+]
+_AI_REGISTERED = []
+
 
 def register():
     """Register all add-on classes and handlers"""
@@ -573,28 +582,31 @@ def register():
                 print(f"⚠ Phase 2 register {_name}: {_e}")
         print("  Phase 2 complete — all features available.")
 
-        # Auto-reimport AI helpers that returned None at startup.
-        # Those _try_import() calls run before Phase 1 adds the PyTorch custom
-        # path to sys.path, so any helper that needs torch fails silently then
-        # but succeeds now that sys.path is fully configured.
-        _AI_HELPER_NAMES = [
-            "hunyuan3d_helpers", "hymotion_helpers", "zoedepth_helpers",
-            "realesrgan_helpers", "rignet_helpers", "instantngp_helpers",
-            "imageto3d_helpers", "shap_e_helpers", "point_e_helpers",
-        ]
+        # Register the AI helpers. Ones that returned None at startup are
+        # re-imported first: those _try_import() calls run before Phase 1 adds
+        # the PyTorch custom path to sys.path, so any helper that needs torch
+        # fails silently then but succeeds now that sys.path is fully
+        # configured. The ones operators.py already imported still need their
+        # register() called -- skipping them left the Image -> Plane / Image ->
+        # 3D Mesh operators and the Shap-E / Point-E prompt properties
+        # unregistered ("unknown operator 'fo4.image_to_plane_fo4'",
+        # 2026-11-03).
         _g = globals()
         _reimported = 0
         for _ai_name in _AI_HELPER_NAMES:
-            if _g.get(_ai_name) is None:
+            _ai_mod = _g.get(_ai_name)
+            if _ai_mod is None:
                 _ai_mod = _try_import(_ai_name)
-                if _ai_mod is not None:
-                    _g[_ai_name] = _ai_mod
-                    try:
-                        if hasattr(_ai_mod, "register"):
-                            _ai_mod.register()
-                        _reimported += 1
-                    except Exception:
-                        pass
+                if _ai_mod is None:
+                    continue
+                _g[_ai_name] = _ai_mod
+                _reimported += 1
+            try:
+                if hasattr(_ai_mod, "register") and _ai_mod not in _AI_REGISTERED:
+                    _ai_mod.register()
+                    _AI_REGISTERED.append(_ai_mod)
+            except Exception as _e:
+                print(f"⚠ Phase 2 register {_ai_name}: {_e}")
         if _reimported:
             print(f"  [Phase 2] Auto-reimported {_reimported} AI helper module(s) after torch path ready")
 
@@ -761,6 +773,12 @@ def unregister():
             advisor_helpers.stop_auto_monitor()
     except Exception:
         pass
+    for module in reversed(_AI_REGISTERED):
+        try:
+            module.unregister()
+        except Exception as e:  # pragma: no cover
+            print(f"⚠ Error unregistering module {getattr(module, '__name__', module)}: {e}")
+    _AI_REGISTERED.clear()
     for module in reversed(modules):
         try:
             module.unregister()
