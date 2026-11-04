@@ -53,21 +53,13 @@ class SkeletonAlignmentWizard:
         if not hasattr(bpy.ops.import_scene, 'pynifly'):
             return False, "Skeleton import requires PyNifly — install it via the Setup & Status tab", None
         try:
-            _before = set(bpy.context.scene.objects)
-            _result = bpy.ops.import_scene.pynifly(filepath=skeleton_nif_path)
-            _new = [o for o in bpy.context.scene.objects if o not in _before]
-            if 'CANCELLED' in _result or not _new:
-                return False, (
-                    f"PyNifly did not import the skeleton (result={_result!r})"
-                ), None
-            # Scale from FO4 game units to Blender metres (÷70) and tag for export.
-            # Uses the real before/after diff above, not bpy.context.selected_objects
-            # -- a stale selection left over from before this call could otherwise
-            # get mis-scaled/renamed "FO4_Skeleton" if the import silently no-op'd.
-            # Shrunk as one arrangement (see fo4_scale) so bones, bone-parented
-            # helpers and pose offsets all land at the same 1/70.
-            from . import fo4_scale as _fs
-            _fs.shrink_imported(bpy.context, _new)
+            # Import + shrink to metres (bones, bone-parented helpers and
+            # pose offsets all land at the same 1/70): nif_import.import_nif.
+            from . import nif_import as _ni
+            _ok, _new, _msg = _ni.import_nif(
+                bpy.context, skeleton_nif_path, repair_textures=False)
+            if not _ok:
+                return False, _msg, None
             _imported = [o for o in _new if o.type in {'MESH', 'ARMATURE', 'CURVE', 'SURFACE'}]
             for _obj in _imported:
                 try:

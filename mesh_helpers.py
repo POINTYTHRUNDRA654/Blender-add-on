@@ -2606,33 +2606,16 @@ class SmartPresets:
         Returns ``(success, message)``.  On success, the newly-imported objects
         are selected and the active object is set by Blender's import operator.
         """
-        from pathlib import Path as _P
-        filename = _P(filepath).name
-        import_scene = getattr(bpy.ops, 'import_scene', None)
-
-        if import_scene is not None and hasattr(import_scene, 'pynifly'):
-            try:
-                _before = set(bpy.context.scene.objects)
-                result = bpy.ops.import_scene.pynifly(filepath=filepath)
-                _new = [o for o in bpy.context.scene.objects if o not in _before]
-                # PyNifly returns an empty set() on success (never 'FINISHED')
-                # and only ever adds 'CANCELLED' on failure -- see
-                # export_helpers.py's _call_nif_export note. Neither alone is
-                # proof anything was actually imported, so also require at
-                # least one new scene object rather than trusting the call
-                # simply didn't raise.
-                if 'CANCELLED' in result or not _new:
-                    return False, (
-                        f"PyNifly did not import anything from {filename} "
-                        f"(result={result!r})"
-                    )
-                return True, f"Imported game mesh via PyNifly: {filename}"
-            except Exception as e:
-                return False, f"PyNifly NIF import error: {e}"
-
-        return False, (
-            "PyNifly not found — install it via the Setup & Status tab and restart Blender."
-        )
+        from . import nif_import as _ni
+        ok, _new, msg = _ni.import_nif(
+            bpy.context, filepath, shrink=False, repair_textures=False)
+        if ok:
+            # Leave the imported mesh active: callers rename
+            # context.active_object right after this.
+            _mesh = next((o for o in _new if o.type == 'MESH'), _new[0])
+            _mesh.select_set(True)
+            bpy.context.view_layer.objects.active = _mesh
+        return ok, msg
 
     @staticmethod
     def auto_apply_textures_from_game_asset(nif_path: str):

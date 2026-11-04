@@ -623,44 +623,20 @@ class FO4_OT_ImportLibraryAsset(Operator):
                 self.report({'INFO'}, f"Imported OBJ: {name}")
 
             elif filetype == 'NIF':
-                if hasattr(bpy.ops, 'import_scene') and hasattr(bpy.ops.import_scene, 'pynifly'):
-                    _before_objs = set(context.scene.objects)
-                    _nif_result = bpy.ops.import_scene.pynifly(filepath=filepath)
-                    _new_objs = [o for o in context.scene.objects if o not in _before_objs]
-                    if 'CANCELLED' in _nif_result or not _new_objs:
-                        self.report(
-                            {'ERROR'},
-                            f"PyNifly did not import anything from {name} "
-                            f"(result={_nif_result!r})",
-                        )
+                from . import nif_import as _ni
+                if _ni.pynifly_available():
+                    # Import, shrink to metres and texture repair: see
+                    # nif_import.import_nif (shared by every NIF import).
+                    _ok, _new_objs, _msg = _ni.import_nif(context, filepath)
+                    if not _ok:
+                        self.report({'ERROR'}, _msg)
                         return {'CANCELLED'}
-                    # Scale imported objects from FO4 game units to Blender metres (÷70)
-                    # and tag each for the ×70 round-trip on export. Uses the real
-                    # before/after diff above, not context.selected_objects -- a
-                    # stale selection left over from before this call could
-                    # otherwise get mis-scaled if the import silently no-op'd.
-                    # Shrunk as one arrangement (see fo4_scale): the per-object
-                    # version left multi-mesh NIFs scattered and reset a mesh
-                    # to full game size whenever transform_apply failed.
-                    from . import fo4_scale as _fs
-                    _fs.shrink_imported(context, _new_objs)
                     for _obj in _new_objs:
                         try:
                             _obj["fo4_source_nif"] = filepath
                         except Exception:
                             pass
-                    # Repair any texture whose file PyNifly couldn't find,
-                    # without touching the materials it built correctly.
-                    try:
-                        from . import fo4_texture_resolver as _ftr
-                        for _obj in _new_objs:
-                            if _obj.type == 'MESH':
-                                _ok, _m = _ftr.resolve_and_apply(
-                                    _obj, filepath, extra_roots=_ftr.preferred_roots(context))
-                                print(f"[FO4Tex] {_obj.name}: {_m}")
-                    except Exception as _te:
-                        print(f"[FO4Tex] texture repair skipped: {_te}")
-                    self.report({'INFO'}, f"Imported NIF: {name}")
+                    self.report({'INFO'}, _msg)
                 else:
                     self.report(
                         {'ERROR'},

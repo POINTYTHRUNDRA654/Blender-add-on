@@ -173,8 +173,14 @@ def _apply_fo4_import_scale(context, objects=None) -> int:
         except Exception:
             pass
     fo4_scale.shrink_imported(context, candidates)
+    return _select_and_frame_imported(context, candidates)
 
-    # Select for viewport framing
+
+def _select_and_frame_imported(context, objects) -> int:
+    """Select the meshes/armatures an import added, make the first active and
+    frame the viewport on them. Returns how many were selected."""
+    _SCALABLE = {'MESH', 'ARMATURE', 'CURVE', 'SURFACE', 'META', 'FONT'}
+    imported = [o for o in objects if o.type in _SCALABLE]
     bpy.ops.object.select_all(action='DESELECT')
     for obj in imported:
         obj.select_set(True)
@@ -194,32 +200,8 @@ def _repair_imported_textures(context, objects, source_path) -> str:
     console per mesh, and anything that still couldn't be found is counted in
     the report so a pink/white mesh is never a silent surprise.
     """
-    try:
-        from . import fo4_texture_resolver as _ftr
-    except Exception as exc:
-        print(f"[FO4Tex] texture repair unavailable: {exc}")
-        return ""
-    roots = _ftr.preferred_roots(context)
-    filled = missing = 0
-    for o in objects:
-        if getattr(o, "type", None) != 'MESH':
-            continue
-        try:
-            ok, msg = _ftr.resolve_and_apply(o, source_path, extra_roots=roots)
-        except Exception as exc:
-            ok, msg = False, f"texture repair failed: {exc}"
-        print(f"[FO4Tex] {o.name}: {msg}")
-        if "filled in:" in msg:
-            filled += 1
-        if "NOT found:" in msg or not ok:
-            missing += 1
-    notes = []
-    if filled:
-        notes.append(f"textures filled in on {filled} mesh(es)")
-    if missing:
-        notes.append(f"{missing} mesh(es) have textures that could not be found "
-                     "(set your FO4 Data folder in the add-on preferences; details in the console)")
-    return (" -- " + "; ".join(notes)) if notes else ""
+    from . import nif_import
+    return nif_import.repair_imported_textures(context, objects, source_path)
 
 
 # Real-world-scale FBX/OBJ/GLB content (~1.7-1.8m human) does not natively
@@ -3523,7 +3505,8 @@ class FO4_OT_BatchImportNifs(Operator):
     filter_glob: StringProperty(default="*.nif", options={'HIDDEN'})
 
     def execute(self, context):
-        if not hasattr(bpy.ops.import_scene, 'pynifly'):
+        from . import nif_import as _ni
+        if not _ni.pynifly_available():
             self.report({'ERROR'}, "PyNifly (io_scene_nifly) is not installed/enabled")
             return {'CANCELLED'}
 
@@ -3537,7 +3520,6 @@ class FO4_OT_BatchImportNifs(Operator):
         for name in names:
             filepath = _os.path.join(self.directory, name)
             source_stem = _os.path.splitext(name)[0]
-            objs_before_this_file = set(context.scene.objects)
             # PyNifly treats a NIF import as a shape-key addition onto the
             # current ACTIVE object when that object is already a mesh
             # ("Active object is a mesh, will import as shape key if
@@ -3550,12 +3532,10 @@ class FO4_OT_BatchImportNifs(Operator):
             # than files selected. Clearing the active object (and
             # selection) before every import forces each file to always
             # land as its own new object.
-            bpy.ops.object.select_all(action='DESELECT')
-            context.view_layer.objects.active = None
+            # (nif_import.import_nif clears the active object first.)
             try:
-                result = bpy.ops.import_scene.pynifly(
-                    filepath=filepath, files=[{"name": name}], directory=self.directory)
-                if 'FINISHED' in result:
+                ok, _this_file, msg = _ni.import_nif(context, filepath)
+                if ok:
                     imported += 1
                     # Tag every mesh this one file just produced with which
                     # source NIF it came from. A single source file can
@@ -3563,20 +3543,13 @@ class FO4_OT_BatchImportNifs(Operator):
                     # BSTriShapes in one NIF) -- this tag is how the batch
                     # exporter later knows to recombine them back into ONE
                     # output NIF instead of writing one file per shape.
-                    objs_after_this_file = set(context.scene.objects)
-                    _this_file = list(objs_after_this_file - objs_before_this_file)
                     for o in _this_file:
                         if o.type == 'MESH':
                             o["fo4_source_nif"] = source_stem
                             o["fo4_source_nif_path"] = filepath
-                    # Same game-units -> metres conversion and texture repair
-                    # as a single NIF import, so batch-imported and single-
-                    # imported assets share one scale in the scene (batch
-                    # imports used to stay at full game size, ~70x bigger).
-                    _apply_fo4_import_scale(context, objects=_this_file)
-                    _repair_imported_textures(context, _this_file, filepath)
                 else:
                     failed.append(name)
+                    print(f"[FO4Import] {msg}")
             except Exception as exc:
                 failed.append(f"{name}: {exc}")
 
@@ -9840,44 +9813,16 @@ class FO4_OT_ImportFO4AssetFile(Operator):
 
         if ext == '.nif':
             # Use PyNifly (import_scene.pynifly) — Niftools is broken on Blender 4.1+
-            if hasattr(bpy.ops, 'import_scene') and hasattr(bpy.ops.import_scene, 'pynifly'):
+            from . import nif_import as _ni
+            if _ni.pynifly_available():
                 try:
-                    _before = set(context.scene.objects)
-                    _nif_result = bpy.ops.import_scene.pynifly(filepath=filepath)
-                    # Collect everything PyNifly added, regardless of selection.
-                    _new = [o for o in context.scene.objects if o not in _before]
-
-                    # bpy.ops calls don't raise when the operator declines to
-                    # run -- a bad/corrupt file, wrong context, etc. come
-                    # back as {'CANCELLED'}, never an exception. This was
-                    # the one branch of this operator's import formats that
-                    # never checked for that (the FBX/OBJ/GLB branches
-                    # above, and this exact PyNifly call in asset_library.py
-                    # and fo4_skeleton_helpers.py, already do) -- so a
-                    # silently declined NIF import here still reported
-                    # "Imported NIF: filename" as success.
-                    if 'CANCELLED' in set(_nif_result or ()) or not _new:
-                        self.report({'ERROR'},
-                            f"PyNifly did not import anything from {filename} "
-                            f"(result={_nif_result!r})")
+                    # Import, unhide, shrink to metres and texture repair all
+                    # happen in nif_import.import_nif (shared by every import).
+                    _ok, _new, _msg = _ni.import_nif(context, filepath)
+                    if not _ok:
+                        self.report({'ERROR'}, _msg)
                         return {'CANCELLED'}
-
-                    # PyNifly honours NIF visibility flags and may hide objects
-                    # (hide_viewport / hide_set) that are tagged as initially
-                    # invisible in the file.  Unhide all imported objects so the
-                    # user can see every mesh and work with the full asset.
-                    for _o in _new:
-                        try:
-                            _o.hide_set(False)
-                            _o.hide_viewport = False
-                        except Exception:
-                            pass
-
-                    n = _apply_fo4_import_scale(context, objects=_new)
-
-                    # Keep PyNifly's materials; only fill in textures whose
-                    # files are missing (see fo4_texture_resolver).
-                    _tex_note = _repair_imported_textures(context, _new, filepath)
+                    n = _select_and_frame_imported(context, _new)
 
                     # Tag every imported object so the whole asset is traceable.
                     _helpers = 0
@@ -9898,7 +9843,7 @@ class FO4_OT_ImportFO4AssetFile(Operator):
                     _mesh_names = [o.name for o in _new if o.type == 'MESH']
                     print(f"[FO4Import] {len(_mesh_names)} mesh(es): {_mesh_names}")
                     _htxt = f", {_helpers} helper node(s) kept" if _helpers else ""
-                    self.report({'INFO'}, f"Imported NIF: {filename} ({n} mesh(es) scaled to Blender metres){_htxt}{_tex_note}")
+                    self.report({'INFO'}, f"{_msg} ({n} mesh(es) scaled to Blender metres){_htxt}")
                     _notify(f"Imported {filename}", 'INFO')
                     return {'FINISHED'}
                 except Exception as e:
@@ -14494,41 +14439,15 @@ class FO4_OT_ImportModFolder(Operator):
 
                     current_collection = collection_cache[collection_key]
 
-                # Import the NIF file
-                before_objects = set(context.scene.objects)
-
-                try:
-                    _batch_nif_result = bpy.ops.import_scene.pynifly(filepath=str(nif_path))
-                except Exception as import_error:
-                    self.report({'WARNING'}, f"Failed to import {nif_path.name}: {import_error}")
+                # Import the NIF file (shrunk to metres + textures repaired
+                # by nif_import.import_nif, the same as a single import)
+                from . import nif_import as _ni
+                ok, new_objects, msg = _ni.import_nif(context, str(nif_path))
+                if not ok:
+                    self.report({'WARNING'}, msg)
                     failed_count += 1
                     continue
-
-                # Find newly imported objects
-                after_objects = set(context.scene.objects)
-                new_objects = after_objects - before_objects
-
-                # bpy.ops calls don't raise when the operator declines to
-                # run -- a bad/corrupt NIF, wrong context, etc. come back as
-                # {'CANCELLED'}, never an exception, so the try/except above
-                # never caught it. Without this check, a silently declined
-                # file here still incremented imported_count below, over-
-                # reporting the "N files imported" summary for a batch that
-                # actually skipped some files.
-                if 'CANCELLED' in set(_batch_nif_result or ()) or not new_objects:
-                    self.report({'WARNING'},
-                        f"PyNifly did not import anything from {nif_path.name} "
-                        f"(result={_batch_nif_result!r})")
-                    failed_count += 1
-                    continue
-
-                # FO4 NIFs are in Havok game units (~70/metre); the single-file
-                # importer (fo4.import_fo4_asset_file) applies the same ÷70
-                # correction via _apply_fo4_import_scale, but this batch path
-                # never did -- every mod-folder import came in ~70x too large
-                # and untagged (no fo4_unit_scale), so export-side rescaling
-                # couldn't compensate for it either.
-                _apply_fo4_import_scale(context, objects=list(new_objects))
+                _select_and_frame_imported(context, new_objects)
 
                 # Move objects to the correct collection and store original path
                 for obj in new_objects:
