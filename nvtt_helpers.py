@@ -95,6 +95,62 @@ def read_dds_dimensions(path: str) -> "tuple[int, int] | None":
         return None
 
 
+# Block-compressed formats: legacy FourCCs and DXGI BC1-BC5 (70-84), BC6H/BC7 (94-99).
+_BC_FOURCCS = {b'DXT1', b'DXT2', b'DXT3', b'DXT4', b'DXT5',
+               b'ATI1', b'ATI2', b'BC4U', b'BC4S', b'BC5U', b'BC5S'}
+
+
+def dds_block_size_problem(path: str) -> "str | None":
+    """Why the Creation Kit / game can't load the DDS at *path*, or ``None``.
+
+    Direct3D 11 refuses (E_INVALIDARG) a block-compressed texture whose width
+    or height is not a multiple of 4, and CK 1.11 then reads the missing
+    texture and crashes (CreationKit.exe+2B8C2A0, RAX 0x80070057). Seen
+    2026-11-03 on a 4096x4086 BC7/BC5 texture set; texconv reports the same
+    files with "Direct3D requires BC image to be multiple of 4".
+    """
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(148)
+    except Exception:
+        return None
+    if len(header) < 128 or header[:4] != b'DDS ':
+        return None
+    import struct as _struct
+    height, width = _struct.unpack_from('<II', header, 12)
+    fourcc = header[84:88]
+    if fourcc == b'DX10':
+        if len(header) < 148:
+            return None
+        dxgi = _struct.unpack_from('<I', header, 128)[0]
+        compressed = 70 <= dxgi <= 84 or 94 <= dxgi <= 99
+    else:
+        compressed = fourcc in _BC_FOURCCS
+    if compressed and (width % 4 or height % 4):
+        return (f"{os.path.basename(path)} is {width}x{height}: block-compressed "
+                "DDS sizes must be multiples of 4 or the Creation Kit crashes "
+                "loading it (resize to e.g. 4096x4096)")
+    return None
+
+
+def _image_dimensions(path: str) -> "tuple[int, int] | None":
+    """(width, height) of a DDS/PNG/TGA from its header, else ``None``."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.dds':
+        return read_dds_dimensions(path)
+    try:
+        import struct as _struct
+        with open(path, 'rb') as f:
+            header = f.read(24)
+        if ext == '.png' and header[:8] == b'\x89PNG\r\n\x1a\n':
+            return _struct.unpack_from('>II', header, 16)
+        if ext == '.tga' and len(header) >= 16:
+            return _struct.unpack_from('<HH', header, 12)
+    except Exception:
+        pass
+    return None
+
+
 def is_texture_size_downgrade(existing_path: str, new_path: str) -> bool:
     """True if *new_path* is a DDS strictly smaller (either dimension) than
     the DDS already sitting at *existing_path*.
@@ -417,6 +473,12 @@ class NVTTHelpers:
                 # the values as-is and still writes DXT1/DXT5/BC5/BC7_UNORM.
                 if os.path.splitext(input_path)[1].lower() not in ('.exr', '.hdr'):
                     cmd.append("-srgb")
+                # Every format here is block-compressed, so the size must be a
+                # multiple of 4 (see dds_block_size_problem); round up.
+                _dims = _image_dimensions(input_path)
+                if _dims and (_dims[0] % 4 or _dims[1] % 4):
+                    cmd += ["-w", str(-(-_dims[0] // 4) * 4),
+                            "-h", str(-(-_dims[1] // 4) * 4)]
                 cmd += ["-o", out_dir, input_path]
 
             result = subprocess.run(
@@ -433,6 +495,9 @@ class NVTTHelpers:
                     alt = os.path.splitext(output_path)[0] + '.DDS'
                     expected = alt if os.path.exists(alt) else output_path
                 if os.path.exists(expected):
+                    _size_problem = dds_block_size_problem(expected)
+                    if _size_problem:
+                        return False, f"{tool} wrote an unusable DDS: {_size_problem}"
                     file_size = os.path.getsize(expected)
                     size_kb = file_size / 1024
                     return True, f"Converted ({tool}) to DDS ({compression_format.upper()}): {expected} ({size_kb:.1f} KB)"

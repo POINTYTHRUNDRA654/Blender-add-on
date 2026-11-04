@@ -1135,6 +1135,39 @@ class ExportHelpers:
         return None
 
     @staticmethod
+    def _ck_crash_texture_note(meshes):
+        """' -- WARNING: ...' naming every DDS the meshes' materials use that
+        the Creation Kit can't load (nvtt_helpers.dds_block_size_problem), or
+        ''. The NIF itself is fine, so this warns instead of blocking; it used
+        to be only a console line from validate_textures' power-of-2 check."""
+        try:
+            from .nvtt_helpers import dds_block_size_problem, read_dds_dimensions
+        except Exception:
+            return ""
+        problems, seen = [], set()
+        for m in meshes:
+            for slot in getattr(m, "material_slots", []):
+                mat = slot.material
+                if not mat or not mat.use_nodes:
+                    continue
+                for node in mat.node_tree.nodes:
+                    img = getattr(node, "image", None) if node.type == 'TEX_IMAGE' else None
+                    if not img or not img.filepath:
+                        continue
+                    path = os.path.normpath(bpy.path.abspath(img.filepath, library=img.library))
+                    if path in seen or not path.lower().endswith('.dds'):
+                        continue
+                    seen.add(path)
+                    if dds_block_size_problem(path):
+                        w, h = read_dds_dimensions(path)
+                        problems.append(f"{os.path.basename(path)} ({w}x{h})")
+        if not problems:
+            return ""
+        return (" -- WARNING: the Creation Kit crashes loading " + ", ".join(problems)
+                + ": compressed DDS sizes must be multiples of 4. Resize them "
+                  "(e.g. to 4096x4096) before using this mesh in the CK.")
+
+    @staticmethod
     def _hide_collision_from_pynifly(meshes):
         """Remove ``pynCollisionTarget`` from *meshes* for the PyNifly call.
 
@@ -1808,7 +1841,8 @@ class ExportHelpers:
 
                     if _stage_notes:
                         _tex_note += "  [new textures: " + "; ".join(_stage_notes) + "]"
-                    return True, f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}"
+                    return True, (f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}"
+                                  f"{ExportHelpers._ck_crash_texture_note([obj])}")
 
                 # Operator returned without FINISHED — treat as failure
                 return False, f"NIF export did not complete (result={result}). Check the Blender console for details."
@@ -2536,7 +2570,8 @@ class ExportHelpers:
                             print(f"[FO4Export] Wind root patch skipped: {_le}")
                         _staged_note = ("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""
                         return True, (f"Exported {mesh_count} mesh(es) as single NIF via "
-                                      f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}{_leaf_note}{_bgsm_note}{_staged_note}")
+                                      f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}{_leaf_note}{_bgsm_note}{_staged_note}"
+                                      f"{ExportHelpers._ck_crash_texture_note(meshes)}")
                     fallback_msg = f"NIF export did not finish ({result}); falling back to FBX."
                 except Exception as e:
                     print(

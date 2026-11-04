@@ -4674,8 +4674,9 @@ class FO4_OT_ExportMesh(Operator):
                 context.scene, self.filepath, objects=multi_selected
             )
             if success:
-                self.report({'INFO'}, message)
-                _notify(message, 'INFO')
+                _level = 'WARNING' if " -- WARNING: " in message else 'INFO'
+                self.report({_level}, message)
+                _notify(message, _level)
             else:
                 self.report({'ERROR'}, message)
                 _notify(message, 'ERROR')
@@ -4705,8 +4706,11 @@ class FO4_OT_ExportMesh(Operator):
         )
 
         if success:
-            self.report({'INFO'}, message)
-            _notify(message, 'INFO')
+            # export_mesh_to_nif appends " -- WARNING: ..." for textures the
+            # Creation Kit can't load.
+            _level = 'WARNING' if " -- WARNING: " in message else 'INFO'
+            self.report({_level}, message)
+            _notify(message, _level)
         else:
             self.report({'ERROR'}, message)
             _notify(message, 'ERROR')
@@ -4868,15 +4872,16 @@ class FO4_OT_ExportMeshWithCollision(Operator):
                 self.report({'WARNING'}, message)
                 _notify(message, 'WARNING')
             else:
-                self.report({'INFO'}, message)
-                _notify(message, 'INFO')
+                _level = 'WARNING' if " -- WARNING: " in message else 'INFO'
+                self.report({_level}, message)
+                _notify(message, _level)
         else:
             self.report({'ERROR'}, message)
             _notify(message, 'ERROR')
             return {'CANCELLED'}
-        
+
         return {'FINISHED'}
-    
+
     def invoke(self, context, event):
         obj = context.active_object
         if not obj or obj.type != 'MESH':
@@ -5162,8 +5167,9 @@ class FO4_OT_ExportSceneAsNif(Operator):
             context.scene, self.filepath, objects=selected or None
         )
         if success:
-            self.report({'INFO'}, message)
-            _notify(message, 'INFO')
+            _level = 'WARNING' if " -- WARNING: " in message else 'INFO'
+            self.report({_level}, message)
+            _notify(message, _level)
         else:
             self.report({'ERROR'}, message)
             _notify(message, 'ERROR')
