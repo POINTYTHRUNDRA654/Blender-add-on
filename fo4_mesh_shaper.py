@@ -1116,6 +1116,14 @@ class FO4_OT_ShaperExportCount(Operator):
 # Panel
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _retopoflow_installed():
+    try:
+        bpy.ops.cgcookie.retopoflow.get_rna_type()
+        return True
+    except Exception:
+        return False
+
+
 class FO4_PT_MeshShaperPanel(_FO4SubPanel):
     """Hard-surface tools: bevels, booleans, normals, stashes"""
     bl_label = "Mesh Shaper (Hard Surface)"
@@ -1172,6 +1180,19 @@ class FO4_PT_MeshShaperPanel(_FO4SubPanel):
                 row.operator("fo4.shaper_stash_restore", text="", icon='LOOP_BACK').stash = name
                 row.operator("fo4.shaper_transfer_normals", text="", icon='MOD_DATA_TRANSFER').source = name
                 row.operator("fo4.shaper_stash_delete", text="", icon='TRASH').stash = name
+
+        box = layout.box()
+        box.label(text="Retopology", icon='MOD_REMESH')
+        box.operator("fo4.retopo_and_bake", text="Retopologize & Bake (automatic)", icon='AUTO')
+        if _retopoflow_installed():
+            # RetopoFlow (Orange Turbine / CG Cookie, GPL-3.0) is a separate
+            # add-on: draw a clean low-poly mesh over the selected high-poly
+            box.operator("cgcookie.retopoflow", text="Retopologize by Hand (RetopoFlow)",
+                         icon='GREASEPENCIL')
+        else:
+            box.label(text="For hand retopology, install RetopoFlow (free, GPL)", icon='INFO')
+            box.operator("wm.url_open", text="RetopoFlow releases",
+                         icon='URL').url = "https://github.com/CGCookie/retopoflow/releases"
 
         box = layout.box()
         box.label(text="Fallout 4 check", icon='CHECKMARK')
