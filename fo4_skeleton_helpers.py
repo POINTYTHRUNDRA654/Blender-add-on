@@ -127,25 +127,40 @@ class FO4_OT_ImportFO4Skeleton(bpy.types.Operator if bpy else object):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        # Search the folders the rest of the add-on uses. This used to read
+        # only prefs.fo4_skeleton_path / prefs.game_path, which do not exist
+        # in this add-on's preferences, so the button always refused with
+        # "Set the FO4 skeleton NIF path" (found 2026-11-04).
+        roots = []
         try:
-            prefs = context.preferences.addons[__package__].preferences
-            skeleton_path = getattr(prefs, 'fo4_skeleton_path', '') or getattr(prefs, 'game_path', '')
+            from . import preferences as _prefs
+            prefs = _prefs.get_preferences()
+            for attr in ('fo4_skeleton_path', 'game_path'):
+                roots.append(getattr(prefs, attr, '') if prefs else '')
+            roots.append(_prefs.get_fo4_assets_path() or '')
+            roots.append(getattr(prefs, 'fo4_game_data_path', '') if prefs else '')
         except Exception:
-            skeleton_path = ''
+            pass
+        try:
+            from . import fo4_game_assets as _ga
+            data_dir = _ga.FO4GameAssets.get_data_dir()
+            if data_dir:
+                roots.append(str(data_dir))
+        except Exception:
+            pass
 
-        if not skeleton_path:
-            self.report({'ERROR'}, "Set the FO4 skeleton NIF path in addon preferences first")
-            return {'CANCELLED'}
-
-        # Try common locations
-        candidates = [
-            skeleton_path,
-            os.path.join(skeleton_path, 'meshes', 'actors', 'character', 'characterassets', 'skeleton.nif'),
-            os.path.join(skeleton_path, 'Data', 'meshes', 'actors', 'character', 'characterassets', 'skeleton.nif'),
-        ]
-        nif_path = next((p for p in candidates if os.path.exists(p)), None)
+        candidates = []
+        for root in [r for r in roots if r]:
+            candidates += [
+                root,
+                os.path.join(root, 'meshes', 'actors', 'character', 'characterassets', 'skeleton.nif'),
+                os.path.join(root, 'Data', 'meshes', 'actors', 'character', 'characterassets', 'skeleton.nif'),
+            ]
+        nif_path = next((p for p in candidates if p.lower().endswith('.nif') and os.path.isfile(p)), None)
         if not nif_path:
-            self.report({'ERROR'}, f"skeleton.nif not found. Checked: {candidates}")
+            self.report({'ERROR'}, "skeleton.nif not found. Set the FO4 Data folder (an unpacked "
+                                   "game with Meshes\\Actors\\Character\\CharacterAssets\\skeleton.nif) "
+                                   "in the add-on preferences.")
             return {'CANCELLED'}
 
         ok, msg, arm = SkeletonAlignmentWizard.import_fo4_skeleton(nif_path)

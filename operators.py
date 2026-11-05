@@ -10103,17 +10103,24 @@ class FO4_OT_PrepareThirdPartyMesh(Operator):
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
                 bpy.ops.object.mode_set(mode='EDIT')
-                # Merge near vertices first (catches duplicate-vert open edges)
-                bpy.ops.mesh.select_all(action='SELECT')
                 try:
-                    bpy.ops.mesh.merge_by_distance(threshold=0.0001)
-                except AttributeError:
-                    bpy.ops.mesh.remove_doubles(threshold=0.0001)
-                # Fill remaining holes
-                bpy.ops.mesh.select_all(action='DESELECT')
-                bpy.ops.mesh.select_non_manifold()
-                bpy.ops.mesh.fill_holes(sides=4)
-                bpy.ops.object.mode_set(mode='OBJECT')
+                    # select_non_manifold() refuses to run in face select
+                    # mode ("Must be in vertex or edge selection mode"),
+                    # which used to crash this button and leave the mesh in
+                    # Edit Mode.
+                    bpy.ops.mesh.select_mode(type='EDGE')
+                    # Merge near vertices first (catches duplicate-vert open edges)
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    if _op_exists("mesh.merge_by_distance"):
+                        bpy.ops.mesh.merge_by_distance(threshold=0.0001)
+                    else:
+                        bpy.ops.mesh.remove_doubles(threshold=0.0001)
+                    # Fill remaining holes
+                    bpy.ops.mesh.select_all(action='DESELECT')
+                    bpy.ops.mesh.select_non_manifold()
+                    bpy.ops.mesh.fill_holes(sides=4)
+                finally:
+                    bpy.ops.object.mode_set(mode='OBJECT')
 
                 bm_post = _bmesh.new()
                 bm_post.from_mesh(obj.data)
