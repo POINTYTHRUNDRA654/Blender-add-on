@@ -629,9 +629,15 @@ def register():
         _phase2_ran[0] = True
         _register_phase2()
 
+    # persistent=True on this timer and the handler below: Blender drops
+    # non-persistent timers and handlers when it opens a .blend, and opening
+    # one at start-up (double-clicking a file, or a recent file) did exactly
+    # that before either fired, so Phase 2 never ran -- no content panels, no
+    # Image -> Plane / Image -> 3D Mesh (Billy's Blender 5.1, 2026-11-04;
+    # reproduced headless with wm.open_mainfile right after register).
     try:
         if not bpy.app.timers.is_registered(_register_phase2):
-            bpy.app.timers.register(_register_phase2_once, first_interval=3.0)
+            bpy.app.timers.register(_register_phase2_once, first_interval=3.0, persistent=True)
     except Exception:
         _register_phase2_once()  # fallback: run immediately if timers unavailable
 
@@ -641,6 +647,7 @@ def register():
     # is a completely independent mechanism from bpy.app.timers, so this
     # still gets Phase 2 registered even in the environments where timers
     # are unreliable.  It removes itself after the first firing either way.
+    @bpy.app.handlers.persistent
     def _phase2_depsgraph_fallback(_scene, _depsgraph):
         try:
             if not _phase2_ran[0]:
@@ -660,7 +667,9 @@ def register():
     # ── Steps 3-5: deferred startup tasks (tool discovery, downloads, etc.) ──────
     try:
         if not bpy.app.timers.is_registered(_deferred_startup):
-            bpy.app.timers.register(_deferred_startup, first_interval=5.0)
+            # persistent: see the Phase 2 timer above (opening a .blend
+            # at start-up dropped it before it fired).
+            bpy.app.timers.register(_deferred_startup, first_interval=5.0, persistent=True)
     except Exception as e:
         _deferred_startup()
         print(f"Timers unavailable, startup tasks ran synchronously: {e}")
