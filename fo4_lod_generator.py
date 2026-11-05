@@ -345,6 +345,44 @@ def _average_color(img):
         return (0.25, 0.25, 0.25, 1.0)
 
 
+def base_color_image(mat):
+    """The colour image of *mat*: whatever image feeds the shader's base
+    colour (Principled "Base Color", or the FO4 node group's "Diffuse"),
+    else an image node named like a colour map. Imports differ: PyNifly
+    names its node "Diffuse_Texture", Blender's glTF importer labels it
+    "BASE COLOR" -- matching only "diffuse" baked a glTF mesh white
+    (2026-11-05)."""
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return None
+    nt = mat.node_tree
+
+    def upstream_image(sock, depth=0):
+        for link in sock.links:
+            node = link.from_node
+            if node.type == 'TEX_IMAGE' and node.image:
+                return node.image
+            if depth < 6:
+                for inp in node.inputs:
+                    img = upstream_image(inp, depth + 1)
+                    if img:
+                        return img
+        return None
+
+    for node in nt.nodes:
+        for name in ("Base Color", "Diffuse", "Color"):
+            sock = node.inputs.get(name) if node.type in ('BSDF_PRINCIPLED', 'GROUP', 'BSDF_DIFFUSE') else None
+            if sock is not None and sock.is_linked:
+                img = upstream_image(sock)
+                if img:
+                    return img
+    for node in nt.nodes:
+        if node.type == 'TEX_IMAGE' and node.image:
+            key = (node.label + " " + node.name + " " + node.image.name).lower()
+            if any(k in key for k in ("diffuse", "base color", "basecolor", "albedo", "_d.", "_d ")):
+                return node.image
+    return None
+
+
 def bake_lod_textures(source_obj, lod_obj, tex_size: int, textures_root: str,
                       rel_dir: str, base: str) -> "tuple[dict, list]":
     """Bake *source_obj*'s diffuse colour and surface shape onto *lod_obj*'s
@@ -365,12 +403,7 @@ def bake_lod_textures(source_obj, lod_obj, tex_size: int, textures_root: str,
     out_dir = _os.path.join(textures_root, "LOD", *[p for p in rel_dir.split("\\") if p])
     _os.makedirs(out_dir, exist_ok=True)
 
-    def _diffuse_of(mat):
-        if mat and mat.use_nodes:
-            for n in mat.node_tree.nodes:
-                if n.type == 'TEX_IMAGE' and n.image and "diffuse" in (n.label or n.name).lower():
-                    return n.image
-        return None
+    _diffuse_of = base_color_image
 
     # Bake through plain stand-in materials: the imported FO4 node group
     # bakes solid black in Cycles (seen 2026-11-02 on GSMutatedHouse01).

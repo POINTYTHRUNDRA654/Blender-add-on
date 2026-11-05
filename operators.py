@@ -11418,6 +11418,11 @@ class FO4_OT_RetopologizeAndBake(Operator):
                     "active object",
         default=True,
     )
+    unwrap_style: EnumProperty(
+        name="Unwrap", default='ORGANIC',
+        items=[('ORGANIC', "Fewest Islands", "As few and as big UV islands as possible (organic shapes)"),
+               ('HARD_SURFACE', "Hard Surface", "Seams along hard edges (weapons, props, buildings)")],
+    )
     target_faces: IntProperty(
         name="Target Quad Faces",
         description="Approximate face count for the retopologized mesh",
@@ -11617,7 +11622,7 @@ class FO4_OT_RetopologizeAndBake(Operator):
                 try:
                     with context.temp_override(active_object=joined, object=joined,
                                                selected_objects=[joined]):
-                        bpy.ops.fo4.uvkit_auto_unwrap('EXEC_DEFAULT', apply_scale=False)
+                        bpy.ops.fo4.uvkit_auto_unwrap('EXEC_DEFAULT', apply_scale=False, style=self.unwrap_style)
                     _unwrapped = True
                 except Exception as _uw_err:
                     print(f"[FO4 Retopo] Auto Unwrap failed, using Smart UV Project: {_uw_err}")
@@ -11698,11 +11703,11 @@ class FO4_OT_RetopologizeAndBake(Operator):
             for hp in highpolys:
                 for slot in hp.material_slots:
                     _hp_saved.append((slot, slot.material))
-                    _img = None
-                    if slot.material and slot.material.use_nodes:
-                        _img = next((n.image for n in slot.material.node_tree.nodes
-                                     if n.type == 'TEX_IMAGE' and n.image
-                                     and "diffuse" in (n.label or n.name).lower()), None)
+                    try:
+                        from . import fo4_lod_generator as _lodg_img
+                        _img = _lodg_img.base_color_image(slot.material)
+                    except Exception:
+                        _img = None
                     _src_diffuse = _src_diffuse or _img
                     _sm = bpy.data.materials.new("FO4_RetopoBakeSource")
                     _sm.use_nodes = True
