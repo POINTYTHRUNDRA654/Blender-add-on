@@ -579,7 +579,7 @@ def _cheapest_path(isl, sources, targets):
     return []
 
 
-def _cut_graph_seams(bm):
+def _cut_graph_seams(bm, only=None):
     """Seam every island just enough to lie flat as ONE piece, however many
     holes and handles (loops) it has: a spanning tree is grown across the
     faces, keeping long and visible edges uncut; the edges it does not cross
@@ -588,6 +588,8 @@ def _cut_graph_seams(bm):
     with no handles get a hidden slit. Returns the number of seams added."""
     added = 0
     for isl in _face_islands(bm):
+        if only is not None and not all(f in only for f in isl):
+            continue
         fset = set(isl)
         inner = list({e for f in isl for e in f.edges
                       if not e.seam and len(e.link_faces) == 2
@@ -632,6 +634,8 @@ def _cut_graph_seams(bm):
             e.seam = True
             added += 1
     for isl in _face_islands(bm):
+        if only is not None and not all(f in only for f in isl):
+            continue
         if not _boundary_loops(isl):
             verts = {v for f in isl for v in f.verts}
             low = min(verts, key=lambda v: v.co.z)
@@ -1208,6 +1212,12 @@ class FO4_OT_UVKitDrape(Operator):
         seams = 0
         for e in bm.edges:
             if len(e.link_faces) == 2:
+                # touched-up faces are unwrapped on their own: a front/back
+                # seam inside them (sideways faces flip sides constantly)
+                # chopped them into hundreds of tiny islands (a flower,
+                # 2026-11-05), so this seam only goes between sheet faces
+                if problems and any(f in problems for f in e.link_faces):
+                    continue
                 s1, s2 = (((rot @ f.normal)[a] >= 0.0) == (primary > 0) for f in e.link_faces)
                 if s1 != s2 and not e.seam:
                     e.seam = True
@@ -1217,6 +1227,7 @@ class FO4_OT_UVKitDrape(Operator):
                 if len(e.link_faces) == 2 and ((e.link_faces[0] in problems) != (e.link_faces[1] in problems)):
                     e.seam = True
                     seams += 1
+            seams += _cut_graph_seams(bm, only=problems)
             for f in bm.faces:
                 f.select = f in problems
         bm.to_mesh(obj.data)
