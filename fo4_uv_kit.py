@@ -1241,6 +1241,15 @@ class FO4_OT_UVKitDrape(Operator):
             ebm = bmesh.from_edit_mesh(obj.data)
             euv = ebm.loops.layers.uv.active
             pf = [f for f in ebm.faces if f.select]
+            squashed = 0
+            for f in pf:
+                co = [l[euv].uv for l in f.loops]
+                squashed += sum(abs((co[i] - co[0]).x * (co[i + 1] - co[0]).y - (co[i] - co[0]).y * (co[i + 1] - co[0]).x)
+                                for i in range(1, len(co) - 1)) < 1e-12
+            if squashed:
+                touch += (f". {squashed:,} touched-up faces could not be unwrapped (squashed flat): the mesh is "
+                          "broken there (open, overlapping pieces). Rebuild it first (Retopologize & Bake), "
+                          "or Drape without Touch Up")
             good = [f for f in ebm.faces if not f.select]
             a3g, auvg = _areas(good, euv, obj.matrix_world)
             a3p, auvp = _areas(pf, euv, obj.matrix_world)
@@ -1261,7 +1270,8 @@ class FO4_OT_UVKitDrape(Operator):
                 f"{_DRAPE_AXES[r[1]][3]} {r[4] * 100:.0f}% shared / {r[3] * 100:.0f}% steep"
                 for r in sorted(results, key=lambda r: r[0]))
         tex_warn = _texture_warning(obj)
-        self.report({'WARNING'} if overlap > 0.15 or (steep > 0.4 and not problems) or tex_warn else {'INFO'},
+        self.report({'WARNING'} if overlap > 0.15 or (steep > 0.4 and not problems) or tex_warn
+                    or "squashed" in touch else {'INFO'},
                     f"Drape Unwrap ({_DRAPE_AXES[ax][3]}): 2 islands, {seams} seam edges | "
                     f"{overlap * 100:.0f}% of the used texture is shared by parts behind each other | "
                     f"{steep * 100:.0f}% of the surface faces sideways{' (touched up)' if problems else ' and will stretch'}"
