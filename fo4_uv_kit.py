@@ -939,9 +939,10 @@ _DRAPE_AXES = {
 }
 
 
-def _drape_layout(bm, mw, axis, margin):
-    """UVs for a two-sheet drape along *axis*: (per-loop UVs, steep share,
-    triangles in UV space)."""
+def _drape_layout(bm, mw, axis, margin, v_lo=0.0, v_hi=1.0, skip=None):
+    """UVs for a two-sheet drape along *axis* inside the band v_lo..v_hi:
+    (per-loop UVs, steep share, triangles in UV space). Faces in *skip* get
+    no drape UVs (they are unwrapped separately)."""
     a, (iu, iv), primary, _ = _DRAPE_AXES[axis]
     rot = mw.to_3x3().normalized()
     co = {v: mw @ v.co for v in bm.verts}
@@ -968,12 +969,82 @@ def _drape_layout(bm, mw, axis, margin):
             if not front:
                 u = width - u          # mirrored: seen from the other side
             uv = ((margin + u * half) if front else (0.5 + 0.5 * margin + u * half),
-                  margin + v * (1.0 - 2 * margin))
-            out[l] = uv
+                  v_lo + margin + v * (v_hi - v_lo - 2 * margin))
+            if skip is None or f not in skip:
+                out[l] = uv
             pts.append(uv)
-        for i in range(1, len(pts) - 1):
-            tris.append((pts[0], pts[i], pts[i + 1]))
+        if skip is None or f not in skip:
+            for i in range(1, len(pts) - 1):
+                tris.append((pts[0], pts[i], pts[i + 1]))
     return out, (steep / total if total else 0.0), tris
+
+
+def _drape_problem_faces(bm, mw, axis, steep_limit=0.5):
+    """Faces a drape along *axis* handles badly: turned sideways (they
+    streak) or hidden behind other geometry from their own sheet's side
+    (they would share texture). Returns (sideways set, hidden set)."""
+    from mathutils.bvhtree import BVHTree
+    a, _, primary, _ = _DRAPE_AXES[axis]
+    rot = mw.to_3x3().normalized()
+    wbm = bm.copy()
+    wbm.transform(mw)
+    bvh = BVHTree.FromBMesh(wbm)
+    wbm.free()
+    bm.verts.ensure_lookup_table()
+    size = max((mw @ v.co - mw @ bm.verts[0].co).length for v in bm.verts[:200]) or 1.0
+    eps = size * 1e-4
+    side, hidden = set(), set()
+    for f in bm.faces:
+        n = rot @ f.normal
+        if abs(n[a]) < steep_limit:
+            side.add(f)
+            continue
+        d = [0.0, 0.0, 0.0]
+        d[a] = 1.0 if n[a] >= 0 else -1.0       # toward this face's own viewer
+        from mathutils import Vector
+        dv = Vector(d)
+        c = mw @ f.calc_center_median()
+        hit = bvh.ray_cast(c + dv * eps, dv)
+        if hit[0] is not None:
+            hidden.add(f)
+    return side, hidden
+
+
+def _shelf_pack(islands, box, target_scale, margin):
+    """Place UV islands (lists of loops with UVs at any position) side by
+    side in rows inside *box* (u0, v0, u1, v1), at *target_scale* or smaller
+    if they do not fit. Returns the scale used."""
+    u0, v0, u1, v1 = box
+    info = []
+    for isl in islands:
+        us = [l.uv.x for l in isl]; vs = [l.uv.y for l in isl]
+        info.append((isl, min(us), min(vs), max(us) - min(us), max(vs) - min(vs)))
+    info.sort(key=lambda r: -r[4])
+    scale = target_scale
+    for _ in range(40):
+        x, y, row_h, ok = u0, v0, 0.0, True
+        for _isl, _a, _b, w, h in info:
+            w, h = w * scale, h * scale
+            if x + w > u1 and x > u0:
+                x, y, row_h = u0, y + row_h + margin, 0.0
+            if y + h > v1 or w > u1 - u0:
+                ok = False
+                break
+            x += w + margin
+            row_h = max(row_h, h)
+        if ok:
+            break
+        scale *= 0.85
+    x, y, row_h = u0, v0, 0.0
+    for isl, mu, mv, w, h in info:
+        sw, sh = w * scale, h * scale
+        if x + sw > u1 and x > u0:
+            x, y, row_h = u0, y + row_h + margin, 0.0
+        for l in isl:
+            l.uv = (x + (l.uv.x - mu) * scale, y + (l.uv.y - mv) * scale)
+        x += sw + margin
+        row_h = max(row_h, sh)
+    return scale
 
 
 class FO4_OT_UVKitDrape(Operator):
@@ -994,6 +1065,15 @@ class FO4_OT_UVKitDrape(Operator):
         ('X', "Right / Left", "For tall meshes seen mostly from the side"),
     ])
     margin_px: IntProperty(name="Margin (px)", default=16, min=0, max=128)
+    fix_problems: bpy.props.BoolProperty(
+        name="Touch Up Problem Areas", default=True,
+        description="Take faces that would streak (turned sideways) or share texture (hidden "
+                    "behind other parts) out of the two sheets and unwrap them on their own "
+                    "in a strip along the bottom of the texture")
+    min_region: IntProperty(
+        name="Smallest Touch-Up", default=40, min=1, max=10000,
+        description="Only touch up problem areas of at least this many connected faces; smaller "
+                    "spots stay in the sheets (avoids hundreds of tiny islands)")
 
     @classmethod
     def poll(cls, context):
@@ -1024,6 +1104,42 @@ class FO4_OT_UVKitDrape(Operator):
             overlap = _raster_overlap(tris, res=384 if len(axes) > 1 else 512)
             results.append((overlap + steep, ax, layout_uv, steep, overlap))
         _, ax, layout_uv, steep, overlap = min(results, key=lambda r: r[0])
+        problems, touch = set(), ""
+        if self.fix_problems:
+            side, hidden = _drape_problem_faces(bm, obj.matrix_world, ax)
+            problems = side | hidden
+            # only pull out problem regions big enough to paint: scattered
+            # single faces become thousands of one-triangle islands (an AI
+            # vine tangle, 2026-11-05), so small regions stay in the sheets
+            kept, seen = set(), set()
+            for f in problems:
+                if f in seen:
+                    continue
+                region, stack = [], [f]
+                seen.add(f)
+                while stack:
+                    g = stack.pop()
+                    region.append(g)
+                    for e in g.edges:
+                        for h in e.link_faces:
+                            if h in problems and h not in seen:
+                                seen.add(h)
+                                stack.append(h)
+                if len(region) >= self.min_region:
+                    kept.update(region)
+            side &= kept
+            hidden &= kept
+            problems = kept
+            area_all = sum(f.calc_area() for f in bm.faces) or 1.0
+            share = sum(f.calc_area() for f in problems) / area_all
+            # share the texture by surface area, so the touched-up parts end
+            # up as sharp as the sheets (a tangle can be mostly touch-ups)
+            strip = min(0.85, max(0.12, share))
+            layout_uv, _s, tris = _drape_layout(bm, obj.matrix_world, ax, m, v_lo=strip, v_hi=1.0,
+                                                skip=problems)
+            overlap = _raster_overlap(tris, res=512)
+            touch = (f" | touched up {len(problems)} faces ({len(side)} sideways, {len(hidden)} hidden; "
+                     f"{share * 100:.0f}% of the surface) into the bottom {strip * 100:.0f}% of the texture")
         for l, val in layout_uv.items():
             l[uv].uv = val
         a = _DRAPE_AXES[ax][0]
@@ -1036,9 +1152,36 @@ class FO4_OT_UVKitDrape(Operator):
                 if s1 != s2 and not e.seam:
                     e.seam = True
                     seams += 1
+        if problems:
+            for e in bm.edges:
+                if len(e.link_faces) == 2 and ((e.link_faces[0] in problems) != (e.link_faces[1] in problems)):
+                    e.seam = True
+                    seams += 1
+            for f in bm.faces:
+                f.select = f in problems
         bm.to_mesh(obj.data)
         bm.free()
         obj.data.update()
+        if problems:
+            # unwrap only the problem faces, then fit them into the strip at
+            # the same sharpness as the sheets
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.0)
+            ebm = bmesh.from_edit_mesh(obj.data)
+            euv = ebm.loops.layers.uv.active
+            pf = [f for f in ebm.faces if f.select]
+            good = [f for f in ebm.faces if not f.select]
+            a3g, auvg = _areas(good, euv, obj.matrix_world)
+            a3p, auvp = _areas(pf, euv, obj.matrix_world)
+            target = math.sqrt((auvg / a3g) / (auvp / a3p)) if a3g and a3p and auvp else 1.0
+            isl_loops = [[l[euv] for f in isl for l in f.loops] for isl in uv_islands(ebm, pf, euv)]
+            used = _shelf_pack(isl_loops, (m, m, 1.0 - m, strip - m), target, m)
+            for f in ebm.faces:
+                f.select = False
+            bmesh.update_edit_mesh(obj.data)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            if used < target * 0.99:
+                touch += f" (packed at {used / target * 100:.0f}% of the sheets' sharpness to fit)"
         if was_edit:
             bpy.ops.object.mode_set(mode='EDIT')
         tried = ""
@@ -1046,10 +1189,11 @@ class FO4_OT_UVKitDrape(Operator):
             tried = " | tried: " + ", ".join(
                 f"{_DRAPE_AXES[r[1]][3]} {r[4] * 100:.0f}% shared / {r[3] * 100:.0f}% steep"
                 for r in sorted(results, key=lambda r: r[0]))
-        self.report({'WARNING'} if overlap > 0.15 or steep > 0.4 else {'INFO'},
+        self.report({'WARNING'} if overlap > 0.15 or (steep > 0.4 and not problems) else {'INFO'},
                     f"Drape Unwrap ({_DRAPE_AXES[ax][3]}): 2 islands, {seams} seam edges | "
                     f"{overlap * 100:.0f}% of the used texture is shared by parts behind each other | "
-                    f"{steep * 100:.0f}% of the surface faces sideways and will stretch{tried}")
+                    f"{steep * 100:.0f}% of the surface faces sideways{' (touched up)' if problems else ' and will stretch'}"
+                    f"{touch}{tried}")
         return {'FINISHED'}
 
 
