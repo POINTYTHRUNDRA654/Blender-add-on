@@ -931,16 +931,68 @@ def _raster_overlap(tris_uv, res=512):
     return float((count > 1).sum()) / covered if covered else 0.0
 
 
+_DRAPE_AXES = {
+    # axis: (index, (u index, v index), the side seen unmirrored, label)
+    'Z': (2, (0, 1), +1, "top / bottom"),
+    'Y': (1, (0, 2), -1, "front / back"),
+    'X': (0, (1, 2), +1, "right / left"),
+}
+
+
+def _drape_layout(bm, mw, axis, margin):
+    """UVs for a two-sheet drape along *axis*: (per-loop UVs, steep share,
+    triangles in UV space)."""
+    a, (iu, iv), primary, _ = _DRAPE_AXES[axis]
+    rot = mw.to_3x3().normalized()
+    co = {v: mw @ v.co for v in bm.verts}
+    us = [p[iu] for p in co.values()]
+    vs = [p[iv] for p in co.values()]
+    u0, v0 = min(us), min(vs)
+    span = max(max(us) - u0, max(vs) - v0) or 1.0
+    width = (max(us) - u0) / span
+    half = 0.5 - 1.5 * margin
+    steep = total = 0.0
+    out, tris = {}, []
+    for f in bm.faces:
+        n = rot @ f.normal
+        front = (n[a] >= 0.0) == (primary > 0)
+        area = f.calc_area()
+        total += area
+        if abs(n[a]) < 0.5:
+            steep += area
+        pts = []
+        for l in f.loops:
+            p = co[l.vert]
+            u = (p[iu] - u0) / span
+            v = (p[iv] - v0) / span
+            if not front:
+                u = width - u          # mirrored: seen from the other side
+            uv = ((margin + u * half) if front else (0.5 + 0.5 * margin + u * half),
+                  margin + v * (1.0 - 2 * margin))
+            out[l] = uv
+            pts.append(uv)
+        for i in range(1, len(pts) - 1):
+            tris.append((pts[0], pts[i], pts[i + 1]))
+    return out, (steep / total if total else 0.0), tris
+
+
 class FO4_OT_UVKitDrape(Operator):
-    """Give the mesh two big UV islands, as if a sheet were draped over its top
-    and another under its bottom: faces pointing up take their UVs straight
-    from above, faces pointing down from below. Best for flat-lying meshes
-    (roots, debris, rubble). Where parts lie on top of each other they share
-    texture, and steep sides stretch; the report says how much"""
+    """Give the mesh two big UV islands, as if one sheet were draped over one
+    side and another over the opposite side: top / bottom, front / back or
+    right / left. Works on any mesh, even a broken one, because nothing is
+    flattened. Where parts lie behind each other they share texture, and
+    surfaces facing sideways stretch; the report says how much. Auto tries
+    all three directions and keeps the one with the least of both"""
     bl_idname = "fo4.uvkit_drape"
     bl_label = "Drape Unwrap"
     bl_options = {'REGISTER', 'UNDO'}
 
+    axis: EnumProperty(name="Sheets", default='AUTO', items=[
+        ('AUTO', "Auto", "Try all three and keep the one with the least shared texture and stretch"),
+        ('Z', "Top / Bottom", "For flat-lying meshes (roots, rugs, rubble)"),
+        ('Y', "Front / Back", "For tall meshes seen mostly from the front"),
+        ('X', "Right / Left", "For tall meshes seen mostly from the side"),
+    ])
     margin_px: IntProperty(name="Margin (px)", default=16, min=0, max=128)
 
     @classmethod
@@ -960,57 +1012,44 @@ class FO4_OT_UVKitDrape(Operator):
             pass
         if not obj.data.uv_layers:
             obj.data.uv_layers.new(name="UVMap")
-        mw = obj.matrix_world
-        rot = mw.to_3x3().normalized()
         bm = bmesh.new()
         bm.from_mesh(obj.data)
         uv = bm.loops.layers.uv.verify()
-        co = {v: mw @ v.co for v in bm.verts}
-        xs = [p.x for p in co.values()]
-        ys = [p.y for p in co.values()]
-        x0, y0 = min(xs), min(ys)
-        span = max(max(xs) - x0, max(ys) - y0) or 1.0
         size = material_texture_size(obj) or _scene_tex_size(context)
         m = self.margin_px / float(max(size))
-        half = 0.5 - 1.5 * m                       # each picture gets half the width
-        steep_area = total_area = 0.0
-        tris_uv = []
-        for f in bm.faces:
-            up = (rot @ f.normal).z >= 0.0
-            nz = abs((rot @ f.normal).z)
-            area = f.calc_area()
-            total_area += area
-            if nz < 0.5:                           # steeper than 60 degrees from flat
-                steep_area += area
-            for l in f.loops:
-                p = co[l.vert]
-                u = (p.x - x0) / span
-                v = (p.y - y0) / span
-                if not up:
-                    u = (max(xs) - x0) / span - u   # mirrored: as seen from below
-                l[uv].uv = ((m + u * half) if up else (0.5 + 0.5 * m + u * half), m + v * (1.0 - 2 * m))
-            pts = [tuple(l[uv].uv) for l in f.loops]
-            for i in range(1, len(pts) - 1):
-                tris_uv.append((pts[0], pts[i], pts[i + 1]))
-        # seam where the top sheet meets the bottom sheet
+        axes = ['Z', 'Y', 'X'] if self.axis == 'AUTO' else [self.axis]
+        results = []
+        for ax in axes:
+            layout_uv, steep, tris = _drape_layout(bm, obj.matrix_world, ax, m)
+            overlap = _raster_overlap(tris, res=384 if len(axes) > 1 else 512)
+            results.append((overlap + steep, ax, layout_uv, steep, overlap))
+        _, ax, layout_uv, steep, overlap = min(results, key=lambda r: r[0])
+        for l, val in layout_uv.items():
+            l[uv].uv = val
+        a = _DRAPE_AXES[ax][0]
+        rot = obj.matrix_world.to_3x3().normalized()
+        primary = _DRAPE_AXES[ax][2]
         seams = 0
         for e in bm.edges:
             if len(e.link_faces) == 2:
-                a, b = ((rot @ f.normal).z >= 0.0 for f in e.link_faces)
-                if a != b and not e.seam:
+                s1, s2 = (((rot @ f.normal)[a] >= 0.0) == (primary > 0) for f in e.link_faces)
+                if s1 != s2 and not e.seam:
                     e.seam = True
                     seams += 1
         bm.to_mesh(obj.data)
         bm.free()
         obj.data.update()
-        overlap = _raster_overlap(tris_uv)
         if was_edit:
             bpy.ops.object.mode_set(mode='EDIT')
-        steep = steep_area / total_area if total_area else 0.0
+        tried = ""
+        if len(results) > 1:
+            tried = " | tried: " + ", ".join(
+                f"{_DRAPE_AXES[r[1]][3]} {r[4] * 100:.0f}% shared / {r[3] * 100:.0f}% steep"
+                for r in sorted(results, key=lambda r: r[0]))
         self.report({'WARNING'} if overlap > 0.15 or steep > 0.4 else {'INFO'},
-                    f"Drape Unwrap: 2 islands (top, bottom), {seams} seam edges | "
-                    f"{overlap * 100:.0f}% of the used texture is shared by parts lying on top of each other | "
-                    f"{steep * 100:.0f}% of the surface is steep and will stretch")
+                    f"Drape Unwrap ({_DRAPE_AXES[ax][3]}): 2 islands, {seams} seam edges | "
+                    f"{overlap * 100:.0f}% of the used texture is shared by parts behind each other | "
+                    f"{steep * 100:.0f}% of the surface faces sideways and will stretch{tried}")
         return {'FINISHED'}
 
 
@@ -1046,7 +1085,7 @@ class FO4_PT_UVKitPanel(_FO4SubPanel):
         row = box.row(align=True)
         row.operator("fo4.uvkit_auto_unwrap", text="Auto Unwrap", icon='UV_DATA').style = 'HARD_SURFACE'
         row.operator("fo4.uvkit_auto_unwrap", text="Fewest Islands", icon='UV_ISLANDSEL').style = 'ORGANIC'
-        box.operator("fo4.uvkit_drape", text="Drape (2 islands, flat-lying meshes)", icon='MOD_CLOTH')
+        box.operator("fo4.uvkit_drape", text="Drape (2 big islands)", icon='MOD_CLOTH').axis = 'AUTO'
 
         box = layout.box()
         box.label(text="Preview", icon='UV')
