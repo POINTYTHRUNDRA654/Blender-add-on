@@ -873,6 +873,117 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Drape: two big islands, as if a sheet were laid over the top and the bottom
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _raster_overlap(tris_uv, res=512):
+    """Share of covered texture pixels that more than one triangle uses."""
+    import numpy as np
+    count = np.zeros((res, res), dtype=np.uint16)
+    for a, b, c in tris_uv:
+        xs = [p[0] * res for p in (a, b, c)]
+        ys = [p[1] * res for p in (a, b, c)]
+        x0, x1 = max(0, int(min(xs))), min(res - 1, int(max(xs)) + 1)
+        y0, y1 = max(0, int(min(ys))), min(res - 1, int(max(ys)) + 1)
+        if x1 < x0 or y1 < y0:
+            continue
+        gx, gy = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+        (ax, ay), (bx, by), (cx, cy) = [(p[0] * res, p[1] * res) for p in (a, b, c)]
+        d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(d) < 1e-12:
+            continue
+        l1 = ((by - cy) * (gx - cx) + (cx - bx) * (gy - cy)) / d
+        l2 = ((cy - ay) * (gx - cx) + (ax - cx) * (gy - cy)) / d
+        inside = (l1 >= 0) & (l2 >= 0) & (l1 + l2 <= 1)
+        count[y0:y1 + 1, x0:x1 + 1] += inside.astype(np.uint16)
+    covered = (count > 0).sum()
+    return float((count > 1).sum()) / covered if covered else 0.0
+
+
+class FO4_OT_UVKitDrape(Operator):
+    """Give the mesh two big UV islands, as if a sheet were draped over its top
+    and another under its bottom: faces pointing up take their UVs straight
+    from above, faces pointing down from below. Best for flat-lying meshes
+    (roots, debris, rubble). Where parts lie on top of each other they share
+    texture, and steep sides stretch; the report says how much"""
+    bl_idname = "fo4.uvkit_drape"
+    bl_label = "Drape Unwrap"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    margin_px: IntProperty(name="Margin (px)", default=16, min=0, max=128)
+
+    @classmethod
+    def poll(cls, context):
+        o = context.active_object
+        return o is not None and o.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        was_edit = obj.mode == 'EDIT'
+        if was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            from . import fo4_mesh_shaper as _ms
+            _ms.create_stash(obj, "before Drape Unwrap")
+        except Exception:
+            pass
+        if not obj.data.uv_layers:
+            obj.data.uv_layers.new(name="UVMap")
+        mw = obj.matrix_world
+        rot = mw.to_3x3().normalized()
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        uv = bm.loops.layers.uv.verify()
+        co = {v: mw @ v.co for v in bm.verts}
+        xs = [p.x for p in co.values()]
+        ys = [p.y for p in co.values()]
+        x0, y0 = min(xs), min(ys)
+        span = max(max(xs) - x0, max(ys) - y0) or 1.0
+        size = material_texture_size(obj) or _scene_tex_size(context)
+        m = self.margin_px / float(max(size))
+        half = 0.5 - 1.5 * m                       # each picture gets half the width
+        steep_area = total_area = 0.0
+        tris_uv = []
+        for f in bm.faces:
+            up = (rot @ f.normal).z >= 0.0
+            nz = abs((rot @ f.normal).z)
+            area = f.calc_area()
+            total_area += area
+            if nz < 0.5:                           # steeper than 60 degrees from flat
+                steep_area += area
+            for l in f.loops:
+                p = co[l.vert]
+                u = (p.x - x0) / span
+                v = (p.y - y0) / span
+                if not up:
+                    u = (max(xs) - x0) / span - u   # mirrored: as seen from below
+                l[uv].uv = ((m + u * half) if up else (0.5 + 0.5 * m + u * half), m + v * (1.0 - 2 * m))
+            pts = [tuple(l[uv].uv) for l in f.loops]
+            for i in range(1, len(pts) - 1):
+                tris_uv.append((pts[0], pts[i], pts[i + 1]))
+        # seam where the top sheet meets the bottom sheet
+        seams = 0
+        for e in bm.edges:
+            if len(e.link_faces) == 2:
+                a, b = ((rot @ f.normal).z >= 0.0 for f in e.link_faces)
+                if a != b and not e.seam:
+                    e.seam = True
+                    seams += 1
+        bm.to_mesh(obj.data)
+        bm.free()
+        obj.data.update()
+        overlap = _raster_overlap(tris_uv)
+        if was_edit:
+            bpy.ops.object.mode_set(mode='EDIT')
+        steep = steep_area / total_area if total_area else 0.0
+        self.report({'WARNING'} if overlap > 0.15 or steep > 0.4 else {'INFO'},
+                    f"Drape Unwrap: 2 islands (top, bottom), {seams} seam edges | "
+                    f"{overlap * 100:.0f}% of the used texture is shared by parts lying on top of each other | "
+                    f"{steep * 100:.0f}% of the surface is steep and will stretch")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Panel
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -904,6 +1015,7 @@ class FO4_PT_UVKitPanel(_FO4SubPanel):
         row = box.row(align=True)
         row.operator("fo4.uvkit_auto_unwrap", text="Auto Unwrap", icon='UV_DATA').style = 'HARD_SURFACE'
         row.operator("fo4.uvkit_auto_unwrap", text="Fewest Islands", icon='UV_ISLANDSEL').style = 'ORGANIC'
+        box.operator("fo4.uvkit_drape", text="Drape (2 islands, flat-lying meshes)", icon='MOD_CLOTH')
 
         box = layout.box()
         box.label(text="Preview", icon='UV')
@@ -924,6 +1036,7 @@ classes = (
     FO4_OT_UVKitBakeCurvature,
     FO4_OT_UVKitBakeID,
     FO4_OT_UVKitAutoUnwrap,
+    FO4_OT_UVKitDrape,
     FO4_PT_UVKitPanel,
 )
 
