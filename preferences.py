@@ -296,13 +296,22 @@ def get_configured_texconv_path() -> str | None:
 
 
 def get_fo4_assets_path() -> str | None:
-    """Return custom FO4 assets path from preferences if set and exists."""
+    """Return the folder with loose FO4 assets: the Assets Path preference,
+    else the FO4 Data Folder (the field the Fallout 4 panels show).
+
+    Smart Presets and the game asset browser read only fo4_assets_path, so
+    with just the Data Folder set they fell back to the Steam install's Data
+    folder, which holds BA2 archives and no loose meshes, and every preset
+    failed with "no game mesh found" (Billy's setup, 2026-11-04: Data Folder
+    F:\\FO4 WORKING FLODER, Assets Path empty).
+    """
     prefs = get_preferences()
     if not prefs:
         return None
-    path = bpy.path.abspath(prefs.fo4_assets_path).strip()
-    if path and os.path.isdir(path):
-        return path
+    for attr in ("fo4_assets_path", "fo4_game_data_path"):
+        path = bpy.path.abspath(getattr(prefs, attr, "") or "").strip()
+        if path and os.path.isdir(path):
+            return path
     return None
 
 

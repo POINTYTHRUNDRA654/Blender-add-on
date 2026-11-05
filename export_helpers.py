@@ -1838,7 +1838,8 @@ class ExportHelpers:
                             # any real object, only for test scripts that
                             # coincidentally set it as a raw custom property.
                             _fresh_report = _nrt.patch_fresh_bsxflags(
-                                filepath, getattr(obj, "fo4_mesh_type", "")
+                                filepath, getattr(obj, "fo4_mesh_type", ""),
+                                has_collision=bool(ExportHelpers._find_collision_meshes(obj)),
                             )
                             _fresh_summary = _nrt.summarize(_fresh_report)
                             if _fresh_summary:
@@ -2506,6 +2507,19 @@ class ExportHelpers:
                                     _coll_note = f"  [{_coll_summary}]"
                         except Exception as _ce:
                             print(f"[FO4Export] Native collision patch skipped: {_ce}")
+                        # BSXFlags, as the single-object export does: this path
+                        # never wrote any, so a combined NIF with collision had
+                        # none (vanilla statics with collision carry 130).
+                        try:
+                            from . import nif_roundtrip as _nrt
+                            _types = [getattr(m, "fo4_mesh_type", "") or "" for m in meshes]
+                            _main_type = max(set(_types), key=_types.count) if _types else ""
+                            _bsx_summary = _nrt.summarize(
+                                _nrt.patch_fresh_bsxflags(filepath, _main_type, has_collision=bool(_colls)))
+                            if _bsx_summary:
+                                _coll_note += f"  [{_bsx_summary}]"
+                        except Exception as _bxe:
+                            print(f"[FO4Export] BSXFlags patch skipped: {_bxe}")
                         _bgsm_note = ""
                         try:
                             # export_scene_as_single_nif (this combine path) used to

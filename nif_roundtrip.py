@@ -208,17 +208,35 @@ FRESH_BSXFLAGS_BY_MESH_TYPE = {
 }
 
 
-def patch_fresh_bsxflags(exported_path, mesh_type: str) -> dict:
+# Collision decides BSXFlags for plain statics, as in vanilla: of 543 vanilla
+# Landscape/Architecture/SetDressing NIFs (surveyed 2026-11-04), 270 of the
+# 324 with collision carry 130 (Havok + Articulated), and 183 of the 219
+# without collision carry no BSXFlags at all (TreeSMarshRoots01: collision,
+# 130; ForestRoots01 / VineCreeperLarge01: neither).
+BSXFLAGS_WITH_COLLISION_DEFAULT = 130
+_NO_BSX_WITHOUT_COLLISION = {"STATIC", "ARCHITECTURE", "VEGETATION"}
+
+
+def patch_fresh_bsxflags(exported_path, mesh_type: str, has_collision=None) -> dict:
     """Write the correct BSXFlags value for *mesh_type* onto a freshly
     exported NIF that has no original reference file to round-trip from
     (see :func:`patch_exported_nif` for that case).
 
-    Only acts on mesh types in :data:`FRESH_BSXFLAGS_BY_MESH_TYPE`, and only
-    when the export doesn't already carry a BSXFlags block (e.g. from a
-    prior round-trip patch) -- never overwrites an existing value.
+    With *has_collision* given, collision decides it for plain statics: a
+    mesh with collision gets its type's value, or 130 when the type has none
+    (DEFAULT/AUTO); Static/Architecture/Vegetation without collision get
+    none. Flora/Debris/Furniture keep their values either way.
+
+    Never overwrites a BSXFlags block the export already carries (e.g. from
+    a prior round-trip patch).
     """
     report = {"restored": [], "could_not_restore": []}
-    flags = FRESH_BSXFLAGS_BY_MESH_TYPE.get((mesh_type or "").upper())
+    mt = (mesh_type or "").upper()
+    flags = FRESH_BSXFLAGS_BY_MESH_TYPE.get(mt)
+    if has_collision is True and flags is None:
+        flags = BSXFLAGS_WITH_COLLISION_DEFAULT
+    elif has_collision is False and mt in _NO_BSX_WITHOUT_COLLISION:
+        flags = None
     if flags is None or _pynifly is None:
         return report
 
