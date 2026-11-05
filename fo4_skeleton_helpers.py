@@ -6,6 +6,7 @@ and generates vertex groups from bone proximity for initial weight painting.
 """
 
 from __future__ import annotations
+from .op_utils import op_exists as _op_exists
 
 import os
 
@@ -50,7 +51,7 @@ class SkeletonAlignmentWizard:
         if not os.path.exists(skeleton_nif_path):
             return False, f"Skeleton NIF not found: {skeleton_nif_path}", None
 
-        if not hasattr(bpy.ops.import_scene, 'pynifly'):
+        if not _op_exists("import_scene.pynifly"):
             return False, "Skeleton import requires PyNifly — install it via the Setup & Status tab", None
         try:
             # Import + shrink to metres (bones, bone-parented helpers and

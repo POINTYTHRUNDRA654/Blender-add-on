@@ -20,6 +20,7 @@ No bundled files are required — internet access needed only on first use.
 """
 
 from __future__ import annotations
+from .op_utils import op_exists as _op_exists
 
 import os
 import tempfile
@@ -69,7 +70,7 @@ def _obj_export(filepath: str) -> bool:
         # {'CANCELLED'}, never an exception. This used to return True
         # unconditionally as long as the call itself didn't throw. Check
         # the result and confirm the file actually landed on disk.
-        if hasattr(bpy.ops.wm, "obj_export"):
+        if _op_exists("wm.obj_export"):
             _result = bpy.ops.wm.obj_export(
                 filepath=filepath,
                 export_selected_objects=True,
@@ -79,7 +80,7 @@ def _obj_export(filepath: str) -> bool:
                 export_materials=False,
                 export_triangulated_mesh=True,
             )
-        else:
+        elif _op_exists("export_scene.obj"):
             _result = bpy.ops.export_scene.obj(
                 filepath=filepath,
                 use_selection=True,
@@ -89,6 +90,8 @@ def _obj_export(filepath: str) -> bool:
                 use_materials=False,
                 use_triangles=True,
             )
+        else:
+            return False, f"No OBJ exporter is available in Blender {bpy.app.version_string}."
         if 'CANCELLED' in set(_result or ()) or not os.path.isfile(filepath):
             print(f"[MeshLab] OBJ export did not complete (result={_result!r})")
             return False
@@ -102,7 +105,7 @@ def _obj_import(filepath: str) -> list:
     """Import an OBJ file.  Returns list of newly created Blender objects."""
     before = {o.name for o in bpy.data.objects}
     try:
-        if hasattr(bpy.ops.wm, "obj_import"):
+        if _op_exists("wm.obj_import"):
             bpy.ops.wm.obj_import(filepath=filepath)
         else:
             bpy.ops.import_scene.obj(filepath=filepath)

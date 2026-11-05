@@ -11,6 +11,7 @@ Installation:
 3. The add-on will automatically detect if it's available
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import importlib.util
 import os
@@ -778,7 +779,7 @@ def import_mesh_file(filepath, mesh_name="AI_Generated_Mesh"):
             # (replaced by wm.obj_import/wm.stl_import) -- calling the old
             # names unconditionally raised AttributeError on every
             # currently-supported Blender version this add-on targets.
-            if hasattr(bpy.ops.wm, "obj_import"):
+            if _op_exists("wm.obj_import"):
                 _result = bpy.ops.wm.obj_import(filepath=filepath)
             else:
                 _result = bpy.ops.import_scene.obj(filepath=filepath)
@@ -787,7 +788,7 @@ def import_mesh_file(filepath, mesh_name="AI_Generated_Mesh"):
         elif ext == '.fbx':
             _result = bpy.ops.import_scene.fbx(filepath=filepath)
         elif ext == '.stl':
-            if hasattr(bpy.ops.wm, "stl_import"):
+            if _op_exists("wm.stl_import"):
                 _result = bpy.ops.wm.stl_import(filepath=filepath)
             else:
                 _result = bpy.ops.import_mesh.stl(filepath=filepath)

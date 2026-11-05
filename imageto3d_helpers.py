@@ -3,6 +3,7 @@ Image-to-3D repositories integration helper
 Consolidates various image-to-3D solutions for Fallout 4 modding
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import importlib.util
 import os
@@ -2046,7 +2047,7 @@ def generate_and_import(image_path):
     # so always check the result and use a before/after object diff rather
     # than assuming success or trusting the current selection.
     before = set(bpy.context.scene.objects)
-    if hasattr(bpy.ops.wm, 'obj_import'):
+    if _op_exists("wm.obj_import"):
         result = bpy.ops.wm.obj_import(filepath=temp_obj)
     else:
         result = bpy.ops.import_scene.obj(filepath=temp_obj)
@@ -2109,7 +2110,7 @@ def batch_import_from_folder(folder_path):
         # declines to run -- always check the result, it comes back as
         # {'CANCELLED'} rather than an exception when the import is declined.
         before = set(bpy.context.scene.objects)
-        if hasattr(bpy.ops.wm, 'obj_import'):
+        if _op_exists("wm.obj_import"):
             result = bpy.ops.wm.obj_import(filepath=obj_path)
         else:
             result = bpy.ops.import_scene.obj(filepath=obj_path)
@@ -2934,7 +2935,7 @@ def generate_asset_from_text(prompt):
     # object diff rather than the current selection, which can still hold a
     # leftover object from before this call.
     before = set(bpy.context.scene.objects)
-    if hasattr(bpy.ops.wm, 'obj_import'):
+    if _op_exists("wm.obj_import"):
         result = bpy.ops.wm.obj_import(filepath=temp_obj)
     else:
         result = bpy.ops.import_scene.obj(filepath=temp_obj)
@@ -3586,7 +3587,7 @@ class FO4_OT_ImageToMeshFO4(bpy.types.Operator):
         # Import into Blender
         before = set(bpy.data.objects)
         try:
-            if hasattr(bpy.ops.wm, 'obj_import'):
+            if _op_exists("wm.obj_import"):
                 bpy.ops.wm.obj_import(filepath=obj_path)
             else:
                 bpy.ops.import_scene.obj(filepath=obj_path)

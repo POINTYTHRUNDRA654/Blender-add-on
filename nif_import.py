@@ -27,6 +27,7 @@ What every import gets:
     given their missing textures (fo4_texture_resolver).
 """
 
+from .op_utils import op_exists as _op_exists
 import os
 from contextlib import contextmanager
 
@@ -34,8 +35,7 @@ import bpy
 
 
 def pynifly_available() -> bool:
-    import_scene = getattr(bpy.ops, 'import_scene', None)
-    return import_scene is not None and hasattr(import_scene, 'pynifly')
+    return _op_exists("import_scene.pynifly")
 
 
 @contextmanager

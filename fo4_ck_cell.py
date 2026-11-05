@@ -61,6 +61,7 @@ Custom properties stored on each imported object
 """
 
 from __future__ import annotations
+from .op_utils import op_exists as _op_exists
 
 import csv
 import hashlib
@@ -558,7 +559,7 @@ class FO4_OT_ImportCKCell(Operator):
                     ('nif',     {'filepath': nif_path}),
                 ]:
                     try:
-                        op = getattr(bpy.ops.import_scene, importer, None)
+                        op = getattr(bpy.ops.import_scene, importer) if _op_exists(f"import_scene.{importer}") else None
                         if op:
                             # bpy.ops calls don't raise on a declined
                             # import (bad file, wrong context) -- they

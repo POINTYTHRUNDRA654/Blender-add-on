@@ -11,6 +11,7 @@ a single click.
 """
 
 from __future__ import annotations
+from .op_utils import op_exists as _op_exists
 
 import json
 import os
@@ -610,7 +611,7 @@ class FO4_OT_ImportLibraryAsset(Operator):
 
             elif filetype == 'OBJ':
                 _before_objs = set(context.scene.objects)
-                if hasattr(bpy.ops.wm, 'obj_import'):
+                if _op_exists("wm.obj_import"):
                     _obj_result = bpy.ops.wm.obj_import(filepath=filepath)
                 else:
                     _obj_result = bpy.ops.import_scene.obj(filepath=filepath)
@@ -656,6 +657,11 @@ class FO4_OT_ImportLibraryAsset(Operator):
                 self.report({'INFO'}, f"Imported glTF: {name}")
 
             elif filetype == 'DAE':
+                if not _op_exists("wm.collada_import"):
+                    self.report({'ERROR'},
+                        f"Blender {bpy.app.version_string} cannot import Collada (.dae): Blender 5.0 "
+                        f"removed it. Convert {name} to FBX or glTF first, then import that.")
+                    return {'CANCELLED'}
                 _before_objs = set(context.scene.objects)
                 _dae_result = bpy.ops.wm.collada_import(filepath=filepath)
                 _new_objs = [o for o in context.scene.objects if o not in _before_objs]

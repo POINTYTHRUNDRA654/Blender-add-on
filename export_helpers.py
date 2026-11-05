@@ -2,6 +2,7 @@
 Export helper functions for Fallout 4 mod creation
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import os
 import json
@@ -289,7 +290,7 @@ class ExportHelpers:
         if not export_scene:
             return False, f"bpy.ops.export_scene missing (Blender {version_str})"
 
-        if not hasattr(export_scene, "nif"):
+        if not _op_exists("export_scene.nif"):
             if blender_version >= (4, 0, 0):
                 return False, "Niftools exporter not registered; official v0.1.1 targets Blender ≤3.6. Install a 4.x-compatible fork or use 3.6 for export."
             return False, "Niftools exporter not registered"
@@ -314,7 +315,7 @@ class ExportHelpers:
         export_scene = getattr(bpy.ops, "export_scene", None)
         if not export_scene:
             return False, "bpy.ops.export_scene not available"
-        if hasattr(export_scene, "pynifly"):
+        if _op_exists("export_scene.pynifly"):
             return True, "PyNifly exporter available (BadDog / BadDogSkyrim)"
         return False, (
             "PyNifly not installed - click 'Auto-Install PyNifly' in the Setup & Status panel "

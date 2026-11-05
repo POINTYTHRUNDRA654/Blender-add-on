@@ -97,9 +97,9 @@ def is_operator_registered(cls_name: str, bl_idname: str) -> bool:
     # Blender 5 extension fallback: verify via bpy.ops namespace
     try:
         prefix, name = bl_idname.split(".", 1)
-        op_ns = getattr(bpy.ops, prefix, None)
-        if op_ns is not None and hasattr(op_ns, name):
-            return True
+        # hasattr() on bpy.ops is True for any name; see op_utils.py.
+        getattr(getattr(bpy.ops, prefix), name).get_rna_type()
+        return True
     except Exception:
         pass
     return False

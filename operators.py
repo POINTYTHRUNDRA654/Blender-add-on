@@ -2,6 +2,7 @@
 Operators for the Fallout 4 Tutorial Add-on
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import sys
 import importlib
@@ -7611,7 +7612,7 @@ class FO4_OT_HybridUnwrap(Operator):
             # except and hidden behind the normal "complete" success message,
             # so the UV quality would silently degrade with no indication
             # anything went wrong.
-            if not hasattr(bpy.ops.uv, 'minimize_stretch'):
+            if not _op_exists("uv.minimize_stretch"):
                 pass  # unavailable on older Blender builds
             else:
                 try:
@@ -9777,7 +9778,7 @@ class FO4_OT_ImportFO4AssetFile(Operator):
             try:
                 _before = set(context.scene.objects)
                 # Blender 3.3+ uses wm.obj_import; older uses import_scene.obj
-                if hasattr(bpy.ops.wm, 'obj_import'):
+                if _op_exists("wm.obj_import"):
                     _result = bpy.ops.wm.obj_import(filepath=filepath)
                 else:
                     _result = bpy.ops.import_scene.obj(filepath=filepath)
@@ -9797,7 +9798,7 @@ class FO4_OT_ImportFO4AssetFile(Operator):
 
         if ext in {'.glb', '.gltf'}:
             try:
-                if hasattr(bpy.ops.import_scene, 'gltf'):
+                if _op_exists("import_scene.gltf"):
                     _before = set(context.scene.objects)
                     _result = bpy.ops.import_scene.gltf(filepath=filepath)
                     _new = [o for o in context.scene.objects if o not in _before]
@@ -10318,26 +10319,32 @@ class FO4_OT_ImportUnityAsset(Operator):
         def _added():
             return [o for o in bpy.context.scene.objects if o not in before]
 
-        if ext == ".fbx" and hasattr(bpy.ops.import_scene, "fbx"):
+        if ext == ".fbx" and _op_exists("import_scene.fbx"):
             result = bpy.ops.import_scene.fbx(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"FBX import did not add anything (result={result!r})"
             return True, "Imported FBX via Blender importer"
-        if ext == ".obj" and hasattr(bpy.ops.import_scene, "obj"):
-            result = bpy.ops.import_scene.obj(filepath=str(path))
+        if ext == ".obj" and (_op_exists("wm.obj_import") or _op_exists("import_scene.obj")):
+            if _op_exists("wm.obj_import"):
+                result = bpy.ops.wm.obj_import(filepath=str(path))
+            else:
+                result = bpy.ops.import_scene.obj(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"OBJ import did not add anything (result={result!r})"
             return True, "Imported OBJ via Blender importer"
-        if ext in (".gltf", ".glb") and hasattr(bpy.ops.import_scene, "gltf"):
+        if ext in (".gltf", ".glb") and _op_exists("import_scene.gltf"):
             result = bpy.ops.import_scene.gltf(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"GLTF import did not add anything (result={result!r})"
             return True, "Imported GLTF via Blender importer"
-        if ext == ".dae" and hasattr(bpy.ops.wm, "collada_import"):
+        if ext == ".dae" and _op_exists("wm.collada_import"):
             result = bpy.ops.wm.collada_import(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"DAE import did not add anything (result={result!r})"
             return True, "Imported DAE via Blender importer"
+        if ext == ".dae":
+            return False, (f"Blender {bpy.app.version_string} cannot import Collada (.dae): Blender 5.0 "
+                           f"removed it. Convert {path.name} to FBX or glTF first, then import that.")
         return False, f"Unsupported format {ext}; import manually from {path}"
 
     def execute(self, context):
@@ -10471,26 +10478,32 @@ class FO4_OT_ImportUnrealAsset(Operator):
             return [o for o in bpy.context.scene.objects if o not in before]
 
         # Common mesh formats
-        if ext == ".fbx" and hasattr(bpy.ops.import_scene, "fbx"):
+        if ext == ".fbx" and _op_exists("import_scene.fbx"):
             result = bpy.ops.import_scene.fbx(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"FBX import did not add anything (result={result!r})"
             return True, "Imported FBX via Blender importer"
-        if ext == ".obj" and hasattr(bpy.ops.import_scene, "obj"):
-            result = bpy.ops.import_scene.obj(filepath=str(path))
+        if ext == ".obj" and (_op_exists("wm.obj_import") or _op_exists("import_scene.obj")):
+            if _op_exists("wm.obj_import"):
+                result = bpy.ops.wm.obj_import(filepath=str(path))
+            else:
+                result = bpy.ops.import_scene.obj(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"OBJ import did not add anything (result={result!r})"
             return True, "Imported OBJ via Blender importer"
-        if ext in (".gltf", ".glb") and hasattr(bpy.ops.import_scene, "gltf"):
+        if ext in (".gltf", ".glb") and _op_exists("import_scene.gltf"):
             result = bpy.ops.import_scene.gltf(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"GLTF import did not add anything (result={result!r})"
             return True, "Imported GLTF via Blender importer"
-        if ext == ".dae" and hasattr(bpy.ops.wm, "collada_import"):
+        if ext == ".dae" and _op_exists("wm.collada_import"):
             result = bpy.ops.wm.collada_import(filepath=str(path))
             if 'CANCELLED' in set(result or ()) or not _added():
                 return False, f"DAE import did not add anything (result={result!r})"
             return True, "Imported DAE via Blender importer"
+        if ext == ".dae":
+            return False, (f"Blender {bpy.app.version_string} cannot import Collada (.dae): Blender 5.0 "
+                           f"removed it. Convert {path.name} to FBX or glTF first, then import that.")
 
         # UE-specific formats: inform user to extract first
         if ext in (".uasset", ".psk", ".pskx", ".usd"):
@@ -10880,7 +10893,7 @@ class FO4_OT_QuickPreset(Operator):
         elif self.preset == 'VEGETATION':
             obj.fo4_collision_type = 'VEGETATION'
             bpy.ops.fo4.generate_collision_mesh()
-            if hasattr(bpy.ops.fo4, 'smart_wind_setup'):
+            if _op_exists("fo4.smart_wind_setup"):
                 bpy.ops.fo4.smart_wind_setup()
         # NPC_MESH: prep only -- no static collision, matches how NPC
         # meshes are actually handled elsewhere in this addon (skinned to
@@ -14410,7 +14423,7 @@ class FO4_OT_ImportModFolder(Operator):
         # Check if NIF importer is available
         try:
             import bpy
-            if not hasattr(bpy.ops, 'import_scene') or not hasattr(bpy.ops.import_scene, 'pynifly'):
+            if not hasattr(bpy.ops, 'import_scene') or not _op_exists("import_scene.pynifly"):
                 self.report({'ERROR'}, "NIF import requires PyNifly — install it via the Setup & Status tab.")
                 return {'CANCELLED'}
         except Exception as e:

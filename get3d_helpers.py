@@ -3,6 +3,7 @@ NVIDIA GET3D integration helper
 Provides AI-powered 3D mesh generation functionality for Fallout 4 modding
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import os
 import subprocess
@@ -201,7 +202,7 @@ class GET3DHelpers:
             # already had selected before this call gets reported back as
             # "the imported mesh". Use a real before/after object diff.
             _before = set(bpy.context.scene.objects)
-            if hasattr(bpy.ops.wm, "obj_import"):
+            if _op_exists("wm.obj_import"):
                 _result = bpy.ops.wm.obj_import(filepath=obj_path)
             else:
                 _result = bpy.ops.import_scene.obj(filepath=obj_path)

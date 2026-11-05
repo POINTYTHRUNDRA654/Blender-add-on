@@ -473,12 +473,12 @@ class AnimationHelpers:
                 print("[auto_weight_paint] computing BBW weights via libigl...")
                 # give user some feedback
                 try:
-                    bpy.ops.wm.progress_begin(0, 100)
+                    bpy.context.window_manager.progress_begin(0, 100)
                 except Exception:
                     pass
                 W = igl.bbw(V, F, H)
                 try:
-                    bpy.ops.wm.progress_end()
+                    bpy.context.window_manager.progress_end()
                 except Exception:
                     pass
                 # clear existing groups and add new weights

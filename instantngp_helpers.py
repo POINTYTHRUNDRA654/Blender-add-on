@@ -3,6 +3,7 @@ Instant-NGP integration helper
 Provides Neural Radiance Fields (NeRF) 3D reconstruction functionality for Fallout 4 modding
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import os
 import subprocess
@@ -319,7 +320,7 @@ class InstantNGPHelpers:
             # selected as "the imported mesh". Use a real before/after
             # object diff instead.
             _before = set(bpy.context.scene.objects)
-            if hasattr(bpy.ops.wm, "obj_import"):
+            if _op_exists("wm.obj_import"):
                 _result = bpy.ops.wm.obj_import(filepath=obj_path)
             else:
                 _result = bpy.ops.import_scene.obj(filepath=obj_path)

@@ -12,6 +12,7 @@ Installation:
 4. Install requirements: pip install -r requirements.txt
 """
 
+from .op_utils import op_exists as _op_exists
 import bpy
 import importlib.util
 import os
@@ -477,6 +478,10 @@ def import_motion_file(filepath, armature=None):
             # confirm something actually landed in the scene.
             _before = set(bpy.context.scene.objects)
             if ext == '.bvh':
+                if not _op_exists("import_anim.bvh"):
+                    return False, ("The BVH importer is not installed. In Blender 4.2 and later it is a "
+                                   "free extension: Edit > Preferences > Get Extensions, search "
+                                   "'BVH format', install it, then try again.")
                 _result = bpy.ops.import_anim.bvh(filepath=filepath)
             else:
                 _result = bpy.ops.import_scene.fbx(filepath=filepath)
