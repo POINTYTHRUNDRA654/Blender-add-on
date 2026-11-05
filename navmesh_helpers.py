@@ -113,13 +113,21 @@ class NavmeshHelpers:
                 "Apply Triangulate (Ctrl+T in Edit Mode) before exporting."
             )
 
-        # 2. Non-manifold (boundary / open) edges
-        boundary_edges = [e for e in bm.edges if not e.is_manifold]
-        if boundary_edges:
+        # 2. Edge topology. A navmesh is an open walkable surface, so border
+        #    edges (one triangle) are normal; the old check asked for a
+        #    "closed manifold surface", which a floor can never be. What a
+        #    NAVM triangle cannot hold is an edge shared by 3+ triangles (it
+        #    stores one neighbour link per edge), and loose wire edges.
+        fan_edges = [e for e in bm.edges if len(e.link_faces) > 2]
+        if fan_edges:
             warnings.append(
-                f"{len(boundary_edges)} boundary/non-manifold edge(s). "
-                "The CK will reject navmesh with open boundary edges. "
-                "Ensure the navmesh is a closed manifold surface."
+                f"{len(fan_edges)} edge(s) shared by 3+ triangles. A navmesh triangle "
+                "links to only one neighbour per edge; separate or delete the extra triangles."
+            )
+        wire_edges = [e for e in bm.edges if not e.link_faces]
+        if wire_edges:
+            warnings.append(
+                f"{len(wire_edges)} loose edge(s) with no triangle (Mesh > Clean Up > Delete Loose)."
             )
 
         # 3. Vertex count limit

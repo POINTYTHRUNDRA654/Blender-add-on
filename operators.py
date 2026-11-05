@@ -11486,6 +11486,8 @@ class FO4_OT_RetopologizeAndBake(Operator):
 
         original_tri_count = sum(len(o.data.polygons) for o in selected)
         original_engine = context.scene.render.engine
+        _saved_bake = None
+        _saved_samples = None
         highpolys = []
         n_pieces = len(selected)
 
@@ -11626,7 +11628,16 @@ class FO4_OT_RetopologizeAndBake(Operator):
                 normal_image = bpy.data.images.new(image_name, width=res, height=res, alpha=False)
                 self._bake_target_node(mat, "Normal", normal_image, non_color=True)
 
-            # 7. Configure Cycles selected-to-active bake
+            # 7. Configure Cycles selected-to-active bake. The scene's own
+            # bake settings and samples are saved first and put back in step
+            # 11 / on error; they used to stay changed (selected-to-active on,
+            # cage and ray distance set), which broke the user's next bake.
+            _bk = context.scene.render.bake
+            _saved_bake = {k: getattr(_bk, k) for k in (
+                "use_selected_to_active", "cage_extrusion", "max_ray_distance",
+                "use_pass_direct", "use_pass_indirect", "use_pass_color",
+                "normal_space", "normal_r", "normal_g", "normal_b")}
+            _saved_samples = context.scene.cycles.samples
             context.scene.render.engine = 'CYCLES'
             context.scene.cycles.samples = 32
             context.scene.render.bake.use_selected_to_active = True
@@ -11657,11 +11668,23 @@ class FO4_OT_RetopologizeAndBake(Operator):
             # 10. Bake normal (tangent space)
             if self.bake_normal:
                 context.scene.render.bake.normal_space = 'TANGENT'
+                # FO4 normal maps are DirectX-style (green points down the
+                # image), as in fo4_lod_generator. Checked 2026-11-04 on seven
+                # vanilla NIFs (crate, barrel, armor, rock, bottle, pistol,
+                # body): the stored tangent frame's V-direction vector points
+                # along +V of the NIF's top-left UV space.
+                context.scene.render.bake.normal_r = 'POS_X'
+                context.scene.render.bake.normal_g = 'NEG_Y'
+                context.scene.render.bake.normal_b = 'POS_Z'
                 mat.node_tree.nodes.active = mat.node_tree.nodes.get("Normal")
                 bpy.ops.object.bake(type='NORMAL')
 
-            # 11. Restore render engine
+            # 11. Restore render engine, samples and bake settings
             context.scene.render.engine = original_engine
+            context.scene.cycles.samples = _saved_samples
+            for _k, _v in _saved_bake.items():
+                setattr(_bk, _k, _v)
+            _saved_bake = None
 
             # 12. Save baked image(s) to disk and optionally convert to DDS
             status_parts = []
@@ -11730,6 +11753,13 @@ class FO4_OT_RetopologizeAndBake(Operator):
             return {'FINISHED'}
 
         except Exception as e:
+            try:
+                if _saved_bake:
+                    for _k, _v in _saved_bake.items():
+                        setattr(context.scene.render.bake, _k, _v)
+                    context.scene.cycles.samples = _saved_samples
+            except Exception:
+                pass
             try:
                 context.scene.render.engine = original_engine
             except Exception:
@@ -12276,6 +12306,23 @@ class FO4_OT_BakeVegetationAO(Operator):
             return {'CANCELLED'}
 
         original_engine = context.scene.render.engine
+        # The bake changes the user's own render settings (Cycles samples,
+        # bake passes); put them back afterwards like the render engine.
+        _bake = context.scene.render.bake
+        _saved = {
+            "direct": _bake.use_pass_direct, "indirect": _bake.use_pass_indirect,
+            "color": _bake.use_pass_color,
+            "samples": getattr(getattr(context.scene, "cycles", None), "samples", None),
+        }
+
+        def _restore_render_settings():
+            context.scene.render.engine = original_engine
+            _bake.use_pass_direct = _saved["direct"]
+            _bake.use_pass_indirect = _saved["indirect"]
+            _bake.use_pass_color = _saved["color"]
+            if _saved["samples"] is not None:
+                context.scene.cycles.samples = _saved["samples"]
+
         try:
             res = int(self.resolution)
             image_name = f"{obj.name}_AO"
@@ -12323,8 +12370,8 @@ class FO4_OT_BakeVegetationAO(Operator):
             # Bake
             bpy.ops.object.bake(type='AO')
 
-            # Restore render engine
-            context.scene.render.engine = original_engine
+            # Restore render engine, samples and bake passes
+            _restore_render_settings()
 
             # Optionally save the raw AO image itself (useful for inspection,
             # but see apply_to_diffuse below for what actually reaches FO4)
@@ -12371,9 +12418,9 @@ class FO4_OT_BakeVegetationAO(Operator):
             return {'FINISHED'}
 
         except Exception as e:
-            # Try to restore the render engine even on failure
+            # Restore the render settings even on failure
             try:
-                context.scene.render.engine = original_engine
+                _restore_render_settings()
             except Exception:
                 pass
             self.report({'ERROR'}, f"AO bake failed: {str(e)}")
