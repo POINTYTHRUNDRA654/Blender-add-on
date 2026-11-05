@@ -78,41 +78,50 @@ class MeshHelpers:
         'NONE':       {'friction': 0.5, 'restitution': 0.1},
     }
 
-    # PyNifly (io_scene_nifly) reads the Havok physical material for a
-    # collision shape from obj.pyn_collshape.bhkMaterial -- a plain string
-    # matching a SkyrimHavokMaterial enum name (FO4 shares this same material
-    # ID table; verified against the installed PyNifly's own export code,
-    # which branches on self.game == 'FO4' for scale/radius right alongside
-    # these same constants, not a separate FO4-only table). None of this
-    # add-on's collision generators ever set it, so every collision mesh this
-    # add-on has ever produced exports with Havok material NONE ("Invalid
-    # Material") -- wrong footstep sounds/impact FX in-game, even though the
-    # shape and layer are otherwise correct. Names must match exactly.
+    # Fallout 4 Havok material written into the exported collision, per
+    # collision type. These are FO4 MATT material names (Fallout4.esm), not
+    # Skyrim's: the earlier map used HEAVY_STONE / HEAVY_WOOD / LIGHT_WOOD,
+    # which do not exist in Fallout 4. Each choice follows what vanilla uses
+    # most for that kind of mesh (survey of F:\FO4 WORKING FLODER, 2026-11-04):
+    # Landscape/Rocks -> Stone (41 of 66), Landscape/Trees -> Wood (106 of 138),
+    # Landscape/Plants -> Grass (167 of 203), actors -> Actor* materials.
+    # nif_roundtrip._patch_havok_material() writes the ID after export.
     _HAVOK_MATERIAL_BY_TYPE = {
-        'DEFAULT':    'STONE',
-        'ROCK':       'HEAVY_STONE',
-        'TREE':       'HEAVY_WOOD',
-        'BUILDING':   'STONE',
-        'VEGETATION': 'LIGHT_WOOD',
-        'GRASS':      'GRASS',
-        'MUSHROOM':   'ORGANIC',
-        'CREATURE':   'SKIN',
-        'NONE':       'STONE',
+        'DEFAULT':    'Stone',
+        'ROCK':       'Stone',
+        'TREE':       'Wood',
+        'BUILDING':   'Stone',
+        'VEGETATION': 'Grass',
+        'GRASS':      'Grass',
+        'MUSHROOM':   'Organic',
+        'CREATURE':   'ActorSkin',
+        'NONE':       'Stone',
     }
 
     @staticmethod
     def _set_havok_material(collision_obj, collision_type: str) -> None:
-        """Set the Havok physical material PyNifly will export for
-        *collision_obj*, if the pyn_collshape property group is available
-        (registered by the PyNifly add-on -- absent if PyNifly isn't
-        installed/enabled, in which case this is a harmless no-op)."""
-        if not hasattr(collision_obj, 'pyn_collshape'):
-            return
-        material_name = MeshHelpers._HAVOK_MATERIAL_BY_TYPE.get(collision_type, 'STONE')
+        """Record the FO4 Havok material for *collision_obj* (custom property
+        ``fo4_havok_material``, read by the exporter). Also sets PyNifly's own
+        ``pyn_collshape.bhkMaterial`` when its enum has the same material, so
+        PyNifly's native export path agrees."""
+        material_name = MeshHelpers._HAVOK_MATERIAL_BY_TYPE.get(collision_type, 'Stone')
         try:
-            collision_obj.pyn_collshape.bhkMaterial = material_name
+            collision_obj["fo4_havok_material"] = material_name
         except Exception:
             pass
+        # PyNifly looks bhkMaterial up in its Skyrim table (KeyError on other
+        # names), so pass only the materials both games share with the same ID.
+        if material_name.upper() not in MeshHelpers._SHARED_SKYRIM_FO4_MATERIALS:
+            return
+        if not hasattr(collision_obj, 'pyn_collshape'):
+            return
+        try:
+            collision_obj.pyn_collshape.bhkMaterial = material_name.upper()
+        except Exception:
+            pass
+
+    _SHARED_SKYRIM_FO4_MATERIALS = frozenset({
+        'STONE', 'WOOD', 'GRASS', 'GLASS', 'CLOTH', 'ORGANIC', 'SKIN', 'DIRT'})
 
     @staticmethod
     def _decimate_ratio_for_limits(collision_obj, limit: int, target: int) -> float:

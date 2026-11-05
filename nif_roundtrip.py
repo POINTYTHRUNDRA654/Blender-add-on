@@ -51,6 +51,76 @@ except Exception:
     _bau = None
     _nc = None
 
+# ── Fallout 4 Havok materials ────────────────────────────────────────────────
+# FO4's collision material ID is Bethesda's CRC32 (zero start value, no final
+# XOR) of the lowercase material name from the MATT record's MNAM field, e.g.
+# "Metal" -> 0x064003D4, "Wood" -> 0x1DD9C611, "Plastic" -> 0x7DFA6E05.
+# Verified 2026-11-04 against the real game: all 147 MATT records were read
+# from Fallout4.esm, and their IDs matched the material values in vanilla NIF
+# collision (16 of 16 checked, e.g. AmmoBox -> MetalHollow, GraveStone -> Stone).
+# Only a few names are shared with Skyrim's table (Stone, Wood, Grass, Glass,
+# Cloth, Organic, Skin, Dirt); Skyrim names such as HEAVY_STONE or LIGHT_WOOD
+# are not FO4 materials at all.
+FO4_HAVOK_MATERIAL_NAMES = frozenset({
+    'ActorArmored', 'ActorArmoredCrab', 'ActorGeneric', 'ActorGhost', 'ActorGlowing',
+    'ActorInsect', 'ActorInsectSmall', 'ActorMetal', 'ActorMetalArmoredPower',
+    'ActorMetalLarge', 'ActorMetalSmall', 'ActorSkeleton', 'ActorSkin', 'ActorSkinLarge',
+    'ActorSkinSmall', 'ArmorHeavy', 'ArmorLight', 'Arrow', 'Axe1Hand', 'Basket', 'Book',
+    'Bottle', 'BottleSmall', 'Brick', 'Carpet', 'CeramicMedium', 'CHAIN', 'Cloth',
+    'ClothCushion', 'Coin', 'Concrete', 'ConcreteStairs', 'debug', 'Dirt', 'DirtStairs',
+    'Generic', 'Glass', 'GlassStairs', 'Grass', 'GrassStairs', 'Gravel', 'Ice', 'Insect',
+    'Insect Wing', 'InsectFloor', 'MaterialActorSynthGen1', 'MaterialBaseball',
+    'MaterialBodyBone', 'MaterialCeramicCoffeeMug', 'MaterialClipboard',
+    'MaterialGroundDirtLeaves', 'MaterialGroundGrassBush', 'MaterialGroundMetalA',
+    'MaterialGroundTileVinyl', 'MaterialGroundTileVinylSanctuaryHills', 'MaterialMetalAuto',
+    'MaterialMetalBucket', 'MaterialMetalCanTin', 'MaterialMetalChairFolding',
+    'MaterialMetalGasLine', 'MaterialMetalGateVault', 'MaterialMetalLunchbox',
+    'MaterialMetalShoppingCart', 'MaterialMetalSign', 'MaterialMetalStairs',
+    'MaterialMetalTray', 'MaterialMetalVertibirdChassisLarge',
+    'MaterialMetalVertibirdChassisSmall', 'MaterialMetalWeight', 'MaterialOtherBone',
+    'MaterialPaperBoxCardboard', 'MaterialPaperBoxSmall', 'MaterialPaperMagazine',
+    'MaterialPlasticBin', 'MaterialPlasticBowlingBall', 'MaterialPlasticLarge',
+    'MaterialPlasticTrafficCone', 'MaterialRubberBall', 'MaterialRubberTire',
+    'MaterialStoneSubwayPillarLarge', 'MaterialSubwayGate', 'MaterialWeaponBlockBladeMedium',
+    'MaterialWeaponBlockBladeSmall', 'MaterialWeaponCasing', 'MaterialWeaponCasingMinigun',
+    'MaterialWeaponCasingPistol', 'MaterialWeaponCasingRifle', 'MaterialWeaponCasingShotgun',
+    'MaterialWeaponMetalBlade1Hand', 'MaterialWeaponMetalBlade1HandSmall',
+    'MaterialWeaponMetalGrenade', 'MaterialWeaponMetalMine', 'MaterialWeaponPistol',
+    'MaterialWeaponRifle', 'MaterialWeaponRifleLarge', 'MaterialWoodBoard', 'MaterialWoodBroom',
+    'MaterialWoodCrate', 'Meat', 'Metal', 'MetalBarrel', 'MetalBarrelTrashCan',
+    'MetalBarrelTrashCanOffice', 'MetalHeavy', 'MetalHollow', 'MetalLight', 'MetalSolid',
+    'MetalStairs', 'Mud', 'Organic', 'OrganicLarge', 'OtherParent', 'Paper', 'Plastic',
+    'PotsPans', 'Sand', 'Sandbag', 'ShieldHeavy', 'ShieldLight', 'Skin', 'Snow', 'SnowStairs',
+    'Stone', 'StoneAsStairs', 'StoneBoulderLarge', 'StoneBoulderMedium', 'StoneBoulderSmall',
+    'StoneBroken', 'StoneBrokenStairs', 'StoneHeavy', 'StoneStairs', 'WARD', 'Water',
+    'WaterPuddle', 'Weapon', 'WeaponBlade2Hand', 'WeaponBlockBlunt', 'WeaponBlunt1Hand',
+    'WeaponBlunt2Hand', 'WeaponBowsStaves', 'Web', 'Wood', 'WoodAsStairs', 'WoodBarrel',
+    'WoodHeavy', 'WoodLight', 'WoodStairs'
+})
+_FO4_HAVOK_MATERIAL_BY_LOWER = {n.lower(): n for n in FO4_HAVOK_MATERIAL_NAMES}
+
+
+def fo4_havok_material_id(name: str):
+    """FO4 Havok material ID for a MATT material name (case-insensitive), or
+    None when *name* is not a Fallout 4 material."""
+    real = _FO4_HAVOK_MATERIAL_BY_LOWER.get(str(name or "").replace("_", "").lower()) \
+        or _FO4_HAVOK_MATERIAL_BY_LOWER.get(str(name or "").lower())
+    if real is None:
+        return None
+    import zlib
+    return zlib.crc32(real.lower().encode("ascii"), 0xFFFFFFFF) ^ 0xFFFFFFFF
+
+
+# Shape classes whose hknpShape userData (+0x18, 64-bit, upper half always 0
+# in vanilla: 3,246 of 3,246 convex shapes checked) holds the material ID.
+# hknpCompressedMeshShape is not listed: its material lives in the
+# hknpBSMaterialProperties block instead (+0x34).
+_HAVOK_SHAPES_WITH_MATERIAL = frozenset({
+    "hknpConvexPolytopeShape", "hknpScaledConvexShape", "hknpDynamicCompoundShape",
+    "hknpStaticCompoundShape", "hknpCapsuleShape", "hknpSphereShape",
+})
+
+
 _ALWAYS_UNRESTORABLE = [
     "Havok collision",
     "shader block type (Effect/Lighting)",
@@ -301,35 +371,31 @@ def patch_root_name(exported_path, mesh_type: str) -> dict:
 
 
 def _patch_havok_material(filepath, material_name: str) -> tuple:
-    """Overwrite the Havok physical material hash inside every
-    hknpBSMaterialProperties block in *filepath* with *material_name*'s real
-    SkyrimHavokMaterial value (FO4 shares this material ID table with
-    Skyrim -- confirmed by cross-checking the installed PyNifly's own FO4
-    export path, which branches on game for scale/radius right alongside
-    these same constants, never for material).
+    """Write the Fallout 4 Havok material for *material_name* into every
+    collision shape in *filepath*.
 
-    Necessary because PyNifly's low-level Havok packer (bhk_autopack.py)
-    has no material parameter at all when building a fresh compressed_mesh/
-    polytope shape -- it always stamps in one fixed byte template captured
-    from a single reference file, regardless of what's requested. This is a
-    raw post-save binary patch, not a PyNifly API call.
+    PyNifly's Havok packer (bhk_autopack.py) has no material parameter: a
+    freshly built shape always carries the material from its fixed byte
+    template (Plastic, 0x7DFA6E05, whatever was asked for). This raw post-save
+    patch puts the real value in two places, matching vanilla:
 
-    Offset +0x34 within the block was empirically confirmed (not guessed)
-    by parsing real vanilla FO4 NIFs with PyNifly's own bhk_autounpack
-    section/fixup parser and finding the one offset whose bytes, read as a
-    little-endian uint32, decoded to the exact known SkyrimHavokMaterial
-    hash matching each reference file's real material (STONE in a stone
-    wall piece, WOOD in a wood roof piece) -- see the reverse-engineering
-    session that produced this fix for the full methodology.
+    * hknpBSMaterialProperties +0x34 (compressed-mesh collision), and
+    * the shape's userData at +0x18 for convex, scaled-convex, compound,
+      capsule and sphere shapes. This is where vanilla keeps it for the
+      convex hulls this add-on writes; before 2026-11-04 only the first
+      place was patched, so every convex export stayed Plastic.
+
+    *material_name* may be an FO4 MATT name ("Stone", "MetalHollow") or a
+    Skyrim enum name that is also an FO4 material ("STONE", "WOOD"). Names
+    that are not FO4 materials are refused rather than written.
 
     Returns (patched_count, message).
     """
-    if _bau is None or _nc is None:
+    if _bau is None:
         return 0, "material patch skipped (PyNifly internals unavailable)"
-    try:
-        material_value = int(_nc.SkyrimHavokMaterial[material_name])
-    except KeyError:
-        return 0, f"material patch skipped (unknown material name {material_name!r})"
+    material_value = fo4_havok_material_id(material_name)
+    if material_value is None:
+        return 0, f"material patch skipped ({material_name!r} is not a Fallout 4 material)"
 
     data = bytearray(open(filepath, "rb").read())
     blocks, _num = _bau._parse_nif_blocks(bytes(data))
@@ -355,13 +421,17 @@ def _patch_havok_material(filepath, material_name: str) -> tuple:
         except Exception:
             continue
         for rel_off, cls in objs:
-            if cls != "hknpBSMaterialProperties":
+            if cls == "hknpBSMaterialProperties":
+                field = 0x34
+            elif cls in _HAVOK_SHAPES_WITH_MATERIAL:
+                field = 0x18
+            else:
                 continue
             # b["offset"] = this NIF block's absolute start in the file;
             # magic_pos = packfile start within the block's blob;
             # data_hdr.abs_start + rel_off = the instance's start within
-            # the packfile's __data__ section; +0x34 = the material field.
-            abs_file_off = b["offset"] + magic_pos + data_hdr.abs_start + rel_off + 0x34
+            # the packfile's __data__ section; + field = the material.
+            abs_file_off = b["offset"] + magic_pos + data_hdr.abs_start + rel_off + field
             if abs_file_off + 4 > len(data):
                 continue
             data[abs_file_off:abs_file_off + 4] = material_value.to_bytes(4, "little")
@@ -370,8 +440,9 @@ def _patch_havok_material(filepath, material_name: str) -> tuple:
     if patched:
         with open(filepath, "wb") as fh:
             fh.write(data)
-        return patched, f"Havok material set to {material_name} ({patched} block(s))"
-    return 0, f"material patch found no hknpBSMaterialProperties block to patch"
+        real = _FO4_HAVOK_MATERIAL_BY_LOWER.get(str(material_name).replace("_", "").lower()) or material_name
+        return patched, f"Havok material set to {real} ({patched} shape(s))"
+    return 0, "material patch found no collision shape to patch"
 
 
 _HULL_MAX_VERTS = 128
@@ -692,11 +763,13 @@ def patch_native_collision(exported_path, collision_obj) -> dict:
         # the real value in afterward, sourced from the same
         # pyn_collshape.bhkMaterial property MeshHelpers.add_*collision*()
         # already sets on collision_obj for PyNifly's own native-export path.
-        try:
-            material_name = collision_obj.pyn_collshape.bhkMaterial if hasattr(
-                collision_obj, 'pyn_collshape') else ""
-        except Exception:
-            material_name = ""
+        material_name = str(collision_obj.get("fo4_havok_material", "") or "")
+        if not material_name:
+            try:
+                material_name = collision_obj.pyn_collshape.bhkMaterial if hasattr(
+                    collision_obj, 'pyn_collshape') else ""
+            except Exception:
+                material_name = ""
         if material_name:
             patched, mat_msg = _patch_havok_material(exported_path, material_name)
             if patched:

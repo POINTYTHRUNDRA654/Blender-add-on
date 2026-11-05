@@ -223,6 +223,15 @@ class ExportHelpers:
                 tex_ok, texture_issues = texture_helpers.TextureHelpers.validate_textures(obj)
                 if not tex_ok:
                     warnings.extend(texture_issues)
+            elif not is_collision:
+                # Without a material PyNifly writes the shape with no shader
+                # block at all (no textures, no BGSM). Every shape in vanilla
+                # has one: 13,024 of 13,024 vanilla SetDressing/Landscape/
+                # Architecture/Props/Furniture NIFs checked, 2026-11-04.
+                warnings.append(
+                    f"'{obj.name}' has no material, so it exports with no shader "
+                    "(no textures or BGSM in game). Add a material first, for "
+                    "example with the BGSM or texture tools.")
 
             # Wind data staleness — advisory only, matching the texture-warning
             # treatment above. Vegetation whose "Wind" group/vertex-colors no
