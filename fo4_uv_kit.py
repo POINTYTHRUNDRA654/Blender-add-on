@@ -706,6 +706,47 @@ def _island_stretch(bm, uv, isl):
     return math.sqrt(sum(a * d * d for (f, d), (_, a, _) in zip(vals, rows)) / tot)
 
 
+def _split_by_stretch_regions(isl, uv, ratio=1.8, min_share=0.03, min_faces=20):
+    """Cut an island along the borders of connected regions whose texture
+    scale is clearly off from the rest (squeezed or blown up by more than
+    *ratio*), so each becomes its own island and gets unwrapped at its own
+    scale. On a creature this lifts a fin off the body; cutting once through
+    the worst spot never separated it (2026-11-05). Returns seams added."""
+    vals, rows, _ = _face_stretch_values(isl, uv)
+    if not vals:
+        return 0
+    lim = math.log(ratio)
+    label = {f: (-1 if d < -lim else (1 if d > lim else 0)) for f, d in vals}
+    fset = set(isl)
+    min_n = max(min_faces, int(len(isl) * min_share))
+    added, seen = 0, set()
+    for f, lab in label.items():
+        if lab == 0 or f in seen:
+            continue
+        region, stack = set(), [f]
+        seen.add(f)
+        while stack:
+            g = stack.pop()
+            region.add(g)
+            for e in g.edges:
+                if e.seam:
+                    continue
+                for h in e.link_faces:
+                    if h in fset and h not in seen and label.get(h) == lab:
+                        seen.add(h)
+                        stack.append(h)
+        if len(region) < min_n or len(region) > len(isl) * 0.8:
+            continue
+        for g in region:
+            for e in g.edges:
+                if e.seam or len(e.link_faces) != 2:
+                    continue
+                if (e.link_faces[0] in region) != (e.link_faces[1] in region):
+                    e.seam = True
+                    added += 1
+    return added
+
+
 def _split_through_worst(bm, uv, isl):
     """Cut a stretched island in two along one hidden seam running from its
     outline, through its most stretched spot, back to its outline."""
@@ -847,9 +888,12 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
             if not bad:
                 break
             if organic:
-                # split each stretched island once, through its worst spot
+                # lift clearly squeezed / blown-up regions (fins, flaps) off
+                # as their own islands; failing that, cut once through the
+                # worst spot
                 for isl in bad:
-                    relief += _split_through_worst(ebm, uv, isl)
+                    n = _split_by_stretch_regions(isl, uv)
+                    relief += n if n else _split_through_worst(ebm, uv, isl)
             else:
                 # cut stretched islands at a lower angle
                 sub_lim = math.radians(max(15.0, self.hard_angle - 20.0 * rounds))
