@@ -2127,8 +2127,12 @@ def install_realesrgan() -> tuple[bool, str]:
         _extract_zip(zip_path, dest)
         zip_path.unlink(missing_ok=True)
 
-        # Flatten a single sub-directory if the zip created one
-        for sub in list(dest.iterdir()):
+        # Unwrap a single wrapper folder if the zip created one. Never flatten
+        # 'models': the binary only loads models from a folder named that, and
+        # flattening it made every install fall back to a plain resize.
+        subs = [s for s in dest.iterdir() if s.is_dir() and s.name.lower() != "models"]
+        wrapper = subs[0] if (len(subs) == 1 and not get_realesrgan_ncnn_exe()) else None
+        for sub in ([wrapper] if wrapper else []):
             if sub.is_dir():
                 for item in list(sub.iterdir()):
                     target = dest / item.name

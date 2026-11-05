@@ -54,6 +54,39 @@ class RealESRGANHelpers:
         return None
 
     @staticmethod
+    def ncnn_model_dir(exe_path, model='realesrgan-x4plus') -> str | None:
+        """Folder holding <model>.param and .bin for the NCNN binary: its
+        'models' subfolder, or the binary's own folder (some downloads were
+        unpacked flat, and the binary only looks in 'models' by default: it
+        then fails with '_wfopen ...models/realesrgan-x4plus.param failed')."""
+        if not exe_path:
+            return None
+        base = os.path.dirname(os.path.abspath(exe_path))
+        mdir = os.path.join(base, 'models')
+
+        def _has(d):
+            return (os.path.isfile(os.path.join(d, model + '.param'))
+                    and os.path.isfile(os.path.join(d, model + '.bin')))
+
+        if _has(mdir):
+            return mdir
+        # The binary only accepts a model folder whose path contains "models"
+        # ("unknown model dir type" otherwise), so files unpacked beside the
+        # exe are copied into models/ once (older add-on installs did that).
+        if _has(base):
+            try:
+                import shutil as _sh
+                os.makedirs(mdir, exist_ok=True)
+                for f in os.listdir(base):
+                    if f.endswith(('.param', '.bin')):
+                        _sh.copy2(os.path.join(base, f), os.path.join(mdir, f))
+                if _has(mdir):
+                    return mdir
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
     def _resolve_vulkan_exe() -> str | None:
         """Return the best available NCNN Vulkan executable path or None.
 
@@ -90,8 +123,9 @@ class RealESRGANHelpers:
         if now - _avail_cache["ts"] < _CACHE_TTL and _avail_cache["result"] is not None:
             return _avail_cache["result"]
 
-        # 1. Locally installed NCNN Vulkan binary (preferred)
-        if RealESRGANHelpers._local_ncnn_exe():
+        # 1. Locally installed NCNN Vulkan binary (preferred), with its model
+        _lx = RealESRGANHelpers._local_ncnn_exe()
+        if _lx and RealESRGANHelpers.ncnn_model_dir(_lx):
             _avail_cache.update(ts=now, result=True)
             return True
         # 2. NCNN Vulkan binary found on PATH
@@ -123,6 +157,11 @@ class RealESRGANHelpers:
 
         local_exe = RealESRGANHelpers._local_ncnn_exe()
         if local_exe:
+            if RealESRGANHelpers.ncnn_model_dir(local_exe) is None:
+                status = (f"{os.path.basename(local_exe)} found, but the realesrgan-x4plus model files are "
+                          "missing - reinstall the AI Upscaler")
+                _avail_cache.update(ts=now, result=False, status=status)
+                return False, status
             status = f"NCNN Vulkan ready: {os.path.basename(local_exe)}"
             _avail_cache.update(ts=now, result=True, status=status)
             return True, status
@@ -222,6 +261,11 @@ class RealESRGANHelpers:
                 '-s', str(scale),
                 '-n', model,
             ]
+            _mdir = RealESRGANHelpers.ncnn_model_dir(exe_path, model)
+            if _mdir is None:
+                return False, (f"Real-ESRGAN model '{model}' not found next to {exe_path} "
+                               "(neither in its 'models' folder nor beside it). Reinstall the AI Upscaler.")
+            cmd += ['-m', _mdir]
 
             result = subprocess.run(
                 cmd,

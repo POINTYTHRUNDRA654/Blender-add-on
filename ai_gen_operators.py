@@ -1196,237 +1196,209 @@ class FO4_OT_AskMossyForSetupHelp(Operator):
 
         return {'FINISHED'}
 
-class FO4_OT_UpscaleTexture(Operator):
-    """Upscale a texture using Real-ESRGAN AI"""
+def _obj_image_items(self, context):
+    from . import texture_inblender as _inb
+    return _inb.image_enum_items(self, context)
+
+
+_SOURCE_ITEMS = [
+    ('OBJECT', "Texture on Active Object", "A texture inside Blender on the active object (no saved file needed)"),
+    ('FILE', "File on Disk", "A texture file"),
+]
+
+
+class _InBlenderUpscaleMixin:
+    """Shared object-mode behaviour for the single-texture upscale buttons."""
+
+    def _object_mode(self):
+        return self.source == 'OBJECT' and not self.filepath
+
+    def invoke(self, context, event):
+        if self._object_mode():
+            from . import texture_inblender as _inb
+            obj = context.active_object
+            if not _inb.object_images(obj):
+                self.report({'ERROR'}, "The active object has no textures. Select a textured mesh, or use 'From File'.")
+                return {'CANCELLED'}
+            name = _inb.default_image_name(obj)
+            if name:
+                self.image_name = name
+            return context.window_manager.invoke_props_dialog(self, width=460)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        col = self.layout.column()
+        if self._object_mode():
+            col.prop(self, "image_name")
+            col.prop(self, "scale")
+            col.prop(self, "apply_to_object")
+            col.prop(self, "save_dir")
+        else:
+            col.prop(self, "scale")
+            col.prop(self, "output_path")
+
+    def _run_object_mode(self, context):
+        from . import texture_inblender as _inb
+        ok, msg, level, _img = _inb.upscale_object_image(
+            context.active_object, self.image_name, int(self.scale), self.apply_to_object, self.save_dir)
+        self.report({level}, msg)
+        try:
+            notification_system.FO4_NotificationSystem.notify(msg, level)
+        except Exception:
+            pass
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+class FO4_OT_UpscaleTexture(_InBlenderUpscaleMixin, Operator):
+    """Upscale a texture with Real-ESRGAN AI: the active object's texture inside Blender, or a file"""
     bl_idname = "fo4.upscale_texture"
     bl_label = "Upscale Texture with AI"
     bl_options = {'REGISTER', 'UNDO'}
-    
-    filepath: StringProperty(
-        name="Texture File",
-        description="Path to the texture file to upscale",
-        subtype='FILE_PATH'
-    )
-    
-    output_path: StringProperty(
-        name="Output Path",
-        description="Path for the upscaled texture (optional)",
-        subtype='FILE_PATH',
-        default=""
-    )
-    
-    scale: EnumProperty(
-        name="Upscale Factor",
-        description="How much to upscale the texture",
-        items=[
-            ('2', "2x", "Double the resolution"),
-            ('4', "4x", "Quadruple the resolution"),
-        ],
-        default='4'
-    )
-    
+
+    source: EnumProperty(name="Source", items=_SOURCE_ITEMS, default='OBJECT', options={'SKIP_SAVE'})
+    image_name: EnumProperty(name="Texture", items=_obj_image_items,
+                             description="Texture on the active object")
+    filepath: StringProperty(name="Texture File", description="Path to the texture file to upscale",
+                             subtype='FILE_PATH', options={'SKIP_SAVE'})
+    output_path: StringProperty(name="Output Path", description="Path for the upscaled texture (optional)",
+                                subtype='FILE_PATH', default="")
+    scale: EnumProperty(name="Upscale Factor", description="How much to upscale the texture",
+                        items=[('2', "2x", "Double the resolution"), ('4', "4x", "Quadruple the resolution")],
+                        default='4')
+    apply_to_object: BoolProperty(name="Use on Object", default=True,
+                                  description="Plug the upscaled image into the material (the old image stays in the .blend)")
+    save_dir: StringProperty(name="Also Save To", subtype='DIR_PATH', default="",
+                             description="Optional folder to also write the result as PNG; empty = keep it only in the .blend")
+
     def execute(self, context):
+        if self._object_mode():
+            return self._run_object_mode(context)
         if not realesrgan_helpers:
             self.report({'ERROR'}, "realesrgan_helpers module not available")
             return {'CANCELLED'}
-        # Check if Real-ESRGAN is available
         if not realesrgan_helpers.RealESRGANHelpers.is_realesrgan_available():
             success, message = realesrgan_helpers.RealESRGANHelpers.check_realesrgan_installation()
             self.report({'ERROR'}, "Real-ESRGAN not found")
-            print("\n" + "="*70)
-            print("REAL-ESRGAN INSTALLATION")
-            print("="*70)
             print(message)
-            print("="*70 + "\n")
-            notification_system.FO4_NotificationSystem.notify(
-                "Real-ESRGAN not installed", 'ERROR'
-            )
+            notification_system.FO4_NotificationSystem.notify("Real-ESRGAN not installed", 'ERROR')
             return {'CANCELLED'}
-
         if not self.filepath:
             self.report({'ERROR'}, "No texture file selected")
             return {'CANCELLED'}
-
-        # Upscale texture
         output = self.output_path or None
         scale_int = int(self.scale)
-
-        success, message = realesrgan_helpers.RealESRGANHelpers.upscale_texture(
-            self.filepath,
-            output,
-            scale_int
-        )
-        
+        success, message = realesrgan_helpers.RealESRGANHelpers.upscale_texture(self.filepath, output, scale_int)
         if success:
             self.report({'INFO'}, message)
-            notification_system.FO4_NotificationSystem.notify(
-                f"Texture upscaled {scale_int}x successfully", 'INFO'
-            )
+            notification_system.FO4_NotificationSystem.notify(f"Texture upscaled {scale_int}x successfully", 'INFO')
         else:
             self.report({'WARNING'}, message)
             notification_system.FO4_NotificationSystem.notify(message, 'WARNING')
             return {'CANCELLED'}
-        
         return {'FINISHED'}
-    
-    def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
 
 
 class FO4_OT_UpscaleObjectTextures(Operator):
-    """Upscale all textures from selected object using Real-ESRGAN AI"""
+    """Upscale every texture on the active object inside Blender (colour with Real-ESRGAN AI,
+    normal and other data maps with a clean resize), and use the results on the object"""
     bl_idname = "fo4.upscale_object_textures"
     bl_label = "Upscale Object Textures with AI"
     bl_options = {'REGISTER', 'UNDO'}
-    
-    output_dir: StringProperty(
-        name="Output Directory",
-        description="Directory to save upscaled textures",
-        subtype='DIR_PATH'
-    )
-    
-    scale: EnumProperty(
-        name="Upscale Factor",
-        description="How much to upscale the textures",
-        items=[
-            ('2', "2x", "Double the resolution"),
-            ('4', "4x", "Quadruple the resolution"),
-        ],
-        default='4'
-    )
-    
-    def execute(self, context):
-        if not realesrgan_helpers:
-            self.report({'ERROR'}, "realesrgan_helpers module not available")
-            return {'CANCELLED'}
-        # Check if Real-ESRGAN is available
-        if not realesrgan_helpers.RealESRGANHelpers.is_realesrgan_available():
-            success, message = realesrgan_helpers.RealESRGANHelpers.check_realesrgan_installation()
-            self.report({'ERROR'}, "Real-ESRGAN not found")
-            print("\n" + "="*70)
-            print("REAL-ESRGAN INSTALLATION")
-            print("="*70)
-            print(message)
-            print("="*70 + "\n")
-            notification_system.FO4_NotificationSystem.notify(
-                "Real-ESRGAN not installed", 'ERROR'
-            )
-            return {'CANCELLED'}
 
-        obj = context.active_object
-        if not obj:
-            self.report({'ERROR'}, "No object selected")
-            return {'CANCELLED'}
-        
-        if not self.output_dir:
-            self.report({'ERROR'}, "No output directory selected")
-            return {'CANCELLED'}
-        
-        scale_int = int(self.scale)
-        
-        # Upscale textures
-        success, message, upscaled_files = realesrgan_helpers.RealESRGANHelpers.upscale_object_textures(
-            obj,
-            self.output_dir,
-            scale_int
-        )
-        
-        if success:
-            self.report({'INFO'}, message)
-            notification_system.FO4_NotificationSystem.notify(message, 'INFO')
-            
-            # Print details
-            print("\n" + "="*70)
-            print("TEXTURE UPSCALING RESULTS")
-            print("="*70)
-            print(f"Object: {obj.name}")
-            print(f"Scale: {scale_int}x")
-            print(f"Upscaled files:")
-            for filepath in upscaled_files:
-                print(f"  - {filepath}")
-            print("="*70 + "\n")
-        else:
-            self.report({'ERROR'}, message)
-            notification_system.FO4_NotificationSystem.notify(message, 'ERROR')
-            return {'CANCELLED'}
-        
-        return {'FINISHED'}
-    
+    output_dir: StringProperty(name="Also Save To", subtype='DIR_PATH', default="",
+                               description="Optional folder to also write the results as PNG; empty = keep them only in the .blend")
+    scale: EnumProperty(name="Upscale Factor", description="How much to upscale the textures",
+                        items=[('2', "2x", "Double the resolution"), ('4', "4x", "Quadruple the resolution")],
+                        default='4')
+    include_data_maps: BoolProperty(
+        name="Normal / Specular Maps Too", default=True,
+        description="Also resize normal, specular and other data maps so every map matches (clean resize, not AI)")
+    apply_to_object: BoolProperty(name="Use on Object", default=True,
+                                  description="Plug the upscaled images into the material (old images stay in the .blend)")
+
     def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
+        from . import texture_inblender as _inb
+        if not _inb.object_images(context.active_object):
+            self.report({'ERROR'}, "The active object has no textures")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        from . import texture_inblender as _inb
+        obj = context.active_object
+        imgs = _inb.object_images(obj)
+        if not imgs:
+            self.report({'ERROR'}, "The active object has no textures")
+            return {'CANCELLED'}
+        done, failed, not_ai = [], [], []
+        for slot, _mat, _node, img in imgs:
+            if _inb.is_data_map(slot, img) and not self.include_data_maps:
+                continue
+            ok, msg, level, _new = _inb.upscale_object_image(obj, img.name, int(self.scale),
+                                                             self.apply_to_object, self.output_dir)
+            print(f"[Upscale] {msg}")
+            (done if ok else failed).append(img.name)
+            if ok and level == 'WARNING':
+                not_ai.append(img.name)
+        if not done:
+            self.report({'ERROR'}, "Nothing was upscaled: " + "; ".join(failed))
+            return {'CANCELLED'}
+        msg = f"Upscaled {len(done)} texture(s) {self.scale}x on {obj.name}"
+        if failed:
+            msg += f"; failed: {', '.join(failed)}"
+        if not_ai:
+            msg += f"; plain resize, NOT AI (no AI upscaler worked): {', '.join(not_ai)}"
+        self.report({'WARNING'} if (failed or not_ai) else {'INFO'}, msg)
+        notification_system.FO4_NotificationSystem.notify(msg, 'WARNING' if (failed or not_ai) else 'INFO')
+        return {'FINISHED'}
 
 
-
-
-class FO4_OT_UpscaleKREALegacy(Operator):
-    """Upscale a texture using KREA AI Legacy-style processing.
-    Uses Real-ESRGAN when available, otherwise falls back to high-quality
-    Lanczos upscaling with sharpening (requires Pillow)."""
+class FO4_OT_UpscaleKREALegacy(_InBlenderUpscaleMixin, Operator):
+    """Upscale a texture in the KREA AI Legacy style (Real-ESRGAN, or Lanczos + sharpening when no AI
+    upscaler is installed): the active object's texture inside Blender, or a file"""
     bl_idname = "fo4.upscale_krea_legacy"
     bl_label = "Upscale (KREA AI Legacy Style)"
     bl_options = {'REGISTER', 'UNDO'}
 
-    filepath: StringProperty(
-        name="Texture File",
-        description="Path to the texture file to upscale",
-        subtype='FILE_PATH'
-    )
-
-    output_path: StringProperty(
-        name="Output Path",
-        description="Path for the upscaled texture (leave blank to auto-generate)",
-        subtype='FILE_PATH',
-        default=""
-    )
-
-    scale: EnumProperty(
-        name="Upscale Factor",
-        description="How much to upscale the texture",
-        items=[
-            ('2', "2x", "Double the resolution"),
-            ('4', "4x", "Quadruple the resolution"),
-        ],
-        default='4'
-    )
+    source: EnumProperty(name="Source", items=_SOURCE_ITEMS, default='OBJECT', options={'SKIP_SAVE'})
+    image_name: EnumProperty(name="Texture", items=_obj_image_items,
+                             description="Texture on the active object")
+    filepath: StringProperty(name="Texture File", description="Path to the texture file to upscale",
+                             subtype='FILE_PATH', options={'SKIP_SAVE'})
+    output_path: StringProperty(name="Output Path",
+                                description="Path for the upscaled texture (leave blank to auto-generate)",
+                                subtype='FILE_PATH', default="")
+    scale: EnumProperty(name="Upscale Factor", description="How much to upscale the texture",
+                        items=[('2', "2x", "Double the resolution"), ('4', "4x", "Quadruple the resolution")],
+                        default='4')
+    apply_to_object: BoolProperty(name="Use on Object", default=True,
+                                  description="Plug the upscaled image into the material (the old image stays in the .blend)")
+    save_dir: StringProperty(name="Also Save To", subtype='DIR_PATH', default="",
+                             description="Optional folder to also write the result as PNG; empty = keep it only in the .blend")
 
     def execute(self, context):
+        if self._object_mode():
+            return self._run_object_mode(context)
         if not realesrgan_helpers:
             self.report({'ERROR'}, "realesrgan_helpers module not available")
             return {'CANCELLED'}
         if not self.filepath:
             self.report({'ERROR'}, "No texture file selected")
             return {'CANCELLED'}
-
         output = self.output_path or None
         scale_int = int(self.scale)
-
-        success, message = realesrgan_helpers.RealESRGANHelpers.upscale_krea_legacy_style(
-            self.filepath,
-            output,
-            scale_int
-        )
-
+        success, message = realesrgan_helpers.RealESRGANHelpers.upscale_krea_legacy_style(self.filepath, output, scale_int)
         if success:
             self.report({'INFO'}, message)
             notification_system.FO4_NotificationSystem.notify(message, 'INFO')
-            # Remind the user to convert the upscaled image to DDS before NIF export.
-            self.report(
-                {'WARNING'},
-                "Upscale complete. Convert the output to DDS (BC1/BC3/BC5) using "
-                "'Convert to DDS' in the Texture Helpers panel before exporting your NIF."
-            )
+            self.report({'WARNING'}, "Upscale complete. Convert the output to DDS (BC1/BC3/BC5) using "
+                                     "'Convert to DDS' in the Texture Helpers panel before exporting your NIF.")
         else:
             self.report({'WARNING'}, message)
             notification_system.FO4_NotificationSystem.notify(message, 'WARNING')
             return {'CANCELLED'}
-
         return {'FINISHED'}
-
-    def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
 
 class FO4_OT_ImportGET3DMesh(Operator):
     """Import a mesh generated by NVIDIA GET3D"""

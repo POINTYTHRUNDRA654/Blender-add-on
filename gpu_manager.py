@@ -215,6 +215,15 @@ def split_file_list(files: List[str]) -> List[tuple]:
     return result
 
 
+def _esrgan_model_dir(esrgan_exe):
+    """Model folder for the NCNN binary ('models' or beside the exe)."""
+    try:
+        from .realesrgan_helpers import RealESRGANHelpers
+        return RealESRGANHelpers.ncnn_model_dir(esrgan_exe)
+    except Exception:
+        return None
+
+
 def run_realesrgan_multi_gpu(esrgan_exe: str,
                               input_file: str,
                               output_file: str,
@@ -237,6 +246,9 @@ def run_realesrgan_multi_gpu(esrgan_exe: str,
         "-t", str(tile_size),
         "-g", str(gpu_id),   # explicit GPU selection
     ]
+    _mdir = _esrgan_model_dir(esrgan_exe)
+    if _mdir:
+        cmd += ["-m", _mdir]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode == 0 and os.path.isfile(output_file):
@@ -286,6 +298,9 @@ def run_batch_multi_gpu(esrgan_exe: str,
                 "-t", str(tile_size),
                 "-g", str(gpu_idx),
             ]
+            _mdir = _esrgan_model_dir(esrgan_exe)
+            if _mdir:
+                cmd += ["-m", _mdir]
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                 ok  = r.returncode == 0 and os.path.isfile(out)

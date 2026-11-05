@@ -1482,6 +1482,14 @@ class FO4_PT_TexturePanel(_FO4SubPanel):
 
         box.operator("fo4.validate_textures", text="Validate Textures", icon='CHECKMARK')
 
+        # Textures on the active object (inside Blender, saved to disk or not)
+        has_tex = False
+        if has_mesh:
+            for _m in obj.data.materials:
+                if _m and _m.use_nodes and any(n.type == 'TEX_IMAGE' and n.image for n in _m.node_tree.nodes):
+                    has_tex = True
+                    break
+
         # AI Upscaling (Real-ESRGAN)
         ai_box = layout.box()
         ai_box.label(text="AI Upscaling (Real-ESRGAN)", icon='RENDER_RESULT')
@@ -1492,15 +1500,22 @@ class FO4_PT_TexturePanel(_FO4SubPanel):
         if esrgan_available:
             ai_box.label(text=f"Status: {esrgan_status}", icon='CHECKMARK')
         else:
-            ai_box.label(text="Status: Not Installed", icon='ERROR')
+            ai_box.label(text="Status: Not Installed (plain resize only)", icon='ERROR')
             ai_box.label(text="→ Install from Setup & Status panel", icon='INFO')
         ai_box.operator("fo4.check_realesrgan_installation", text="Check Status", icon='SYSTEM')
-        row = ai_box.row()
-        row.enabled = bool(esrgan_available)
-        row.operator("fo4.upscale_texture", text="Upscale Texture", icon='FULLSCREEN_ENTER')
-        row = ai_box.row()
-        row.enabled = bool(esrgan_available)
-        row.operator("fo4.upscale_object_textures", text="Upscale Object Textures", icon='OBJECT_DATA')
+        if has_mesh and not has_tex:
+            ai_box.label(text="The active object has no textures", icon='INFO')
+        row = ai_box.row(align=True)
+        row.enabled = has_tex
+        op = row.operator("fo4.upscale_texture", text="Upscale Texture on Object", icon='FULLSCREEN_ENTER')
+        op.source = 'OBJECT'
+        row2 = ai_box.row(align=True)
+        row2.enabled = has_tex
+        row2.operator("fo4.upscale_object_textures", text="Upscale All Object Textures", icon='OBJECT_DATA')
+        frow = ai_box.row(align=True)
+        frow.enabled = bool(esrgan_available)
+        op = frow.operator("fo4.upscale_texture", text="From File...", icon='FILEBROWSER')
+        op.source = 'FILE'
 
         # KREA AI Legacy upscaling - own self-contained upscaler, no subscription
         krea_box = layout.box()
@@ -1509,22 +1524,32 @@ class FO4_PT_TexturePanel(_FO4SubPanel):
             krea_box.label(text=f"Engine: {esrgan_status}", icon='CHECKMARK')
         else:
             krea_box.label(text="Engine: PIL fallback (install Real-ESRGAN above for best quality)", icon='INFO')
-        krea_box.operator("fo4.upscale_krea_legacy", text="Upscale Texture", icon='FULLSCREEN_ENTER')
+        krow = krea_box.row(align=True)
+        sub = krow.row(align=True)
+        sub.enabled = has_tex
+        op = sub.operator("fo4.upscale_krea_legacy", text="Upscale Texture on Object", icon='FULLSCREEN_ENTER')
+        op.source = 'OBJECT'
+        op = krow.operator("fo4.upscale_krea_legacy", text="", icon='FILEBROWSER')
+        op.source = 'FILE'
 
-        # ── Enhance Texture (Upscale -> Normal/Spec -> Downscale) ────────────
+        # ── Enhance Texture (detail + finish) ────────────────────────────────
         enh_box = layout.box()
-        enh_box.label(text="Enhance Texture + Auto Normal/Specular", icon='OUTLINER_OB_IMAGE')
+        enh_box.label(text="Enhance Texture: Detail + Finish", icon='OUTLINER_OB_IMAGE')
         enh_col = enh_box.column(align=True)
         enh_col.scale_y = 0.75
-        enh_col.label(text="AI upscales to high-res intermediate, generates", icon='DOT')
-        enh_col.label(text="normal + specular maps at that resolution, then", icon='DOT')
-        enh_col.label(text="Lanczos-downscales ALL maps back to target size.", icon='DOT')
-        enh_col.label(text="Tiers: 1K->4K | 2K->8K | 4K->16K (select in dialog)", icon='INFO')
-        enh_box.operator("fo4.enhance_texture_1k",
-                         text="Enhance Single Texture (choose tier in dialog)",
-                         icon='FULLSCREEN_ENTER')
+        enh_col.label(text="AI upscale, then from that detail:", icon='DOT')
+        enh_col.label(text="normal map laid over your existing one,", icon='DOT')
+        enh_col.label(text="specular map: red = shine, green = gloss.", icon='DOT')
+        enh_col.label(text="Gloss ranges measured from vanilla _s maps.", icon='INFO')
+        erow = enh_box.row(align=True)
+        sub = erow.row(align=True)
+        sub.enabled = has_tex
+        op = sub.operator("fo4.enhance_texture_1k", text="Enhance Texture on Object", icon='FULLSCREEN_ENTER')
+        op.source = 'OBJECT'
+        op = erow.operator("fo4.enhance_texture_1k", text="", icon='FILEBROWSER')
+        op.source = 'FILE'
         enh_box.operator("fo4.batch_enhance_1k_textures",
-                         text="Batch Enhance Folder (choose tier in dialog)",
+                         text="Batch Enhance Folder",
                          icon='FILE_FOLDER')
 
         # BGSM Material Files
