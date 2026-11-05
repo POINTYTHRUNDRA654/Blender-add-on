@@ -209,6 +209,12 @@ class ExportHelpers:
         if obj.type == 'MESH':
             is_collision = ExportHelpers._is_collision_mesh(obj)
 
+            # The UV & Texture Kit's checker swaps the materials for a grid;
+            # exporting then would write the grid instead of the real ones.
+            if any(s.material and s.material.name == "FO4_UVChecker" for s in obj.material_slots):
+                blocking.append(f"'{obj.name}' still shows the UV checker: turn it off "
+                                "(UV & Texture Kit > Toggle UV Checker) before exporting.")
+
             # Geometry validation — non-manifold edges, missing UVs, and
             # poly-count violations are hard blockers for all visible meshes.
             success, mesh_issues = mesh_helpers.MeshHelpers.validate_mesh(

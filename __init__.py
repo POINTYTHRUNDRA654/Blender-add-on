@@ -294,6 +294,7 @@ fo4_navmesh_generator    = _try_import("fo4_navmesh_generator")
 fo4_weather_interior     = _try_import("fo4_weather_interior")
 fo4_glow_effects         = _try_import("fo4_glow_effects")
 fo4_mesh_shaper          = _try_import("fo4_mesh_shaper")
+fo4_uv_kit               = _try_import("fo4_uv_kit")
 fo4_texture_generator    = _try_import("fo4_texture_generator")
 
 
@@ -393,6 +394,7 @@ _PHASE2_MODULES = list(filter(_filter, [
     fo4_weather_interior,
     fo4_glow_effects,
     fo4_mesh_shaper,
+    fo4_uv_kit,
     fo4_texture_generator,
     # Animation sub-systems — operators registered in Phase 2 so startup
     # is not delayed; all UI panels that reference them check registration
