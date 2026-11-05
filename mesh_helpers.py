@@ -812,6 +812,7 @@ class MeshHelpers:
         """
         target_faces = max(10, int(target_faces))
         remesh_ok = False
+        _from_skin = False
         original_face_count = len(obj.data.polygons)
         # Backup the pristine input so a catastrophically bad attempt (see
         # below) can be rolled back and retried with the next fallback
@@ -850,27 +851,103 @@ class MeshHelpers:
             # decimating the skin left long sliver triangles that no unwrap
             # can flatten well. If QuadriFlow still fails, the fallbacks
             # below start from the skin, not from the broken original.
-            if MeshHelpers.shell_remesh(obj, 0):
+            # detail 800 (cells ~2.4 mm on a 1.9 m plant): at 400 the skin
+            # glued petals that sit closer than ~5 mm together
+            if MeshHelpers.shell_remesh(obj, 0, detail=800):
                 print(f"[FO4 Retopo] '{obj.name}': open/broken surface ({_nonman} of {_n_edges} edges), "
                       f"rebuilt as a closed skin ({len(obj.data.polygons)} faces)")
                 original_data = obj.data.copy()
+                _from_skin = True
             else:
                 _restore_original()
 
         # Try QuadriFlow (best quality, needs near-manifold geometry)
         if not remesh_ok:
+            # QuadriFlow has no curvature option (its settings: preserve
+            # sharp / boundary / attributes, symmetry, smooth normals, mode,
+            # target ratio / edge length / faces, mesh area, seed). Passing
+            # use_mesh_curvature raised TypeError on every call, so this step
+            # never ran and every retopo silently fell through to the coarse
+            # voxel remesh below, which fuses thin parts such as petals
+            # (found 2026-11-05). use_curvature is kept in the signature for
+            # callers but has nothing to map to.
             try:
-                bpy.ops.object.quadriflow_remesh(
+                # QuadriFlow refuses ("needs to be manifold and have face
+                # normals that point in a consistent direction") a closed
+                # mesh whose normals are mixed, e.g. a fresh skin remesh.
+                import bmesh as _bm_qf
+                _bq = _bm_qf.new()
+                _bq.from_mesh(obj.data)
+                # A single scrap of two back-to-back triangles (no volume)
+                # makes QuadriFlow refuse the whole mesh; a skin remesh of an
+                # AI flower left 44 of them among 223 pieces (2026-11-05).
+                # They are invisible, so drop scraps under 12 faces or with
+                # next to no volume before remeshing.
+                _seen, _scraps = set(), []
+                for _f in _bq.faces:
+                    if _f in _seen:
+                        continue
+                    _comp, _st = [], [_f]
+                    _seen.add(_f)
+                    while _st:
+                        _g = _st.pop()
+                        _comp.append(_g)
+                        for _e in _g.edges:
+                            for _h in _e.link_faces:
+                                if _h not in _seen:
+                                    _seen.add(_h)
+                                    _st.append(_h)
+                    _area = sum(_g.calc_area() for _g in _comp)
+                    _vol = abs(sum(_g.calc_center_median().dot(_g.normal) * _g.calc_area() for _g in _comp) / 3.0)
+                    if len(_comp) < 12 or _vol < (_area ** 1.5) * 1e-4:
+                        _scraps.extend(_comp)
+                if _scraps:
+                    _bm_qf.ops.delete(_bq, geom=_scraps, context='FACES')
+                    _bm_qf.ops.delete(_bq, geom=[v for v in _bq.verts if not v.link_faces], context='VERTS')
+                    print(f"[FO4 Retopo] '{obj.name}': removed {len(_scraps)} faces of tiny / flat scraps before QuadriFlow")
+                _bm_qf.ops.recalc_face_normals(_bq, faces=_bq.faces[:])
+                _bq.to_mesh(obj.data)
+                _bq.free()
+                obj.data.update()
+                _before = len(obj.data.polygons)
+                _qf_res = bpy.ops.object.quadriflow_remesh(
                     target_faces=target_faces,
                     use_preserve_boundary=preserve_boundary,
-                    use_mesh_curvature=use_curvature,
+                    use_preserve_sharp=True,
                     mode='FACES',
                 )
-                if _acceptable(len(obj.data.polygons)):
+                if 'FINISHED' not in _qf_res:
+                    # a refusal returns CANCELLED without raising and leaves
+                    # the mesh as it was, which the size check alone accepted
+                    raise RuntimeError(f"QuadriFlow returned {_qf_res} ({_before} faces unchanged)")
+                if _acceptable(len(obj.data.polygons)) and len(obj.data.polygons) <= target_faces * 4:
                     remesh_ok = True
+                    print(f"[FO4 Retopo] '{obj.name}': QuadriFlow -> {len(obj.data.polygons)} faces")
                 else:
+                    print(f"[FO4 Retopo] '{obj.name}': QuadriFlow result too far off target "
+                          f"({len(obj.data.polygons)} faces for {target_faces}); trying the next method")
                     _restore_original()
-            except Exception:
+            except Exception as _qf_err:
+                print(f"[FO4 Retopo] '{obj.name}': QuadriFlow failed ({_qf_err}); trying the next method")
+                _restore_original()
+
+        # Fallback for a skin: reduce it. Unlike a coarse voxel remesh, a
+        # reduction keeps faces where the shape needs them: on an AI flower
+        # the voxel remesh turned small blooms into blobs at 14k and 28k
+        # triangles while reducing the same skin to 16k kept separate,
+        # pointed petals (2026-11-05). The unwrap of a reduced mesh is
+        # rougher (long thin triangles), which the UV tools report.
+        if not remesh_ok and _from_skin:
+            try:
+                _tris = sum(len(p.vertices) - 2 for p in obj.data.polygons)
+                _dec = obj.modifiers.new("FO4_SkinReduce", 'DECIMATE')
+                _dec.ratio = max(0.0001, min(1.0, (target_faces * 2) / float(max(1, _tris))))
+                with bpy.context.temp_override(object=obj, active_object=obj, selected_editable_objects=[obj]):
+                    bpy.ops.object.modifier_apply(modifier=_dec.name)
+                remesh_ok = True
+                print(f"[FO4 Retopo] '{obj.name}': skin reduced -> {len(obj.data.polygons)} faces")
+            except Exception as _red_err:
+                print(f"[FO4 Retopo] '{obj.name}': skin reduction failed ({_red_err})")
                 _restore_original()
 
         # Fallback: Voxel remesh modifier. The right voxel_size for a given
