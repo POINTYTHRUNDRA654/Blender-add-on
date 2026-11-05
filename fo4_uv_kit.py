@@ -687,7 +687,11 @@ def _face_stretch_values(isl, uv):
         auv = sum(abs((co[i] - co[0]).x * (co[i + 1] - co[0]).y
                       - (co[i] - co[0]).y * (co[i + 1] - co[0]).x) * 0.5
                   for i in range(1, len(co) - 1))
-        rows.append((f, a3, math.log(auv / a3) if a3 > 1e-12 and auv > 1e-14 else 0.0))
+        if a3 <= 1e-12:
+            continue
+        # a face squashed to nothing in UV space is the worst stretch there
+        # is; skipping it used to make a fully collapsed unwrap score 0.00
+        rows.append((f, a3, math.log(max(auv, 1e-14) / a3)))
     tot = sum(a for _, a, _ in rows) or 1.0
     mean = sum(a * r for _, a, r in rows) / tot
     return [(f, r - mean) for f, _, r in rows], rows, tot
@@ -725,8 +729,25 @@ def _split_through_worst(bm, uv, isl):
     return len(p1) + len(p2)
 
 
+def _collapsed_faces(obj):
+    """Faces whose UVs have (almost) no area: the unwrap failed there."""
+    bm = bmesh.from_edit_mesh(obj.data)
+    uv = bm.loops.layers.uv.active
+    n = 0
+    for f in bm.faces:
+        co = [l[uv].uv for l in f.loops]
+        a = sum(abs((co[i] - co[0]).x * (co[i + 1] - co[0]).y - (co[i] - co[0]).y * (co[i + 1] - co[0]).x)
+                for i in range(1, len(co) - 1))
+        n += a < 1e-12
+    return n
+
+
 def _unwrap_all(obj):
-    """Unwrap everything with the least-stretch method this Blender has."""
+    """Unwrap everything with the least-stretch method this Blender has.
+    Minimum Stretch can silently squash a whole mesh flat (an AI vine mesh:
+    6,376 of 6,376 faces, 2026-11-05), so collapsed faces are counted and
+    Angle Based is tried too; the method that collapses fewer faces wins.
+    Returns (method, collapsed faces)."""
     bpy.ops.mesh.select_all(action='SELECT')
     try:
         methods = [i.identifier for i in bpy.ops.uv.unwrap.get_rna_type().properties["method"].enum_items]
@@ -734,7 +755,14 @@ def _unwrap_all(obj):
         methods = ['ANGLE_BASED']
     method = 'MINIMUM_STRETCH' if 'MINIMUM_STRETCH' in methods else 'ANGLE_BASED'
     bpy.ops.uv.unwrap(method=method, margin=0.0)
-    return method
+    collapsed = _collapsed_faces(obj)
+    if collapsed and method != 'ANGLE_BASED':
+        bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.0)
+        other = _collapsed_faces(obj)
+        if other < collapsed:
+            return 'ANGLE_BASED', other
+        bpy.ops.uv.unwrap(method=method, margin=0.0)
+    return method, collapsed
 
 
 class FO4_OT_UVKitAutoUnwrap(Operator):
@@ -810,7 +838,7 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
         bm.free()
 
         bpy.ops.object.mode_set(mode='EDIT')
-        method = _unwrap_all(obj)
+        method, collapsed = _unwrap_all(obj)
         relief = 0
         for rounds in range(1, 13 if organic else 4):
             ebm = bmesh.from_edit_mesh(obj.data)
@@ -838,7 +866,7 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
                 merged += _merge_tiny_islands(ebm)
             relief += _cut_graph_seams(ebm)
             bmesh.update_edit_mesh(obj.data)
-            _unwrap_all(obj)
+            method, collapsed = _unwrap_all(obj)
         ebm = bmesh.from_edit_mesh(obj.data)
         uv = ebm.loops.layers.uv.active
         islands = _face_islands(ebm)
@@ -866,9 +894,12 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
                f"{hard} hard-edge, {cuts} to lie flat, {relief} stretch relief, "
                f"{merged} removed to join tiny islands; worst stretch {worst:.2f}; "
                f"texture used {auv * 100:.0f}%; {d:,.0f} px/m at {size[0]}px")
+        if collapsed:
+            msg += (f". {collapsed} faces could not be unwrapped (squashed flat): usually parts that "
+                    "pass through each other; clean those up or remesh first")
         if notes:
             msg += " (" + "; ".join(notes) + ")"
-        self.report({'WARNING'} if worst > self.stretch_limit else {'INFO'}, msg)
+        self.report({'WARNING'} if worst > self.stretch_limit or collapsed else {'INFO'}, msg)
         return {'FINISHED'}
 
 
