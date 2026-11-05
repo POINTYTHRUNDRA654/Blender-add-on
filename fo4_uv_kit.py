@@ -783,6 +783,20 @@ def _collapsed_faces(obj):
     return n
 
 
+def _texture_warning(obj):
+    """' The mesh has textures ...' when its materials use image textures:
+    a new unwrap moves the islands, so images painted or baked for the old
+    UVs stop lining up (a re-unwrapped squid, 2026-11-05)."""
+    for slot in obj.material_slots:
+        m = slot.material
+        if not m or m.name == CHECKER_MAT or not m.use_nodes:
+            continue
+        if any(n.type == 'TEX_IMAGE' and n.image for n in m.node_tree.nodes):
+            return (". The mesh's textures were made for its old UVs and no longer line up: "
+                    "re-bake them (select the source, then this mesh: Re-bake from Source) or repaint")
+    return ""
+
+
 def _unwrap_all(obj):
     """Unwrap everything with the least-stretch method this Blender has.
     Minimum Stretch can silently squash a whole mesh flat (an AI vine mesh:
@@ -938,12 +952,14 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
                f"{hard} hard-edge, {cuts} to lie flat, {relief} stretch relief, "
                f"{merged} removed to join tiny islands; worst stretch {worst:.2f}; "
                f"texture used {auv * 100:.0f}%; {d:,.0f} px/m at {size[0]}px")
+        tex_warn = _texture_warning(obj)
+        msg += tex_warn
         if collapsed:
             msg += (f". {collapsed} faces could not be unwrapped (squashed flat): usually parts that "
                     "pass through each other; clean those up or remesh first")
         if notes:
             msg += " (" + "; ".join(notes) + ")"
-        self.report({'WARNING'} if worst > self.stretch_limit or collapsed else {'INFO'}, msg)
+        self.report({'WARNING'} if worst > self.stretch_limit or collapsed or tex_warn else {'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -1233,11 +1249,12 @@ class FO4_OT_UVKitDrape(Operator):
             tried = " | tried: " + ", ".join(
                 f"{_DRAPE_AXES[r[1]][3]} {r[4] * 100:.0f}% shared / {r[3] * 100:.0f}% steep"
                 for r in sorted(results, key=lambda r: r[0]))
-        self.report({'WARNING'} if overlap > 0.15 or (steep > 0.4 and not problems) else {'INFO'},
+        tex_warn = _texture_warning(obj)
+        self.report({'WARNING'} if overlap > 0.15 or (steep > 0.4 and not problems) or tex_warn else {'INFO'},
                     f"Drape Unwrap ({_DRAPE_AXES[ax][3]}): 2 islands, {seams} seam edges | "
                     f"{overlap * 100:.0f}% of the used texture is shared by parts behind each other | "
                     f"{steep * 100:.0f}% of the surface faces sideways{' (touched up)' if problems else ' and will stretch'}"
-                    f"{touch}{tried}")
+                    f"{touch}{tried}{tex_warn}")
         return {'FINISHED'}
 
 
@@ -1274,6 +1291,7 @@ class FO4_PT_UVKitPanel(_FO4SubPanel):
         row.operator("fo4.uvkit_auto_unwrap", text="Auto Unwrap", icon='UV_DATA').style = 'HARD_SURFACE'
         row.operator("fo4.uvkit_auto_unwrap", text="Fewest Islands", icon='UV_ISLANDSEL').style = 'ORGANIC'
         box.operator("fo4.uvkit_drape", text="Drape (2 big islands)", icon='MOD_CLOTH').axis = 'AUTO'
+        box.operator("fo4.rebake_from_source", text="Re-bake from Source (after new UVs)", icon='RENDER_STILL')
 
         box = layout.box()
         box.label(text="Preview", icon='UV')

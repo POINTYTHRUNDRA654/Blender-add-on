@@ -11397,6 +11397,160 @@ class FO4_OT_CombineVegetationMeshes(Operator):
         return context.window_manager.invoke_props_dialog(self)
 
 
+class FO4_OT_RebakeFromSource(Operator):
+    """Bake colour and normal again from the high-detail source onto the
+    active mesh's current UVs. Use it after changing the UVs of a baked mesh
+    (re-unwrapping moves the islands, so the old images no longer line up).
+    Select the source, then the game mesh last (active)"""
+    bl_idname = "fo4.rebake_from_source"
+    bl_label = "Re-bake from Source"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bake_diffuse: BoolProperty(name="Colour", default=True)
+    bake_normal: BoolProperty(name="Normal Map", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        a = context.active_object
+        return (a is not None and a.type == 'MESH' and context.mode == 'OBJECT'
+                and any(o.type == 'MESH' and o is not a for o in context.selected_objects))
+
+    @staticmethod
+    def _target_node(mat, name):
+        n = mat.node_tree.nodes.get(name) if mat and mat.use_nodes else None
+        return n if n is not None and n.type == 'TEX_IMAGE' else None
+
+    def execute(self, context):
+        low = context.active_object
+        sources = [o for o in context.selected_objects if o.type == 'MESH' and o is not low]
+        mat = low.active_material
+        dnode = self._target_node(mat, "Diffuse")
+        nnode = self._target_node(mat, "Normal")
+        if not (dnode or nnode):
+            self.report({'ERROR'}, "The active mesh's material has no 'Diffuse' or 'Normal' image node "
+                                   "(made by Retopologize & Bake) to bake into")
+            return {'CANCELLED'}
+        res = 2048
+        for n in (dnode, nnode):
+            if n and n.image:
+                res = max(res, n.image.size[0])
+        images = {}
+        for key, node, non_color in (("Diffuse", dnode, False), ("Normal", nnode, True)):
+            if node is None or not (self.bake_diffuse if key == "Diffuse" else self.bake_normal):
+                continue
+            img = node.image
+            if img is None or img.size[0] == 0 or (img.filepath and img.filepath.lower().endswith(".dds")):
+                img = bpy.data.images.new(f"{low.name}_{key}", res, res, alpha=False)
+                node.image = img
+            if non_color:
+                img.colorspace_settings.name = 'Non-Color'
+            images[key] = (node, img)
+        if not images:
+            self.report({'ERROR'}, "Nothing to bake")
+            return {'CANCELLED'}
+
+        from . import fo4_lod_generator as _lodg
+        from mathutils import Vector as _V
+
+        def _world_box(objs):
+            pts = [o.matrix_world @ _V(c) for o in objs for c in o.bound_box]
+            return (_V([min(p[i] for p in pts) for i in range(3)]),
+                    _V([max(p[i] for p in pts) for i in range(3)]))
+        lo_l, hi_l = _world_box([low])
+        lo_s, hi_s = _world_box(sources)
+        overlap = all(lo_l[i] < hi_s[i] and lo_s[i] < hi_l[i] for i in range(3))
+        size_l, size_s = hi_l - lo_l, hi_s - lo_s
+        same_size = all(abs(size_l[i] - size_s[i]) <= 0.15 * max(size_s[i], 1e-6) for i in range(3))
+        shift = None
+        if not overlap:
+            if not same_size:
+                self.report({'ERROR'}, "The source and the game mesh are not in the same place and not the same "
+                                       "size; move the game mesh back onto the source first (the bake shoots rays "
+                                       "from one onto the other)")
+                return {'CANCELLED'}
+            # moved aside (e.g. to compare them): line it up just for the bake
+            shift = (lo_s + hi_s) * 0.5 - (lo_l + hi_l) * 0.5
+        scn = context.scene
+        bk = scn.render.bake
+        saved = {k: getattr(bk, k) for k in (
+            "use_selected_to_active", "cage_extrusion", "max_ray_distance", "use_pass_direct",
+            "use_pass_indirect", "use_pass_color", "normal_space", "normal_r", "normal_g", "normal_b",
+            "margin")}
+        saved_engine, saved_samples = scn.render.engine, scn.cycles.samples
+        hidden = [o for o in sources if o.hide_get()]
+        swaps, stand_ins, src_img = [], [], None
+        try:
+            if shift is not None:
+                low.location += shift
+                context.view_layer.update()
+            for o in hidden:
+                o.hide_set(False)
+            # plain stand-in materials on the source (the FO4 node group bakes black)
+            for o in sources:
+                for slot in o.material_slots:
+                    img = _lodg.base_color_image(slot.material)
+                    src_img = src_img or img
+                    sm = bpy.data.materials.new("FO4_RebakeSource")
+                    sm.use_nodes = True
+                    bsdf = next(n for n in sm.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+                    if img is not None:
+                        tn = sm.node_tree.nodes.new('ShaderNodeTexImage')
+                        tn.image = img
+                        sm.node_tree.links.new(tn.outputs['Color'], bsdf.inputs['Base Color'])
+                    swaps.append((slot, slot.material))
+                    slot.material = sm
+                    stand_ins.append(sm)
+            if "Diffuse" in images and src_img is not None:
+                fill = _lodg._average_color(src_img)
+                images["Diffuse"][1].pixels.foreach_set(list(fill) * (images["Diffuse"][1].size[0] * images["Diffuse"][1].size[1]))
+            dim = max(low.dimensions) or 1.0
+            scn.render.engine = 'CYCLES'
+            scn.cycles.samples = 16
+            bk.use_selected_to_active = True
+            bk.cage_extrusion = max(0.001, dim * 0.02)
+            bk.max_ray_distance = max(0.01, dim * 0.1)
+            bk.margin = max(4, res // 256)
+            for o in context.view_layer.objects:
+                o.select_set(o is low or o in sources)
+            context.view_layer.objects.active = low
+            if "Diffuse" in images:
+                bk.use_pass_direct = bk.use_pass_indirect = False
+                bk.use_pass_color = True
+                mat.node_tree.nodes.active = images["Diffuse"][0]
+                bpy.ops.object.bake(type='DIFFUSE')
+            if "Normal" in images:
+                bk.normal_space = 'TANGENT'
+                # FO4 normal maps are DirectX-style (see Retopologize & Bake)
+                bk.normal_r, bk.normal_g, bk.normal_b = 'POS_X', 'NEG_Y', 'POS_Z'
+                mat.node_tree.nodes.active = images["Normal"][0]
+                bpy.ops.object.bake(type='NORMAL')
+        except Exception as exc:
+            self.report({'ERROR'}, f"Re-bake failed: {exc}")
+            return {'CANCELLED'}
+        finally:
+            for slot, m in swaps:
+                slot.material = m
+            for sm in stand_ins:
+                bpy.data.materials.remove(sm)
+            for k, v in saved.items():
+                setattr(bk, k, v)
+            scn.render.engine, scn.cycles.samples = saved_engine, saved_samples
+            for o in hidden:
+                o.hide_set(True)
+            if shift is not None:
+                low.location -= shift
+        done = []
+        for key, (node, img) in images.items():
+            if img.filepath and not img.packed_file:
+                img.save()
+                done.append(f"{key.lower()} saved to {img.filepath}")
+            else:
+                img.pack()
+                done.append(f"{key.lower()} (kept in the .blend)")
+        self.report({'INFO'}, f"Re-baked from {', '.join(o.name for o in sources)}: " + "; ".join(done))
+        return {'FINISHED'}
+
+
 class FO4_OT_RetopologizeAndBake(Operator):
     """Retopologize an AI-generated (triangle-soup) mesh — e.g. a Meshy
     "smart topology" import — into a clean quad mesh and bake its original
@@ -17791,6 +17945,7 @@ classes = (
     FO4_OT_CreateVegetationPreset,
     FO4_OT_CombineVegetationMeshes,
     FO4_OT_RetopologizeAndBake,
+    FO4_OT_RebakeFromSource,
     FO4_OT_ScatterVegetation,
     FO4_OT_OptimizeVegetationForFPS,
     FO4_OT_CreateVegetationLODChain,

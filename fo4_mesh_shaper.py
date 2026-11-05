@@ -1184,6 +1184,7 @@ class FO4_PT_MeshShaperPanel(_FO4SubPanel):
         box = layout.box()
         box.label(text="Retopology", icon='MOD_REMESH')
         box.operator("fo4.retopo_and_bake", text="Retopologize & Bake (automatic)", icon='AUTO')
+        box.operator("fo4.rebake_from_source", text="Re-bake from Source", icon='RENDER_STILL')
         if _retopoflow_installed():
             # RetopoFlow (Orange Turbine / CG Cookie, GPL-3.0) is a separate
             # add-on: draw a clean low-poly mesh over the selected high-poly
