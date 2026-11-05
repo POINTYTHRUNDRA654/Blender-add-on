@@ -1997,7 +1997,7 @@ class FO4_PT_RiggedArmorPipeline(_FO4SubPanel):
         box = layout.box()
         box.operator("fo4.copy_pynif_rigged_settings", text="Copy Rigged pyNIF Settings", icon='COPYDOWN')
         box.operator("fo4.save_pynif_rigged_preset", text="Save Rigged Preset JSON", icon='FILE_TICK')
-        box.label(text="Enable Skinning + BSDismember + Export Partitions", icon='DOT')
+        box.label(text="Skin weights and FO4 Seg groups are written automatically", icon='DOT')
 
         layout.separator()
         layout.label(text="Step 8 — Creation Kit:", icon='WORLD')

@@ -181,6 +181,18 @@ def patch_exported_nif(exported_path, original_path, obj) -> dict:
         report["could_not_restore"].append(f"(failed to open NIFs for patching: {exc})")
         return report
 
+    # With both files open, name only what the original really had and the
+    # export lost, instead of the blanket _ALWAYS_UNRESTORABLE list (which
+    # told users a vanilla body "could not restore Havok collision" although
+    # it never had any).
+    report["could_not_restore"] = []
+    try:
+        if orig.root.collision_object is not None and exp.root.collision_object is None:
+            report["could_not_restore"].append(
+                "Havok collision (the original NIF had collision; add a UCX_ collision object to export it)")
+    except Exception:
+        report["could_not_restore"].append("Havok collision (could not compare)")
+
     dirty = False
 
     # ---- root name -------------------------------------------------------
@@ -204,6 +216,16 @@ def patch_exported_nif(exported_path, original_path, obj) -> dict:
     except Exception as exc:
         pairs = []
         report["could_not_restore"].append(f"shape matching ({exc})")
+
+    for o_shape, e_shape in pairs:
+        try:
+            o_sh = o_shape.shader.blockname if o_shape.shader else None
+            e_sh = e_shape.shader.blockname if e_shape.shader else None
+            if o_sh and e_sh and o_sh != e_sh:
+                report["could_not_restore"].append(
+                    f"shader block type on {e_shape.name} ({o_sh} in the original, {e_sh} exported)")
+        except Exception:
+            pass
 
     alpha_restored = False
     for o_shape, e_shape in pairs:

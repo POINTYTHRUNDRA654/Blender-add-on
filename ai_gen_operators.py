@@ -3979,59 +3979,91 @@ class FO4_OT_CopyCreaturePipeline(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ── PyNifly export settings (real ones) ──────────────────────────────────────
+# PyNifly's NIF exporter (export_scene.pynifly) uses Blender operator presets:
+# Python files under scripts/presets/operator/export_scene.pynifly/ that show
+# up in the preset menu of File > Export > NIF. Before 2026-11-04 these
+# buttons saved JSON with made-up options ("BSDismember", "BSFadeNode",
+# "bhkConvexShape", user version 2 = 83) and said to load it via a
+# "File > Import Preset" menu that PyNifly does not have.
+
+def _mossy_pynifly_export_settings():
+    """The export_scene.pynifly settings Mossy's own Export button uses
+    (ExportHelpers._build_pynifly_export_kwargs), without the file path."""
+    try:
+        from . import export_helpers as _eh
+        kw = dict(_eh.ExportHelpers._build_pynifly_export_kwargs("preset.nif") or {})
+    except Exception:
+        return {}
+    kw.pop("filepath", None)
+    return kw
+
+
+def _write_pynifly_export_preset(name):
+    """Write a Blender operator preset for PyNifly's NIF exporter with the
+    settings Mossy's Export button uses. Returns the preset file path."""
+    import os
+    kw = _mossy_pynifly_export_settings()
+    if not kw:
+        raise RuntimeError("PyNifly's NIF exporter is not installed or enabled")
+    folder = bpy.utils.user_resource(
+        'SCRIPTS', path=os.path.join("presets", "operator", "export_scene.pynifly"), create=True)
+    path = os.path.join(folder, bpy.path.clean_name(name) + ".py")
+    lines = ["import bpy", "op = bpy.context.active_operator", ""]
+    lines += [f"op.{k} = {v!r}" for k, v in sorted(kw.items())]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+_FO4_NIF_FACTS = (
+    "What Mossy's Export button writes for Fallout 4 (checked against vanilla NIFs, 2026-11-04):\n"
+    "Header: Gamebryo 20.2.0.7, user version 12, BS stream 130. Root node: NiNode.\n"
+)
+_FO4_STATIC_FACTS = (
+    "Collision: bhkNPCollisionObject + bhkPhysicsSystem holding an hknp convex hull, with the "
+    "FO4 Havok material for the collision type (Stone, Wood, Grass...). BSXFlags 130 with "
+    "collision, none without.\n"
+    "Materials: BSLightingShaderProperty using the BGSM; texture paths relative to Data.\n"
+)
+_FO4_RIGGED_FACTS = (
+    "Shapes: BSSubIndexTriShape with BSSkin::Instance and BSSkin::BoneData, up to 4 bone "
+    "influences per vertex.\n"
+    "Segments: from the 'FO4 Seg ...' vertex groups; the .ssf is written next to the NIF. "
+    "Save the NIF under a Meshes folder so the .ssf path is relative to Data.\n"
+)
+
+
+def _pynifly_settings_text(kind):
+    kw = _mossy_pynifly_export_settings()
+    settings = ", ".join(f"{k}={v}" for k, v in sorted(kw.items())) or "(PyNifly not installed)"
+    facts = _FO4_RIGGED_FACTS if kind == "rigged" else _FO4_STATIC_FACTS
+    extra = ("LODs: Mossy's Generate LODs button writes the LOD NIFs; collision comes from the "
+             "UCX_ collision object.\n") if kind == "lod" else ""
+    return ("PyNifly export settings (File > Export > NIF), the same as Mossy's Export button:\n"
+            + settings + "\n" + _FO4_NIF_FACTS + facts + extra)
+
+
+def _save_preset_execute(op, name):
+    try:
+        path = _write_pynifly_export_preset(name)
+    except Exception as exc:
+        op.report({'ERROR'}, f"Could not save the PyNifly preset: {exc}")
+        return {'CANCELLED'}
+    op.report({'INFO'}, f"Saved PyNifly export preset '{bpy.path.display_name(name)}' "
+                        f"(File > Export > NIF, preset menu): {path}")
+    return {'FINISHED'}
+
+
 class FO4_OT_SavePyNIFCreaturePreset(bpy.types.Operator):
-    """Save the FO4 creature pyNIF export preset JSON to disk.
-    Same settings as rigged armor — Enable Skinning=True, BSDismember=True."""
+    """Save a PyNifly export preset for rigged creatures, with the settings
+    Mossy's Export button uses (pick it in File > Export > NIF)."""
     bl_idname  = "fo4.save_pynif_creature_preset"
     bl_label   = "Save pyNIF Creature Preset"
     bl_options = {'REGISTER'}
 
-    filepath: bpy.props.StringProperty(subtype='FILE_PATH', default="pynif_fo4_creature_preset.json")
-    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
-
-    def invoke(self, context, event):
-        self.filepath = "pynif_fo4_creature_preset.json"
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
-
     def execute(self, context):
-
-        from .path_guard import output_path_ok
-
-        if not output_path_ok(self, self.filepath, "where to save"):
-
-            return {'CANCELLED'}
-        import json, pathlib
-        preset = {
-            "label": "pyNIF Export — Rigged Creature (Fallout 4)",
-            "game": "Fallout4", "version": "20.2.0.7",
-            "user_version": 12, "user_version_2": 130,
-            "nodes": {"root": "BSFadeNode", "enable_skinning": True,
-                      "enable_tangents": True, "enable_havok": True},
-            "skeleton": {"export_armature": True, "preserve_bone_names": True,
-                         "preserve_hierarchy": True},
-            "geometry": {"triangulate": True, "apply_modifiers": True,
-                         "remove_doubles": True, "recalculate_normals": True,
-                         "auto_smooth_angle": 30},
-            "skinning": {"export_skin_weights": True,
-                         "export_bs_dismember_skin_instance": True,
-                         "export_partitions": True,
-                         "partition_source": "vertex_groups"},
-            "materials": {"material_type": "BGSM", "use_external_bgsm": True,
-                          "texture_format": "DDS"},
-            "collision": {"type": "None"},
-            "animation_notes": (
-                "1. Animate on imported FO4 creature armature (separate Actions per clip)"
-                " | 2. Export each Action as FBX (Bake Animation=ON)"
-                " | 3. Convert FBX→HKX via hkxcmd / Havok Content Tools"
-                " | 4. Place HKX in Data\\Meshes\\Actors\\YourCreature\\Animations\\"
-                " | 5. Clone vanilla behavior graph, swap animation clips, point to your NIF"
-            ),
-        }
-        dst = pathlib.Path(self.filepath)
-        dst.write_text(json.dumps(preset, indent=2))
-        self.report({'INFO'}, f"Creature preset saved: {dst.name}")
-        return {'FINISHED'}
+        return _save_preset_execute(self, "FO4_Creature_Mossy")
 
 
 class FO4_OT_CopyFullLODPipeline(bpy.types.Operator):
@@ -4053,8 +4085,8 @@ class FO4_OT_CopyFullLODPipeline(bpy.types.Operator):
                 "STEP 2 Run fo4_lod_generator.py → LOD0/1/2/3\n"
                 "STEP 3 Run fo4_collision_from_lod3.py → LOD3_COL\n"
                 "STEP 4 Clean LOD0: Merge by Distance, Triangulate, Apply Transforms, Normals, Auto Smooth 30°\n"
-                "STEP 5 pyNIF export: Main=Mesh_LOD0, Collision=Mesh_LOD3_COL, "
-                "bhkConvexShape/MO_SYS_STATIC/Mass=0, Header 20.2.0.7/12/130, BSFadeNode\n"
+                "STEP 5 Export with Mossy's Export Mesh + Collision: Main=Mesh_LOD0, "
+                "Collision=Mesh_LOD3_COL (bhkNPCollisionObject/bhkPhysicsSystem), Header 20.2.0.7/12/130\n"
                 "STEP 6 Creation Kit: Static → New → Model → NIF\n"
             )
         context.window_manager.clipboard = txt
@@ -4134,9 +4166,9 @@ class FO4_OT_SetupCollisionMesh(bpy.types.Operator):
     collision_type: bpy.props.EnumProperty(
         name="Collision Type",
         items=[
-            ('CONVEX',    "bhkConvexShape (complex props, rocks, trees)", ""),
-            ('BOX',       "bhkBoxShape (simple props — use a cube)",      ""),
-            ('RIGIDBODY', "bhkRigidBody (physics/movable props)",         ""),
+            ('CONVEX',    "Static convex hull (props, rocks, trees)",    ""),
+            ('BOX',       "Static box (simple props, use a cube)",       ""),
+            ('RIGIDBODY', "Movable physics prop (uses the mass below)",  ""),
         ],
         default='CONVEX',
     )
@@ -4153,36 +4185,28 @@ class FO4_OT_SetupCollisionMesh(bpy.types.Operator):
         obj.data.materials.clear()
 
         type_map = {
-            'CONVEX':    "bhkConvexShape / MO_SYS_STATIC",
-            'BOX':       "bhkBoxShape / MO_SYS_STATIC",
-            'RIGIDBODY': f"bhkRigidBody / MO_SYS_DYNAMIC (mass={self.mass})",
+            'CONVEX':    "static convex hull",
+            'BOX':       "static box",
+            'RIGIDBODY': f"movable physics prop (mass={self.mass})",
         }
         hint = type_map.get(self.collision_type, "")
         print(f"[FO4 Collision] {obj.name} marked as: {hint}")
-        print("In pyNIF: mark this object as collision-only, exclude from render")
+        print("Export with Mossy's Export Mesh + Collision; FO4 collision is written as "
+              "bhkNPCollisionObject + bhkPhysicsSystem")
         self.report({'INFO'}, f"Collision mesh ready: {hint}")
         return {'FINISHED'}
 
 
 class FO4_OT_CopyPyNIFLODSettings(bpy.types.Operator):
-    """Copy pyNIF LOD + collision export settings to clipboard."""
+    """Copy the PyNifly export settings Mossy's Export button uses, plus what
+    the exported Fallout 4 NIF contains, to the clipboard."""
     bl_idname  = "fo4.copy_pynif_lod_settings"
     bl_label   = "Copy pyNIF LOD Settings"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        txt = (
-            "# pyNIF Export — LOD + Collision (Fallout 4)\n"
-            "Game: Fallout4 | Version: 20.2.0.7 | UV12 | UV2-130\n"
-            "Geometry: Triangulate=On, Apply Modifiers=On, Remove Doubles=On, Normals=Recalculate, Auto Smooth=30°\n"
-            "Materials: BGSM, Use External BGSM=On  ← do NOT rename/remove material slots\n"
-            "Collision Static:  bhkConvexShape | Source=Mesh_Collision | MO_SYS_STATIC | Mass=0\n"
-            "Collision Dynamic: bhkRigidBody   | Source=Mesh_Collision | MO_SYS_DYNAMIC | Mass=5-20\n"
-            "LOD Decimation: LOD1=0.6, LOD2=0.3, LOD3=0.1 (collision)\n"
-            "Mark Mesh_Collision as collision-only (no render) in pyNIF\n"
-        )
-        context.window_manager.clipboard = txt
-        self.report({'INFO'}, "LOD + collision settings copied to clipboard")
+        context.window_manager.clipboard = _pynifly_settings_text("lod")
+        self.report({'INFO'}, "LOD + collision export settings copied to clipboard")
         return {'FINISHED'}
 
 
@@ -4380,50 +4404,27 @@ class FO4_OT_TransferArmorWeights(bpy.types.Operator):
 
 
 class FO4_OT_CopyPyNIFRiggedSettings(bpy.types.Operator):
-    """Copy pyNIF export settings for FO4 rigged armor/clothing to clipboard."""
+    """Copy the PyNifly export settings Mossy's Export button uses, plus what
+    the exported Fallout 4 NIF contains, to the clipboard."""
     bl_idname  = "fo4.copy_pynif_rigged_settings"
     bl_label   = "Copy pyNIF Rigged Armor Settings"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        txt = "Game: Fallout4 | Version: 20.2.0.7 | UV12/UV2-130 | Skinning: ON | BSDismember: ON"
-        context.window_manager.clipboard = txt
-        self.report({'INFO'}, "pyNIF rigged armor settings copied to clipboard")
+        context.window_manager.clipboard = _pynifly_settings_text("rigged")
+        self.report({'INFO'}, "Rigged armor export settings copied to clipboard")
         return {'FINISHED'}
 
 
 class FO4_OT_SavePyNIFRiggedPreset(bpy.types.Operator):
-    """Save the FO4 rigged armor pyNIF preset JSON to disk.
-    Load via pyNIF: File → Import Preset."""
+    """Save a PyNifly export preset for rigged armor and clothing, with the
+    settings Mossy's Export button uses (pick it in File > Export > NIF)."""
     bl_idname  = "fo4.save_pynif_rigged_preset"
     bl_label   = "Save pyNIF Rigged Preset"
     bl_options = {'REGISTER'}
 
-    filepath: bpy.props.StringProperty(subtype='FILE_PATH', default="pynif_fo4_rigged_preset.json")
-    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
-
-    def invoke(self, context, event):
-        self.filepath = "pynif_fo4_rigged_preset.json"
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
-
     def execute(self, context):
-
-        from .path_guard import output_path_ok
-
-        if not output_path_ok(self, self.filepath, "where to save"):
-
-            return {'CANCELLED'}
-        import pathlib, shutil
-        bundled = pathlib.Path(__file__).parent / "presets" / "pynif_fo4_rigged_preset.json"
-        dst = pathlib.Path(self.filepath)
-        if bundled.exists():
-            shutil.copy2(str(bundled), str(dst))
-            self.report({'INFO'}, f"Rigged preset saved: {dst.name}")
-        else:
-            self.report({'WARNING'}, "Bundled rigged preset not found")
-            return {'CANCELLED'}
-        return {'FINISHED'}
+        return _save_preset_execute(self, "FO4_Rigged_Armor_Mossy")
 
 
 class FO4_OT_CopyAIPrompt(bpy.types.Operator):
@@ -4721,104 +4722,26 @@ class FO4_OT_SaveBGSMTemplate(bpy.types.Operator):
 
 
 class FO4_OT_SavePyNIFPreset(bpy.types.Operator):
-    """Save the FO4 pyNIF preset JSON to a location you choose.
-    Load it in pyNIF via File → Import Preset to pre-fill all export settings."""
+    """Save a PyNifly export preset for static meshes, with the settings
+    Mossy's Export button uses (pick it in File > Export > NIF)."""
     bl_idname  = "fo4.save_pynif_preset"
     bl_label   = "Save pyNIF Preset File"
     bl_options = {'REGISTER'}
 
-    filepath: bpy.props.StringProperty(
-        subtype='FILE_PATH',
-        default="pynif_fo4_preset.json",
-    )
-    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
-
-    def invoke(self, context, event):
-        self.filepath = "pynif_fo4_preset.json"
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
-
     def execute(self, context):
-
-        from .path_guard import output_path_ok
-
-        if not output_path_ok(self, self.filepath, "where to save"):
-
-            return {'CANCELLED'}
-        import os, json, pathlib
-
-        preset = {
-            "game": "Fallout4",
-            "export_format": "NIF",
-            "version": "20.2.0.7",
-            "user_version": 12,
-            "user_version_2": 130,
-            "geometry": {
-                "triangulate": True,
-                "apply_modifiers": True,
-                "remove_doubles": True,
-                "recalculate_normals": True,
-                "auto_smooth_angle": 30,
-                "enable_tangents": True,
-            },
-            "materials": {
-                "material_type": "BGSM",
-                "embed_material_path": False,
-                "use_external_bgsm": True,
-                "texture_format": "DDS",
-                "basecolor": "",
-                "normal": "",
-                "roughness": "",
-                "metallic": "",
-                "ao": "",
-            },
-            "collision": {
-                "type": "bhkConvexShape",
-                "mass": 1,
-                "motion_system": "MO_SYS_KEYFRAMED",
-                "enable_havok": True,
-            },
-            "nodes": {
-                "root": "BSFadeNode",
-                "enable_skinning": False,
-            },
-        }
-
-        # Also try to copy from bundled preset if present
-        bundled = pathlib.Path(__file__).parent / "presets" / "pynif_fo4_preset.json"
-        if bundled.exists():
-            try:
-                preset = json.loads(bundled.read_text(encoding="utf-8"))
-            except Exception:
-                pass  # fall back to inline dict above
-
-        out = pathlib.Path(self.filepath)
-        out.write_text(json.dumps(preset, indent=2), encoding="utf-8")
-        print(f"[pyNIF] Preset saved to: {out}")
-        self.report({'INFO'}, f"pyNIF FO4 preset saved: {out.name}")
-        return {'FINISHED'}
+        return _save_preset_execute(self, "FO4_Static_Mossy")
 
 
 class FO4_OT_CopyPyNIFSettings(bpy.types.Operator):
-    """Copy the full pyNIF export settings for Fallout 4 to clipboard.
-    Covers: NIF header, geometry, materials (BGSM), collision, nodes, and export path."""
-    bl_idname = "fo4.copy_pynif_settings"
-    bl_label  = "Copy pyNIF Export Settings"
+    """Copy the PyNifly export settings Mossy's Export button uses, plus what
+    the exported Fallout 4 NIF contains, to the clipboard."""
+    bl_idname  = "fo4.copy_pynif_settings"
+    bl_label   = "Copy pyNIF Export Settings"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        txt = (
-                "Game: Fallout 4\nExport Format: NIF\n"
-                "Version: 20.2.0.7\nUser Version: 12\nUser Version 2: 130\n"
-                "Triangulate Mesh: On\nApply Modifiers: On\n"
-                "Remove Doubles: On\nNormals: Recalculate\nAuto Smooth: 30 deg\n"
-                "Material Type: BGSM\nTexture Format: DDS (BC7)\n"
-                "Root Node: BSFadeNode\nEnable Havok: On\n"
-                "Enable Tangents: On\nEnable Skinning: Off\n"
-            )
-        context.window_manager.clipboard = txt
-        print(f"[pyNIF] FO4 export settings copied to clipboard")
-        self.report({'INFO'}, "pyNIF FO4 export settings copied to clipboard")
+        context.window_manager.clipboard = _pynifly_settings_text("static")
+        self.report({'INFO'}, "FO4 export settings copied to clipboard")
         return {'FINISHED'}
 
 

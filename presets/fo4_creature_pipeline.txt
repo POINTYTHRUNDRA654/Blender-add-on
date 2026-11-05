@@ -25,15 +25,14 @@ STEP 4 — Transfer weights from vanilla creature
 
 STEP 5 — Dismember partitions (if gore required)
   Vertex Groups → Add "FO4 Seg 000" → Assign all vertices
-  pyNIF converts to a BSSubIndexTriShape with an FO4Segment partition
+  Export writes a BSSubIndexTriShape with one segment per FO4 Seg group
 
-STEP 6 — Export rigged creature NIF (pyNIF)
-  Game: Fallout 4 | Version: 20.2.0.7 | User Version: 12 | User Version 2: 83
-  Root: BSFadeNode | Enable Skinning: True | Enable Tangents: True | Enable Havok: True
-  Skeleton: Export Armature=True, Preserve Bone Names=True, Preserve Hierarchy=True
-  Geometry: Triangulate, Apply Modifiers, Remove Doubles, Recalculate Normals, Auto Smooth 30°
-  Skinning: Export Skin Weights=True, BSDismemberSkinInstance=True
-  Materials: BGSM, Use External BGSM, DDS BC7
+STEP 6 — Export rigged creature NIF (Mossy's Export Mesh button)
+  Header: 20.2.0.7 | User Version: 12 | BS stream: 130 | Root: NiNode
+  Skinning: BSSkin::Instance + BSSkin::BoneData, up to 4 bone influences per vertex
+  Segments: from the FO4 Seg vertex groups; the .ssf is written next to the NIF
+            (save under a Meshes folder so its path is relative to Data)
+  Materials: BGSM, DDS textures with Data-relative paths
   Collision: None (deforms with skeleton)
 
 ANIMATION PIPELINE
@@ -158,7 +157,7 @@ COMPLETE 17-STEP PIPELINE
  1. Model creature
  2. Rig to FO4 skeleton (fo4_creature_rigging.py)
  3. Transfer weights (Transfer FO4 Weights operator)
- 4. Export rigged NIF (pyNIF — Skinning=ON, BSDismember=ON)
+ 4. Export rigged NIF (Mossy's Export Mesh button)
  5. Animate in Blender (separate Actions per clip)
  6. Export FBX per action (Bake Anim=ON)
  7. Convert FBX → HKX (hkxcmd / Havok Content Tools, 32-bit)

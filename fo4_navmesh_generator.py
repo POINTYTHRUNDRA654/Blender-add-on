@@ -154,11 +154,16 @@ def validate_navmesh(nav_obj) -> dict:
             "message":  f"{len(non_tris)} non-triangle faces — FO4 navmesh must be all-tris",
             "fix":      "Apply Triangulate modifier",
         })
-    # Check manifold (no open edges)
+    # Edge topology. A navmesh is an open walkable surface, so border edges
+    # (one triangle) are normal and not reported. What a NAVM record cannot
+    # hold is an edge shared by three or more triangles: each navmesh
+    # triangle stores one neighbour link per edge. Wire edges (no triangle)
+    # are stray geometry.
     bm = bmesh.new()
     bm.from_mesh(me)
     bm.edges.ensure_lookup_table()
-    open_edges = [e for e in bm.edges if len(e.link_faces) < 2]
+    fan_edges = [e for e in bm.edges if len(e.link_faces) > 2]
+    wire_edges = [e for e in bm.edges if not e.link_faces]
     # Degenerate (near-zero-area) triangles -- these cause CK pathfinding to
     # hang or crash (same check navmesh_helpers.py's independent validator
     # already performs). min_triangle_area was declared in NAVMESH_LIMITS but
@@ -167,11 +172,18 @@ def validate_navmesh(nav_obj) -> dict:
     bm.faces.ensure_lookup_table()
     degenerate = [f for f in bm.faces if f.calc_area() < NAVMESH_LIMITS["min_triangle_area"]]
     bm.free()
-    if open_edges:
+    if fan_edges:
         issues.append({
             "severity": "WARNING",
-            "message":  f"{len(open_edges)} open edges — navmesh should be manifold for best results",
-            "fix":      "Fill holes or use Mesh → Clean Up → Fill Holes",
+            "message":  f"{len(fan_edges)} edge(s) shared by 3+ triangles — a navmesh triangle "
+                        "can link to only one neighbour per edge",
+            "fix":      "Select > Select All by Trait > Non Manifold, then separate or delete the extra triangles",
+        })
+    if wire_edges:
+        issues.append({
+            "severity": "WARNING",
+            "message":  f"{len(wire_edges)} loose edge(s) with no triangle",
+            "fix":      "Mesh > Clean Up > Delete Loose",
         })
     if degenerate:
         issues.append({

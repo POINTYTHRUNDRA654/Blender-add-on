@@ -1414,27 +1414,36 @@ class FO4_OT_LoadFO4Skeleton(Operator):
     def _skeleton_nif_path(self) -> "str | None":
         """Return path to skeleton.nif if found in the configured FO4 assets folder."""
         import os
-        root = None
+        # Try every configured folder, not just the first one: an assets path
+        # that is set but has no loose skeleton.nif used to stop the search
+        # and fall back to the 22-bone placeholder skeleton even when the
+        # game Data folder setting pointed at an unpacked game.
+        roots = []
         try:
             from . import preferences as _prefs
-            root = _prefs.get_fo4_assets_path()
+            roots.append(_prefs.get_fo4_assets_path())
+            _p = _prefs.get_preferences()
+            if _p is not None:
+                roots.append(getattr(_p, "fo4_game_data_path", ""))
         except Exception:
             pass
-        if not root and fo4_game_assets:
+        if fo4_game_assets:
             try:
                 data_dir = fo4_game_assets.FO4GameAssets.get_data_dir()
                 if data_dir:
-                    root = str(data_dir)
+                    roots.append(str(data_dir))
             except Exception:
                 pass
-        if not root:
-            return None
-        candidates = [
-            os.path.join(root, "meshes", "actors", "character", "characterassets", "skeleton.nif"),
-            os.path.join(root, "Data", "meshes", "actors", "character", "characterassets", "skeleton.nif"),
-            os.path.join(root, "meshes", "actors", "character", "skeleton.nif"),
-        ]
-        return next((p for p in candidates if os.path.exists(p)), None)
+        for root in [r for r in roots if r]:
+            candidates = [
+                os.path.join(root, "meshes", "actors", "character", "characterassets", "skeleton.nif"),
+                os.path.join(root, "Data", "meshes", "actors", "character", "characterassets", "skeleton.nif"),
+                os.path.join(root, "meshes", "actors", "character", "skeleton.nif"),
+            ]
+            found = next((p for p in candidates if os.path.exists(p)), None)
+            if found:
+                return found
+        return None
 
     def execute(self, context):
         # ── 1. Already in scene? ──────────────────────────────────────────────
@@ -18353,15 +18362,15 @@ def register():
             name="Collision Type",
             description="FO4 collision shape type for pyNIF export",
             items=[
-                ('CONVEX',    "bhkConvexShape — Static (buildings, rocks, trees)", ""),
-                ('BOX',       "bhkBoxShape — Simple Static (box props)",            ""),
-                ('RIGIDBODY', "bhkRigidBody — Dynamic (physics props, mass 5-20)",  ""),
+                ('CONVEX',    "Static convex hull (buildings, rocks, trees)", ""),
+                ('BOX',       "Static box (simple box props)",                ""),
+                ('RIGIDBODY', "Movable physics prop (mass 5-20)",             ""),
             ],
             default='CONVEX',
         )
         bpy.types.Scene.fo4_sbp_slot_choice = bpy.props.EnumProperty(
             name="SBP Slot",
-            description="FO4 BSDismember body partition slot",
+            description="Body part slot for the FO4 segment (FO4 Seg) vertex group",
             items=_fo4_sbp_slot_items,
             default=0,  # 'SBP_32' -- index, not string: Blender requires an
                         # int default when items is a callable, not a string

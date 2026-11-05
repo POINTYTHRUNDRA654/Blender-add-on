@@ -18,17 +18,14 @@ STEP 4 — Clean main mesh (Mesh_LOD0)
   Mesh → Normals → Recalculate Outside
   Auto Smooth → 30°
 
-STEP 5 — Export with pyNIF
+STEP 5 — Export with Mossy's Export Mesh + Collision button
   Main mesh:       Mesh_LOD0
-  Collision mesh:  Mesh_LOD3_COL (mark as collision-only, exclude from render)
-  Collision type:  bhkConvexShape / MO_SYS_STATIC / Mass=0   (static world objects)
-                   bhkRigidBody  / MO_SYS_DYNAMIC / Mass=5-20 (movable props)
+  Collision mesh:  Mesh_LOD3_COL (written as the NIF's collision, not rendered)
+  Collision:       bhkNPCollisionObject + bhkPhysicsSystem (hknp convex hull)
+                   with the FO4 Havok material of the collision type
   Materials:       Already connected — do NOT rename or remove BGSM slots
-  Header:          Version 20.2.0.7 / User Version 12 / User Version 2 83
-  Root Node:       BSFadeNode
-  Enable Tangents: True
-  Enable Havok:    True
-  Enable Skinning: False
+  Header:          Version 20.2.0.7 / User Version 12 / BS stream 130
+  Root Node:       NiNode, BSXFlags 130 (collision present)
 
 STEP 6 — Import into Creation Kit
   Object Window → Static → New
@@ -37,10 +34,10 @@ STEP 6 — Import into Creation Kit
 
 Your NIF contains:
   ✓ Main mesh (Mesh_LOD0)
-  ✓ Collision mesh (bhkConvexShape / bhkRigidBody)
+  ✓ Collision (bhkNPCollisionObject / bhkPhysicsSystem)
   ✓ All textures intact
   ✓ All BGSM materials intact
-  ✓ FO4 header values (20.2.0.7 / 12 / 83)
+  ✓ FO4 header values (20.2.0.7 / 12 / 130)
 
 
 Per-Asset Checklist (Reusable — every tree, building, rock, prop)

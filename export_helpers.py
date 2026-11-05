@@ -6,6 +6,7 @@ from .op_utils import op_exists as _op_exists
 import bpy
 import os
 import json
+import re
 import sys
 import traceback
 
@@ -1178,6 +1179,33 @@ class ExportHelpers:
                   "(e.g. to 4096x4096) before using this mesh in the CK.")
 
     @staticmethod
+    def _absolute_segment_file_note(filepath):
+        """' -- WARNING: ...' when the exported NIF's skinned shapes point at
+        their segment (.ssf) file by an absolute path, or ''.
+
+        PyNifly writes the reference relative ("Meshes\\...\\x.ssf") only when
+        the NIF is saved somewhere under a "Meshes" folder; anywhere else
+        (Downloads, Desktop) it embeds the full disk path, which will not
+        exist on players' PCs. Vanilla uses relative paths: 1,667 of the 1,667
+        armor/clothes/body BSSubIndexTriShapes with a segment file (the other
+        609 have none), checked 2026-11-04."""
+        try:
+            from io_scene_nifly.pyn import pynifly as _pyn
+            nif = _pyn.NifFile(str(filepath))
+            bad = sorted({s.segment_file for s in nif.shapes
+                          if getattr(s, "blockname", "") == "BSSubIndexTriShape"
+                          and re.match(r"^([A-Za-z]:[\\/]|[\\/])", s.segment_file or "")})
+        except Exception:
+            return ""
+        if not bad:
+            return ""
+        return (" -- WARNING: the segment file is referenced by a full disk path ("
+                + bad[0] + "), which will not exist on players' PCs; vanilla always "
+                "uses a path relative to Data. Export the NIF into a "
+                "folder under Meshes (for example Downloads\\MyMod\\Meshes\\Armor\\MyArmor\\) "
+                "so the reference is written as Meshes\\...\\name.ssf, and ship the .ssf with it.")
+
+    @staticmethod
     def _hide_siblings_from_pynifly(obj, keep):
         """Hide everything else visible under *obj*'s top-level parent and
         return what was hidden (see _unhide_objects).
@@ -1898,7 +1926,8 @@ class ExportHelpers:
                     if _stage_notes:
                         _tex_note += "  [new textures: " + "; ".join(_stage_notes) + "]"
                     return True, (f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}"
-                                  f"{ExportHelpers._ck_crash_texture_note([obj])}")
+                                  f"{ExportHelpers._ck_crash_texture_note([obj])}"
+                                  f"{ExportHelpers._absolute_segment_file_note(filepath)}")
 
                 # Operator returned without FINISHED — treat as failure
                 return False, f"NIF export did not complete (result={result}). Check the Blender console for details."
@@ -2640,7 +2669,8 @@ class ExportHelpers:
                         _staged_note = ("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""
                         return True, (f"Exported {mesh_count} mesh(es) as single NIF via "
                                       f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}{_leaf_note}{_bgsm_note}{_staged_note}"
-                                      f"{ExportHelpers._ck_crash_texture_note(meshes)}")
+                                      f"{ExportHelpers._ck_crash_texture_note(meshes)}"
+                                      f"{ExportHelpers._absolute_segment_file_note(filepath)}")
                     fallback_msg = f"NIF export did not finish ({result}); falling back to FBX."
                 except Exception as e:
                     print(
