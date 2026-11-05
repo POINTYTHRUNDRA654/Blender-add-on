@@ -748,6 +748,57 @@ class MeshHelpers:
         return True, "  |  ".join(parts)
 
     @staticmethod
+    def shell_remesh(obj, target_tris, detail=400, skin=1.35):
+        """Rebuild *obj* in place as one closed surface: a thin skin grown
+        around every face (signed-distance grid, so holes, open tubes and
+        loose scraps don't matter), then reduced to ~*target_tris*
+        triangles (0 = keep full detail). *detail* = grid cells across the longest side; *skin* =
+        skin thickness in cells. Returns False if this Blender lacks the
+        grid nodes (added in Blender 5.0) or the result is empty."""
+        needed = ('GeometryNodeMeshToSDFGrid', 'GeometryNodeSDFGridOffset', 'GeometryNodeGridToMesh')
+        if not all(hasattr(bpy.types, n) for n in needed):
+            return False
+        size = max(obj.dimensions) / max(1e-9, max(abs(s) for s in obj.scale))
+        voxel = max(1e-5, size / float(detail))
+        ng = bpy.data.node_groups.new("FO4_ShellRemesh", 'GeometryNodeTree')
+        try:
+            ng.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+            ng.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+            gi = ng.nodes.new('NodeGroupInput')
+            go = ng.nodes.new('NodeGroupOutput')
+            sdf = ng.nodes.new('GeometryNodeMeshToSDFGrid')
+            off = ng.nodes.new('GeometryNodeSDFGridOffset')
+            g2m = ng.nodes.new('GeometryNodeGridToMesh')
+            sdf.inputs['Voxel Size'].default_value = voxel
+            sdf.inputs['Band Width'].default_value = 6
+            off.inputs['Distance'].default_value = voxel * skin
+            g2m.inputs['Threshold'].default_value = 0.0
+            ng.links.new(gi.outputs[0], sdf.inputs['Mesh'])
+            ng.links.new(sdf.outputs[0], off.inputs['Grid'])
+            ng.links.new(off.outputs[0], g2m.inputs['Grid'])
+            ng.links.new(g2m.outputs[0], go.inputs[0])
+            mod = obj.modifiers.new("FO4_ShellRemesh", 'NODES')
+            mod.node_group = ng
+            with bpy.context.temp_override(object=obj, active_object=obj, selected_editable_objects=[obj]):
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception as exc:
+            print(f"[FO4 Retopo] shell remesh failed: {exc}")
+            return False
+        finally:
+            bpy.data.node_groups.remove(ng)
+        faces = len(obj.data.polygons)
+        if not faces:
+            return False
+        tris = sum(len(p.vertices) - 2 for p in obj.data.polygons)
+        if target_tris and tris > target_tris:
+            dec = obj.modifiers.new("FO4_ShellDecimate", 'DECIMATE')
+            # Decimate's ratio applies to the grid mesh's quads (2 triangles each)
+            dec.ratio = max(0.0001, target_tris / float(2 * len(obj.data.polygons)))
+            with bpy.context.temp_override(object=obj, active_object=obj, selected_editable_objects=[obj]):
+                bpy.ops.object.modifier_apply(modifier=dec.name)
+        return len(obj.data.polygons) > 0
+
+    @staticmethod
     def quadriflow_retopo(obj, target_faces, preserve_boundary=True, use_curvature=True):
         """Retopologize *obj* in place to ~target_faces quads via QuadriFlow.
 
@@ -782,20 +833,45 @@ class MeshHelpers:
         def _acceptable(actual):
             return actual >= target_faces * 0.25
 
-        # Try QuadriFlow (best quality, needs near-manifold geometry)
-        try:
-            bpy.ops.object.quadriflow_remesh(
-                target_faces=target_faces,
-                use_preserve_boundary=preserve_boundary,
-                use_mesh_curvature=use_curvature,
-                mode='FACES',
-            )
-            if _acceptable(len(obj.data.polygons)):
-                remesh_ok = True
+        # Open or broken surfaces (AI meshes, scans: holes, loose scraps) are
+        # rebuilt as one closed skin first. QuadriFlow and a plain voxel
+        # remesh both need a real inside: on the GSRoots mesh (425 pieces,
+        # 3,327 open edges) the voxel remesh melted the roots into blobs or
+        # dropped them, while the skin kept every root (2026-11-05).
+        import bmesh as _bm_chk
+        _b = _bm_chk.new()
+        _b.from_mesh(obj.data)
+        _nonman = sum(1 for e in _b.edges if not e.is_manifold)
+        _n_edges = len(_b.edges)
+        _b.free()
+        if _n_edges and _nonman / _n_edges > 0.02:
+            # Keep the skin at full detail and let QuadriFlow lay an even quad
+            # grid over it (it can, now that the surface is closed); simply
+            # decimating the skin left long sliver triangles that no unwrap
+            # can flatten well. If QuadriFlow still fails, the fallbacks
+            # below start from the skin, not from the broken original.
+            if MeshHelpers.shell_remesh(obj, 0):
+                print(f"[FO4 Retopo] '{obj.name}': open/broken surface ({_nonman} of {_n_edges} edges), "
+                      f"rebuilt as a closed skin ({len(obj.data.polygons)} faces)")
+                original_data = obj.data.copy()
             else:
                 _restore_original()
-        except Exception:
-            _restore_original()
+
+        # Try QuadriFlow (best quality, needs near-manifold geometry)
+        if not remesh_ok:
+            try:
+                bpy.ops.object.quadriflow_remesh(
+                    target_faces=target_faces,
+                    use_preserve_boundary=preserve_boundary,
+                    use_mesh_curvature=use_curvature,
+                    mode='FACES',
+                )
+                if _acceptable(len(obj.data.polygons)):
+                    remesh_ok = True
+                else:
+                    _restore_original()
+            except Exception:
+                _restore_original()
 
         # Fallback: Voxel remesh modifier. The right voxel_size for a given
         # target_faces depends entirely on the source's actual geometric

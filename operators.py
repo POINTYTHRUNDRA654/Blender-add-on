@@ -11474,6 +11474,26 @@ class FO4_OT_RetopologizeAndBake(Operator):
                 pass
         return node
 
+    def _bake_maps(self, context, mat):
+        """Steps 9-10: bake diffuse (pure albedo) and tangent-space normal."""
+        rb = context.scene.render.bake
+        if self.bake_diffuse:
+            rb.use_pass_direct = False
+            rb.use_pass_indirect = False
+            rb.use_pass_color = True
+            mat.node_tree.nodes.active = mat.node_tree.nodes.get("Diffuse")
+            bpy.ops.object.bake(type='DIFFUSE')
+        if self.bake_normal:
+            rb.normal_space = 'TANGENT'
+            # FO4 normal maps are DirectX-style (green points down the
+            # image), as in fo4_lod_generator. Checked 2026-11-04 on seven
+            # vanilla NIFs (crate, barrel, armor, rock, bottle, pistol,
+            # body): the stored tangent frame's V-direction vector points
+            # along +V of the NIF's top-left UV space.
+            rb.normal_r, rb.normal_g, rb.normal_b = 'POS_X', 'NEG_Y', 'POS_Z'
+            mat.node_tree.nodes.active = mat.node_tree.nodes.get("Normal")
+            bpy.ops.object.bake(type='NORMAL')
+
     def execute(self, context):
         if not texture_helpers:
             self.report({'ERROR'}, "texture_helpers module not available")
@@ -11589,11 +11609,23 @@ class FO4_OT_RetopologizeAndBake(Operator):
             for poly in joined.data.polygons:
                 poly.use_smooth = True
 
-            # 5. Re-UV-unwrap the new topology
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
-            bpy.ops.object.mode_set(mode='OBJECT')
+            # 5. Re-UV-unwrap the new topology: the UV & Texture Kit's Auto
+            #    Unwrap (hidden seams, stretch relief, tight packing) when it
+            #    is loaded, else Smart UV Project.
+            _unwrapped = False
+            if _op_exists("fo4.uvkit_auto_unwrap"):
+                try:
+                    with context.temp_override(active_object=joined, object=joined,
+                                               selected_objects=[joined]):
+                        bpy.ops.fo4.uvkit_auto_unwrap('EXEC_DEFAULT', apply_scale=False)
+                    _unwrapped = True
+                except Exception as _uw_err:
+                    print(f"[FO4 Retopo] Auto Unwrap failed, using Smart UV Project: {_uw_err}")
+            if not _unwrapped:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+                bpy.ops.object.mode_set(mode='OBJECT')
 
             # 6. Fresh single FO4 material with named Diffuse/Normal bake targets
             joined.data.materials.clear()
@@ -11657,27 +11689,46 @@ class FO4_OT_RetopologizeAndBake(Operator):
             joined.select_set(True)
             context.view_layer.objects.active = joined
 
-            # 9. Bake diffuse (pure albedo, no lighting)
-            if self.bake_diffuse:
-                context.scene.render.bake.use_pass_direct = False
-                context.scene.render.bake.use_pass_indirect = False
-                context.scene.render.bake.use_pass_color = True
-                mat.node_tree.nodes.active = mat.node_tree.nodes.get("Diffuse")
-                bpy.ops.object.bake(type='DIFFUSE')
+            # 8b. Bake through plain stand-in materials, as fo4_lod_generator
+            # does: the imported FO4 node group bakes black in Cycles (and
+            # its alpha lets bake rays pass straight through). On the GSRoots
+            # mesh a quarter of the faces baked black before this
+            # (2026-11-05). Originals go back right after the bakes.
+            _hp_saved, _stand_ins, _src_diffuse = [], [], None
+            for hp in highpolys:
+                for slot in hp.material_slots:
+                    _hp_saved.append((slot, slot.material))
+                    _img = None
+                    if slot.material and slot.material.use_nodes:
+                        _img = next((n.image for n in slot.material.node_tree.nodes
+                                     if n.type == 'TEX_IMAGE' and n.image
+                                     and "diffuse" in (n.label or n.name).lower()), None)
+                    _src_diffuse = _src_diffuse or _img
+                    _sm = bpy.data.materials.new("FO4_RetopoBakeSource")
+                    _sm.use_nodes = True
+                    _bsdf = next(n for n in _sm.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+                    if _img is not None:
+                        _tn = _sm.node_tree.nodes.new('ShaderNodeTexImage')
+                        _tn.image = _img
+                        _sm.node_tree.links.new(_tn.outputs['Color'], _bsdf.inputs['Base Color'])
+                    slot.material = _sm
+                    _stand_ins.append(_sm)
+            # Pixels no ray reaches get the texture's average colour, not black
+            if diffuse_image is not None and _src_diffuse is not None:
+                try:
+                    from . import fo4_lod_generator as _lodg
+                    _fill = _lodg._average_color(_src_diffuse)
+                    diffuse_image.pixels.foreach_set(list(_fill) * (res * res))
+                except Exception as _fe:
+                    print(f"[FO4 Retopo] diffuse pre-fill skipped: {_fe}")
 
-            # 10. Bake normal (tangent space)
-            if self.bake_normal:
-                context.scene.render.bake.normal_space = 'TANGENT'
-                # FO4 normal maps are DirectX-style (green points down the
-                # image), as in fo4_lod_generator. Checked 2026-11-04 on seven
-                # vanilla NIFs (crate, barrel, armor, rock, bottle, pistol,
-                # body): the stored tangent frame's V-direction vector points
-                # along +V of the NIF's top-left UV space.
-                context.scene.render.bake.normal_r = 'POS_X'
-                context.scene.render.bake.normal_g = 'NEG_Y'
-                context.scene.render.bake.normal_b = 'POS_Z'
-                mat.node_tree.nodes.active = mat.node_tree.nodes.get("Normal")
-                bpy.ops.object.bake(type='NORMAL')
+            try:
+                self._bake_maps(context, mat)
+            finally:
+                for _slot, _m in _hp_saved:
+                    _slot.material = _m
+                for _sm in _stand_ins:
+                    bpy.data.materials.remove(_sm)
 
             # 11. Restore render engine, samples and bake settings
             context.scene.render.engine = original_engine

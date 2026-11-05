@@ -476,6 +476,403 @@ class FO4_OT_UVKitBakeID(Operator):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Automatic unwrap
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The usual manual rules, done automatically:
+#   1. unapplied object scale skews an unwrap  -> apply it first
+#   2. cut along hard edges and material borders (Hard Surface style)
+#   3. every island must lie flat: holes, tubes and loops are joined into one
+#      outline by a cut graph; cuts go where they are least visible
+#      (underneath, then at the back)
+#   4. unwrap, measure stretch per island, add seams only where it stretches
+#   5. pack the islands with a margin that keeps mipmaps from bleeding
+
+def _face_islands(bm):
+    """Face groups separated by seams (or non-manifold edges)."""
+    seen, islands = set(), []
+    for f in bm.faces:
+        if f in seen:
+            continue
+        stack, isl = [f], []
+        seen.add(f)
+        while stack:
+            g = stack.pop()
+            isl.append(g)
+            for e in g.edges:
+                if e.seam or len(e.link_faces) != 2:
+                    continue
+                for h in e.link_faces:
+                    if h not in seen:
+                        seen.add(h)
+                        stack.append(h)
+        islands.append(isl)
+    return islands
+
+
+def _boundary_loops(isl):
+    """Boundary loops of an island as vertex sets: its outline plus any seam
+    running inside it. One loop = lies flat (if it has no handles); none = a
+    closed shape; two or more = a tube."""
+    fset = set(isl)
+    edges = {e for f in isl for e in f.edges}
+    bnd = [e for e in edges if e.seam or sum(1 for lf in e.link_faces if lf in fset) < 2]
+    adj = {}
+    for e in bnd:
+        for v in e.verts:
+            adj.setdefault(v, []).append(e)
+    loops, seen = [], set()
+    for v in adj:
+        if v in seen:
+            continue
+        comp, stack = set(), [v]
+        while stack:
+            u = stack.pop()
+            if u in comp:
+                continue
+            comp.add(u)
+            stack.extend(e.other_vert(u) for e in adj[u])
+        seen |= comp
+        loops.append(comp)
+    return loops
+
+
+def _visibility_cost(e):
+    """Edges facing up or toward the front cost more to cut."""
+    n = sum((f.normal for f in e.link_faces), e.verts[0].normal * 0)
+    if n.length > 1e-9:
+        n.normalize()
+    return 1.0 + 3.0 * max(0.0, n.z) + 1.5 * max(0.0, -n.y)
+
+
+def _cheapest_path(isl, sources, targets):
+    """Edges of the cheapest path through *isl* from any vertex in *sources*
+    to any in *targets* (Dijkstra; cost = length x visibility)."""
+    import heapq
+    fset = set(isl)
+    allowed = {e for f in isl for e in f.edges if not e.seam}
+    dist, prev, heap = {}, {}, []
+    for v in sources:
+        dist[v] = 0.0
+        heapq.heappush(heap, (0.0, id(v), v))
+    tset = set(targets)
+    while heap:
+        d, _, v = heapq.heappop(heap)
+        if d > dist.get(v, 1e30):
+            continue
+        if v in tset and v not in sources:
+            path, cur = [], v
+            while cur in prev:
+                e = prev[cur]
+                path.append(e)
+                cur = e.other_vert(cur)
+            return path
+        for e in v.link_edges:
+            if e not in allowed or not any(lf in fset for lf in e.link_faces):
+                continue
+            u = e.other_vert(v)
+            nd = d + e.calc_length() * _visibility_cost(e)
+            if nd < dist.get(u, 1e30):
+                dist[u] = nd
+                prev[u] = e
+                heapq.heappush(heap, (nd, id(u), u))
+    return []
+
+
+def _cut_graph_seams(bm):
+    """Seam every island just enough to lie flat as ONE piece, however many
+    holes and handles (loops) it has: a spanning tree is grown across the
+    faces, keeping long and visible edges uncut; the edges it does not cross
+    form a cut graph, and dead-end branches of that graph are pruned away.
+    What is left joins every handle and hole into one outline. Closed shapes
+    with no handles get a hidden slit. Returns the number of seams added."""
+    added = 0
+    for isl in _face_islands(bm):
+        fset = set(isl)
+        inner = list({e for f in isl for e in f.edges
+                      if not e.seam and len(e.link_faces) == 2
+                      and all(lf in fset for lf in e.link_faces)})
+        parent = {f: f for f in isl}
+
+        def find(f):
+            while parent[f] is not f:
+                parent[f] = parent[parent[f]]
+                f = parent[f]
+            return f
+        crossed = set()
+        # Kruskal: maximum spanning tree, weight = length x visibility, so the
+        # tree crosses (keeps uncut) the long and visible edges
+        for e in sorted(inner, key=lambda e: e.calc_length() * _visibility_cost(e), reverse=True):
+            a, b = e.link_faces
+            ra, rb = find(a), find(b)
+            if ra is not rb:
+                parent[ra] = rb
+                crossed.add(e)
+        cut = set(inner) - crossed
+        if not cut:
+            continue
+        on_outline = {v for f in isl for e in f.edges
+                      if e.seam or sum(1 for lf in e.link_faces if lf in fset) < 2 for v in e.verts}
+        deg = {}
+        for e in cut:
+            for v in e.verts:
+                deg[v] = deg.get(v, 0) + 1
+        changed = True
+        while changed:
+            changed = False
+            for e in list(cut):
+                for v in e.verts:
+                    if deg.get(v, 0) == 1 and v not in on_outline:
+                        cut.discard(e)
+                        for u in e.verts:
+                            deg[u] -= 1
+                        changed = True
+                        break
+        for e in cut:
+            e.seam = True
+            added += 1
+    for isl in _face_islands(bm):
+        if not _boundary_loops(isl):
+            verts = {v for f in isl for v in f.verts}
+            low = min(verts, key=lambda v: v.co.z)
+            far = max(verts, key=lambda v: (v.co - low.co).length)
+            for e in _cheapest_path(isl, {low}, {far}):
+                if not e.seam:
+                    e.seam = True
+                    added += 1
+    return added
+
+
+def _merge_tiny_islands(bm, max_faces=3, rounds=6):
+    """Remove the seams around islands of *max_faces* faces or fewer, joining
+    each to the neighbour it shares the longest seam with. Noisy meshes
+    (scans, AI meshes) otherwise shatter into hundreds of one-triangle
+    islands that waste texture space. Returns the number of seams removed."""
+    removed = 0
+    for _ in range(rounds):
+        islands = _face_islands(bm)
+        owner = {f: i for i, isl in enumerate(islands) for f in isl}
+        changed = False
+        for i, isl in enumerate(islands):
+            if len(isl) > max_faces:
+                continue
+            shared = {}
+            for f in isl:
+                for e in f.edges:
+                    if not e.seam or len(e.link_faces) != 2:
+                        continue
+                    other = next((lf for lf in e.link_faces if owner.get(lf) != i), None)
+                    if other is None:
+                        continue
+                    shared.setdefault(owner[other], []).append(e)
+            if not shared:
+                continue
+            best = max(shared.values(), key=lambda es: sum(e.calc_length() for e in es))
+            for e in best:
+                if e.seam:
+                    e.seam = False
+                    removed += 1
+                    changed = True
+        if not changed:
+            break
+    return removed
+
+
+def _face_stretch_values(isl, uv):
+    """Per-face log(UV area / surface area), minus the island's mean."""
+    rows = []
+    for f in isl:
+        a3 = f.calc_area()
+        co = [l[uv].uv for l in f.loops]
+        auv = sum(abs((co[i] - co[0]).x * (co[i + 1] - co[0]).y
+                      - (co[i] - co[0]).y * (co[i + 1] - co[0]).x) * 0.5
+                  for i in range(1, len(co) - 1))
+        rows.append((f, a3, math.log(auv / a3) if a3 > 1e-12 and auv > 1e-14 else 0.0))
+    tot = sum(a for _, a, _ in rows) or 1.0
+    mean = sum(a * r for _, a, r in rows) / tot
+    return [(f, r - mean) for f, _, r in rows], rows, tot
+
+
+def _island_stretch(bm, uv, isl):
+    """Area-weighted spread of UV-to-surface area ratio over an island
+    (0 = no stretch; 0.3+ is clearly visible on a checker)."""
+    vals, rows, tot = _face_stretch_values(isl, uv)
+    if not rows:
+        return 0.0
+    return math.sqrt(sum(a * d * d for (f, d), (_, a, _) in zip(vals, rows)) / tot)
+
+
+def _split_through_worst(bm, uv, isl):
+    """Cut a stretched island in two along one hidden seam running from its
+    outline, through its most stretched spot, back to its outline."""
+    vals, _, _ = _face_stretch_values(isl, uv)
+    worst = max(vals, key=lambda fv: abs(fv[1]))[0]
+    loops = _boundary_loops(isl)
+    if not loops:
+        return 0
+    outline = set().union(*loops)
+    start = set(worst.verts)
+    p1 = _cheapest_path(isl, outline, start)
+    if not p1:
+        return 0
+    used = {v for e in p1 for v in e.verts}
+    end_v = next(iter(start & used), next(iter(start)))
+    for e in p1:
+        e.seam = True
+    p2 = _cheapest_path(isl, {end_v}, outline - used)
+    for e in p2:
+        e.seam = True
+    return len(p1) + len(p2)
+
+
+def _unwrap_all(obj):
+    """Unwrap everything with the least-stretch method this Blender has."""
+    bpy.ops.mesh.select_all(action='SELECT')
+    try:
+        methods = [i.identifier for i in bpy.ops.uv.unwrap.get_rna_type().properties["method"].enum_items]
+    except Exception:
+        methods = ['ANGLE_BASED']
+    method = 'MINIMUM_STRETCH' if 'MINIMUM_STRETCH' in methods else 'ANGLE_BASED'
+    bpy.ops.uv.unwrap(method=method, margin=0.0)
+    return method
+
+
+class FO4_OT_UVKitAutoUnwrap(Operator):
+    """Unwrap the whole mesh automatically and pack it. Hard Surface puts
+    seams on hard edges; Organic makes as few and as big islands as it can.
+    The mesh is stashed first"""
+    bl_idname = "fo4.uvkit_auto_unwrap"
+    bl_label = "Auto Unwrap"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    style: EnumProperty(name="Style", default='HARD_SURFACE', items=[
+        ('HARD_SURFACE', "Hard Surface", "Seams along hard edges and material borders "
+                                         "(weapons, props, buildings)"),
+        ('ORGANIC', "Organic: Fewest Islands", "As few and as big islands as possible, no "
+                                               "hard-edge seams (roots, rocks, creatures; best "
+                                               "for repainting textures)"),
+    ])
+    hard_angle: FloatProperty(name="Hard Edge Angle", default=60.0, min=5.0, max=180.0,
+                              description="Hard Surface: cut where neighbouring faces bend more "
+                                          "than this (degrees)")
+    keep_seams: bpy.props.BoolProperty(name="Keep Existing Seams", default=True)
+    stretch_limit: FloatProperty(name="Stretch Limit", default=0.25, min=0.05, max=2.0,
+                                 description="Islands stretching more than this get extra seams")
+    margin_px: IntProperty(name="Margin (px)", default=8, min=1, max=64,
+                           description="Space between islands, in pixels of the texture size")
+    apply_scale: bpy.props.BoolProperty(name="Apply Scale First", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        o = context.active_object
+        return o is not None and o.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        was_edit = obj.mode == 'EDIT'
+        if was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        notes = []
+        try:
+            from . import fo4_mesh_shaper as _ms
+            _ms.create_stash(obj, "before Auto Unwrap")
+        except Exception:
+            pass
+        if self.apply_scale and any(abs(s - 1.0) > 1e-4 for s in obj.scale):
+            if obj.data.users > 1:
+                notes.append("scale not applied (mesh shared with other objects)")
+            else:
+                with context.temp_override(selected_editable_objects=[obj], active_object=obj, object=obj):
+                    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                notes.append("applied object scale")
+        if not obj.data.uv_layers:
+            obj.data.uv_layers.new(name="UVMap")
+
+        organic = self.style == 'ORGANIC'
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        if not self.keep_seams:
+            for e in bm.edges:
+                e.seam = False
+        hard = 0
+        if not organic:
+            lim = math.radians(self.hard_angle)
+            for e in bm.edges:
+                if len(e.link_faces) != 2 or e.seam:
+                    continue
+                f1, f2 = e.link_faces
+                if f1.normal.angle(f2.normal, 0.0) > lim or f1.material_index != f2.material_index:
+                    e.seam = True
+                    hard += 1
+        merged = _merge_tiny_islands(bm)
+        cuts = _cut_graph_seams(bm)
+        bm.to_mesh(obj.data)
+        bm.free()
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        method = _unwrap_all(obj)
+        relief = 0
+        for rounds in range(1, 13 if organic else 4):
+            ebm = bmesh.from_edit_mesh(obj.data)
+            uv = ebm.loops.layers.uv.active
+            bad = [isl for isl in _face_islands(ebm) if _island_stretch(ebm, uv, isl) > self.stretch_limit]
+            if not bad:
+                break
+            if organic:
+                # split each stretched island once, through its worst spot
+                for isl in bad:
+                    relief += _split_through_worst(ebm, uv, isl)
+            else:
+                # cut stretched islands at a lower angle
+                sub_lim = math.radians(max(15.0, self.hard_angle - 20.0 * rounds))
+                for isl in bad:
+                    fset = set(isl)
+                    for f in isl:
+                        for e in f.edges:
+                            if e.seam or len(e.link_faces) != 2 or not all(lf in fset for lf in e.link_faces):
+                                continue
+                            a, b = e.link_faces
+                            if a.normal.angle(b.normal, 0.0) > sub_lim:
+                                e.seam = True
+                                relief += 1
+                merged += _merge_tiny_islands(ebm)
+            relief += _cut_graph_seams(ebm)
+            bmesh.update_edit_mesh(obj.data)
+            _unwrap_all(obj)
+        ebm = bmesh.from_edit_mesh(obj.data)
+        uv = ebm.loops.layers.uv.active
+        islands = _face_islands(ebm)
+        worst = max((_island_stretch(ebm, uv, i) for i in islands), default=0.0)
+        size = material_texture_size(obj) or _scene_tex_size(context)
+        bpy.ops.mesh.select_all(action='SELECT')
+        pack_kw = dict(rotate=True, margin=self.margin_px / float(max(size)))
+        try:
+            if "shape_method" in bpy.ops.uv.pack_islands.get_rna_type().properties:
+                pack_kw["shape_method"] = 'CONCAVE'   # tightest packing
+        except Exception:
+            pass
+        bpy.ops.uv.pack_islands(**pack_kw)
+        if not was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bm2, _e = _get_bm(obj)
+        uv2 = bm2.loops.layers.uv.active
+        a3, auv = _areas(list(bm2.faces), uv2, obj.matrix_world)
+        if not _e:
+            bm2.free()
+        d = density_px_per_m(a3, auv, *size)
+        context.scene.fo4_uvkit_measured = d
+        msg = (f"Auto Unwrap {('organic' if organic else 'hard surface')} "
+               f"({method.replace('_', ' ').lower()}): {len(islands)} islands; seams: "
+               f"{hard} hard-edge, {cuts} to lie flat, {relief} stretch relief, "
+               f"{merged} removed to join tiny islands; worst stretch {worst:.2f}; "
+               f"texture used {auv * 100:.0f}%; {d:,.0f} px/m at {size[0]}px")
+        if notes:
+            msg += " (" + "; ".join(notes) + ")"
+        self.report({'WARNING'} if worst > self.stretch_limit else {'INFO'}, msg)
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Panel
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -503,6 +900,12 @@ class FO4_PT_UVKitPanel(_FO4SubPanel):
             box.label(text=f"Last measured: {scn.fo4_uvkit_measured:,.0f} px/m")
 
         box = layout.box()
+        box.label(text="Unwrap", icon='UV')
+        row = box.row(align=True)
+        row.operator("fo4.uvkit_auto_unwrap", text="Auto Unwrap", icon='UV_DATA').style = 'HARD_SURFACE'
+        row.operator("fo4.uvkit_auto_unwrap", text="Fewest Islands", icon='UV_ISLANDSEL').style = 'ORGANIC'
+
+        box = layout.box()
         box.label(text="Preview", icon='UV')
         box.operator("fo4.uvkit_checker", icon='TEXTURE_DATA')
 
@@ -520,6 +923,7 @@ classes = (
     FO4_OT_UVKitChecker,
     FO4_OT_UVKitBakeCurvature,
     FO4_OT_UVKitBakeID,
+    FO4_OT_UVKitAutoUnwrap,
     FO4_PT_UVKitPanel,
 )
 
