@@ -961,6 +961,26 @@ class ExportHelpers:
 
                 if _has_dupes:
                     import bmesh as _bmesh_dd
+                    # Vanilla NIFs duplicate vertices on purpose at hard edges
+                    # (one normal per NIF vertex), so merging them rounded off
+                    # every hard edge of a re-exported vanilla mesh (ammo box
+                    # lid: 293 of 422 normals lost, 2026-11-04). Record each
+                    # face corner's normal first and put it back afterwards as
+                    # a custom normal: the mesh looks the same, and
+                    # _split_hard_edges_for_nif re-splits it for the NIF.
+                    _me_dd = obj.data
+                    _cn_dd = ([c.vector.copy() for c in _me_dd.corner_normals]
+                              if hasattr(_me_dd, "corner_normals") else None)
+                    _kd_cn, _cn_list = None, []
+                    if _cn_dd is not None:
+                        _eps = (max(obj.dimensions) or 1.0) * 1e-3
+                        _kd_cn = _mu_dd.kdtree.KDTree(len(_me_dd.loops))
+                        for _p in _me_dd.polygons:
+                            for _li in _p.loop_indices:
+                                _kd_cn.insert(_me_dd.vertices[_me_dd.loops[_li].vertex_index].co
+                                              + _p.normal * _eps, len(_cn_list))
+                                _cn_list.append(_cn_dd[_li])
+                        _kd_cn.balance()
                     _bm = _bmesh_dd.new()
                     _bm.from_mesh(obj.data)
                     _uv_layer = _bm.loops.layers.uv.active
@@ -976,6 +996,17 @@ class ExportHelpers:
                     _bm.to_mesh(obj.data)
                     _bm.free()
                     obj.data.update()
+                    if _kd_cn is not None:
+                        _new_cn = []
+                        for _p in _me_dd.polygons:
+                            for _li in _p.loop_indices:
+                                _q = (_me_dd.vertices[_me_dd.loops[_li].vertex_index].co
+                                      + _p.normal * _eps)
+                                _new_cn.append(tuple(_cn_list[_kd_cn.find(_q)[1]]))
+                        for _p in _me_dd.polygons:
+                            _p.use_smooth = True
+                        _me_dd.normals_split_custom_set(_new_cn)
+                        _me_dd.update()
                     # Force a full dependency-graph refresh. Without this, the
                     # exporter (which reads the evaluated mesh) could still
                     # see stale pre-merge topology/UV state on some Blender
@@ -1177,6 +1208,86 @@ class ExportHelpers:
         return (" -- WARNING: the Creation Kit crashes loading " + ", ".join(problems)
                 + ": compressed DDS sizes must be multiples of 4. Resize them "
                   "(e.g. to 4096x4096) before using this mesh in the CK.")
+
+    @staticmethod
+    def _split_hard_edges_for_nif(meshes):
+        """Give each mesh a temporary copy split at its hard edges, for the
+        export only; returns what _restore_split_meshes() needs.
+
+        A NIF vertex holds exactly one normal, so wherever the shading breaks
+        (flat-shaded faces, sharp edges, custom normals) vanilla meshes carry
+        separate vertices (WoodCrate01: 165 positions with 2+ normals).
+        PyNifly only splits at UV seams and writes one normal per vertex, so a
+        flat-shaded cube came out with 14 vertices and smeared, rounded
+        shading (checked 2026-11-04). The copy is split at every edge whose
+        two sides shade differently and keeps the original corner normals as
+        custom normals, so PyNifly writes the right normal on each side. The
+        user's mesh is put back unchanged afterwards.
+        """
+        import bmesh
+        import math as _m
+        done = []
+        cos_tol = _m.cos(_m.radians(1.0))
+        for obj in meshes:
+            if obj.type != 'MESH' or not obj.data.polygons:
+                continue
+            me = obj.data
+            if hasattr(me, "corner_normals"):
+                cn = [c.vector.copy() for c in me.corner_normals]
+            else:
+                me.calc_normals_split()
+                cn = [l.normal.copy() for l in me.loops]
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            bm.faces.ensure_lookup_table()
+            # corner normal per (face index, vertex) of the original mesh
+            fv_norm = {}
+            for p in me.polygons:
+                for li in p.loop_indices:
+                    fv_norm[(p.index, me.loops[li].vertex_index)] = cn[li]
+            hard = []
+            for e in bm.edges:
+                if len(e.link_faces) != 2:
+                    continue
+                f1, f2 = e.link_faces
+                for v in e.verts:
+                    n1 = fv_norm.get((f1.index, v.index))
+                    n2 = fv_norm.get((f2.index, v.index))
+                    if n1 is not None and n2 is not None and n1.dot(n2) < cos_tol:
+                        hard.append(e)
+                        break
+            if not hard:
+                bm.free()
+                continue
+            # remember each corner's normal by face index and corner position
+            corner_ns = [[fv_norm[(f.index, l.vert.index)] for l in f.loops] for f in bm.faces]
+            bmesh.ops.split_edges(bm, edges=hard)
+            tmp = me.copy()
+            bm.to_mesh(tmp)
+            bm.free()
+            new_ns = [None] * len(tmp.loops)
+            for p in tmp.polygons:
+                for k, li in enumerate(p.loop_indices):
+                    new_ns[li] = tuple(corner_ns[p.index][k])
+            for p in tmp.polygons:
+                p.use_smooth = True
+            tmp.normals_split_custom_set(new_ns)
+            tmp.update()
+            obj.data = tmp
+            done.append((obj, me, tmp, len(hard)))
+            print(f"[FO4Export] {obj.name}: split {len(hard)} hard edge(s) for the NIF "
+                  f"({len(me.vertices)} -> {len(tmp.vertices)} vertices)")
+        return done
+
+    @staticmethod
+    def _restore_split_meshes(done):
+        for obj, orig, tmp, _n in done:
+            try:
+                obj.data = orig
+                if tmp.users == 0:
+                    bpy.data.meshes.remove(tmp)
+            except Exception as exc:
+                print(f"[FO4Export] could not restore {obj.name}'s mesh: {exc}")
 
     @staticmethod
     def _absolute_segment_file_note(filepath):
@@ -1639,10 +1750,12 @@ class ExportHelpers:
                     print(f"[FO4Export] new texture: {_sn}")
                 _hidden_coll = []
                 _hidden_siblings = []
+                _split_done = []
                 try:
                     if exporter == "pynifly":
                         _hidden_coll = ExportHelpers._hide_collision_from_pynifly([obj])
                         _hidden_siblings = ExportHelpers._hide_siblings_from_pynifly(obj, selection)
+                        _split_done = ExportHelpers._split_hard_edges_for_nif([obj])
                         kwargs = ExportHelpers._build_pynifly_export_kwargs(filepath)
                         result = ExportHelpers._call_nif_export(
                             bpy.ops.export_scene.pynifly, kwargs,
@@ -1657,6 +1770,7 @@ class ExportHelpers:
                         )
                         exporter_label = "Niftools v0.1.1"
                 finally:
+                    ExportHelpers._restore_split_meshes(_split_done)
                     ExportHelpers._restore_collision_for_pynifly(_hidden_coll)
                     ExportHelpers._unhide_objects(_hidden_siblings)
                     _unstage_new_textures(_staged)
@@ -2506,12 +2620,15 @@ class ExportHelpers:
                     _export_start2 = _time_mod2.time()
                     _hidden_coll = (ExportHelpers._hide_collision_from_pynifly(meshes)
                                     if exporter == "pynifly" else [])
+                    _split_done2 = (ExportHelpers._split_hard_edges_for_nif(meshes)
+                                    if exporter == "pynifly" else [])
                     try:
                         result = ExportHelpers._call_nif_export(
                             call, kwargs,
                             active_object=meshes[0], selected_objects=list(bpy.context.selected_objects),
                         )
                     finally:
+                        ExportHelpers._restore_split_meshes(_split_done2)
                         ExportHelpers._restore_collision_for_pynifly(_hidden_coll)
                     # PyNifly returns empty set() on success; only {'CANCELLED'}
                     # signals failure. But that's not proof the file was
