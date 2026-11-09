@@ -1044,9 +1044,16 @@ class AnimationHelpers:
                 del mesh_obj[key]
         mesh_obj["fo4_no_wind"] = True
 
+        try:
+            from . import bgsm_helpers as _bh_nw
+        except Exception:
+            _bh_nw = None
         for _slot in getattr(mesh_obj, "material_slots", []):
             if _slot.material is not None:
                 _slot.material["fo4_bgsm_tree"] = False
+                if _bh_nw is not None:
+                    # Back to the shared material the plant used before wind.
+                    _bh_nw.restore_material_after_wind(_slot.material)
 
         # PyNifly exports VERTEX_ALPHA's grey value as the vertex alpha when the
         # attribute exists (see apply_wind_vertex_colors), so make it solid white.

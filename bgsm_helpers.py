@@ -1791,6 +1791,88 @@ def keep_existing_reason(dest_path: str, folder: str, src_path: str = "") -> str
     return ""
 
 
+WIND_MATERIAL_SUFFIX = "_Wind"
+
+
+def _existing_bgsm_for(mat, shader_name: str, nif_filepath: str = "") -> str:
+    """Path of the .bgsm file *shader_name* currently resolves to, or ''.
+
+    Looks where the game would: the material the Blender material was read
+    from (``fo4_bgsm_path``), the mod the NIF is being exported into (the
+    folder above its ``Meshes``), then the extracted game Data folder."""
+    src = mat.get("fo4_bgsm_path") if hasattr(mat, "get") else None
+    if src and os.path.isfile(str(src)):
+        return str(src)
+    rel = shader_name.replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
+    if not rel.lower().startswith("materials" + os.sep):
+        rel = os.path.join("Materials", rel)
+    roots = []
+    if nif_filepath:
+        parts = os.path.normpath(os.path.abspath(nif_filepath)).split(os.sep)
+        idx = max((i for i, p in enumerate(parts) if p.lower() == "meshes"), default=None)
+        if idx:
+            roots.append(os.sep.join(parts[:idx]))
+    gdata = _game_data_root()
+    if gdata:
+        roots.append(gdata)
+    for root in roots:
+        cand = os.path.join(root, rel)
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def ensure_wind_material(mat, nif_filepath: str = "") -> str:
+    """Give a wind material its own .bgsm when the one it points at has Tree off.
+
+    FO4 reads vertex alpha as sway only when the material's Tree flag is on;
+    without it the same alpha is transparency, so a wind plant whose material
+    still has Tree off loses every pixel under the alpha-test threshold (the
+    bottom of the plant). Export never replaces an existing material (it may
+    be a game file, or shared: GSFungusSpore12.bgsm is also used by a dirt
+    cliff and an ash pile), so the wind step's Tree flag never reached it.
+
+    When *mat* asked for Tree (``fo4_bgsm_tree``) and the material it points
+    at exists with Tree off, point it at ``<name>_Wind.bgsm`` instead; export
+    then writes that copy from the original (``fo4_bgsm_path``) with Tree on
+    and leaves the shared file alone. Returns a note, '' when nothing changed.
+    """
+    if mat is None or not bool(mat.get("fo4_bgsm_tree")):
+        return ""
+    name = str(mat.get("BSLSP_Shader_Name") or "")
+    if not name.lower().endswith(".bgsm"):
+        return ""
+    stem, ext = name[:-5], name[-5:]
+    if stem.lower().endswith(WIND_MATERIAL_SUFFIX.lower()):
+        return ""
+    existing = _existing_bgsm_for(mat, name, nif_filepath)
+    if not existing:
+        return ""          # new material: export writes it with Tree on
+    try:
+        with open(existing, "rb") as fh:
+            if read_bgsm(fh.read()).tree:
+                return ""  # already a swaying-plant material
+    except Exception:
+        pass               # unreadable: safer to use a copy of our own
+    new_name = stem + WIND_MATERIAL_SUFFIX + ext
+    if not mat.get("fo4_bgsm_path"):
+        mat["fo4_bgsm_path"] = existing   # the copy starts from the original
+    mat["fo4_bgsm_name_before_wind"] = name
+    mat["BSLSP_Shader_Name"] = new_name
+    return (f"{os.path.basename(name)} has Tree off (wind would make the plant see-through), "
+            f"so this plant now uses its own {os.path.basename(new_name)} with Tree on")
+
+
+def restore_material_after_wind(mat) -> None:
+    """Undo :func:`ensure_wind_material` when wind is removed."""
+    if mat is None:
+        return
+    before = mat.get("fo4_bgsm_name_before_wind")
+    if before:
+        mat["BSLSP_Shader_Name"] = before
+        del mat["fo4_bgsm_name_before_wind"]
+
+
 def export_bgsm_to_path(obj, out_path, *, is_lod: bool = False) -> tuple[bool, str]:
     """Write *obj*'s active material's BGSM straight to an explicit
     *out_path*, bypassing the name-guessing in :func:`export_bgsm_for_object`

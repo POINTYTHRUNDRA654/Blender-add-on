@@ -1559,6 +1559,29 @@ class ExportHelpers:
             print(f"[FO4Export] Could not write {credits_path}: {e}")
 
     @staticmethod
+    def _prepare_wind_materials(objs, filepath):
+        """Before the NIF is written: a wind plant whose material file has
+        Tree off gets its own <name>_Wind.bgsm (see
+        bgsm_helpers.ensure_wind_material). Returns the notes for the report."""
+        notes = []
+        try:
+            from . import bgsm_helpers as _bh_w
+        except Exception:
+            return notes
+        for o in objs:
+            if getattr(o, "type", "") != 'MESH' or o.get("fo4_lod_level"):
+                continue
+            for s in getattr(o, "material_slots", []):
+                try:
+                    n = _bh_w.ensure_wind_material(s.material, filepath)
+                except Exception as exc:
+                    n = f"could not check the wind material of {o.name}: {exc}"
+                if n and n not in notes:
+                    notes.append(n)
+                    print(f"[FO4Export] wind material: {n}")
+        return notes
+
+    @staticmethod
     def export_mesh_to_nif(obj, filepath):
         """Export mesh to NIF format, preferring PyNifly then Niftools v0.1.1,
         falling back to FBX when neither is installed.
@@ -1754,6 +1777,7 @@ class ExportHelpers:
                 _staged, _stage_notes = _stage_new_textures([obj], filepath)
                 for _sn in _stage_notes:
                     print(f"[FO4Export] new texture: {_sn}")
+                _wind_mat_notes = ExportHelpers._prepare_wind_materials([obj], filepath)
                 _hidden_coll = []
                 _hidden_siblings = []
                 _split_done = []
@@ -2045,6 +2069,8 @@ class ExportHelpers:
 
                     if _stage_notes:
                         _tex_note += "  [new textures: " + "; ".join(_stage_notes) + "]"
+                    if _wind_mat_notes:
+                        _bgsm_note += " | Wind: " + "; ".join(_wind_mat_notes)
                     return True, (f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}"
                                   f"{ExportHelpers._ck_crash_texture_note([obj])}"
                                   f"{ExportHelpers._absolute_segment_file_note(filepath)}")
@@ -2602,6 +2628,7 @@ class ExportHelpers:
             # valid context even when no object was explicitly activated.
             bpy.context.view_layer.objects.active = meshes[0]
 
+            _wind_mat_notes = ExportHelpers._prepare_wind_materials(meshes, filepath)
             if nif_available:
                 # Dispatch to the appropriate exporter.
                 if exporter == "pynifly":
@@ -2790,6 +2817,8 @@ class ExportHelpers:
                         except Exception as _le:
                             print(f"[FO4Export] Wind root patch skipped: {_le}")
                         _staged_note = ("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""
+                        if _wind_mat_notes:
+                            _staged_note += "  [Wind: " + "; ".join(_wind_mat_notes) + "]"
                         return True, (f"Exported {mesh_count} mesh(es) as single NIF via "
                                       f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}{_leaf_note}{_bgsm_note}{_staged_note}"
                                       f"{ExportHelpers._ck_crash_texture_note(meshes)}"
