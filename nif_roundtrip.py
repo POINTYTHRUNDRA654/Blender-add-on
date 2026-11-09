@@ -940,7 +940,10 @@ def patch_wind_root_node(exported_path, obj=None, original_path=None) -> dict:
     export of a wind-animated mesh writes a plain NiNode root, even though
     every real FO4 wind-foliage file (vanilla and this mod's own originals)
     uses a BSLeafAnimNode root paired with the Vertex_Colors|Tree_Anim
-    shader flags PyNifly DOES write correctly. Verified via side-by-side
+    shader flags. (PyNifly writes those flags only when the imported material
+    already had them -- a plant given wind in Blender kept Vertex_Alpha on and
+    Tree_Anim off, so this patch now sets them too; see
+    _patch_wind_shader_flags_bytes.) Verified via side-by-side
     reference comparison (Cedar01.nif, TreeMaplePreWar02.nif, and the
     original unpatched DeadShrubGS02.nif all use BSLeafAnimNode roots) that
     those flags are legitimate for wind foliage -- the missing root type is
@@ -998,23 +1001,82 @@ def patch_wind_root_node(exported_path, obj=None, original_path=None) -> dict:
 
     try:
         with open(exported_path, "rb") as fh:
-            data = fh.read()
+            original = data = fh.read()
+    except Exception as exc:
+        report["could_not_restore"].append(f"wind foliage ({exc})")
+        return report
+
+    # Shader flags first: they matter even when the root is already right.
+    try:
+        data, n_flags = _patch_wind_shader_flags_bytes(data)
+        if n_flags:
+            report["restored"].append(
+                f"shader flags -> Tree_Anim on, Vertex_Alpha off ({n_flags} shader(s))")
+    except Exception as exc:
+        report["could_not_restore"].append(f"wind shader flags ({exc})")
+
+    try:
         current_root_type = _root_block_type(data)
-        if current_root_type == b'BSLeafAnimNode':
-            return report  # already correct (e.g. round-tripped original)
-        if current_root_type != b'NiNode':
+        if current_root_type == b'NiNode':
+            data = _patch_root_to_leafanim_bytes(data)
+            report["restored"].append("root node -> BSLeafAnimNode (wind foliage)")
+        elif current_root_type != b'BSLeafAnimNode':
             report["could_not_restore"].append(
                 f"BSLeafAnimNode root (unexpected root type {current_root_type!r})"
             )
-            return report
-        patched = _patch_root_to_leafanim_bytes(data)
-        with open(exported_path, "wb") as fh:
-            fh.write(patched)
-        report["restored"].append("root node -> BSLeafAnimNode (wind foliage)")
     except Exception as exc:
         report["could_not_restore"].append(f"BSLeafAnimNode root ({exc})")
 
+    if data != original:
+        try:
+            with open(exported_path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:
+            report["restored"] = []
+            report["could_not_restore"].append(f"wind foliage (could not write: {exc})")
+
     return report
+
+
+SLSF1_VERTEX_ALPHA = 1 << 3
+SLSF2_TREE_ANIM = 1 << 29
+
+
+def _patch_wind_shader_flags_bytes(data: bytes):
+    """Wind-foliage shader flags the way vanilla writes them: Tree_Anim on
+    (vertex alpha = sway) and Vertex_Alpha off (vertex alpha != transparency).
+
+    Measured on the unpacked game, 2026-11-09: of the shaders in the 349
+    vanilla NIFs with a BSLeafAnimNode root, 989 are Tree_Anim on +
+    Vertex_Alpha off (KelpAnim01, Seaweed01_Tree...), 33 both on, 36
+    Vertex_Alpha only, 397 neither. PyNifly writes whatever flags the
+    imported material carried, so a plant that had no wind before kept
+    Vertex_Alpha on and Tree_Anim off: viewers (NifSkope) then cut away every
+    pixel whose sway alpha is under the alpha-test threshold -- the bottom of
+    the plant (GSFungusSpore12: 5,940 of 6,513 vertices). Billy confirmed in
+    NifSkope that switching Tree on shows the whole plant.
+
+    Returns ``(new_bytes, number_of_shaders_changed)``. FO4 (BS stream 130)
+    only; other versions are returned unchanged.
+    """
+    o = data.index(b'\n') + 1
+    if struct.unpack_from('<I', data, o + 13)[0] != 130:
+        return data, 0
+    types, offsets, _sizes = _block_layout(data)
+    buf = bytearray(data)
+    changed = 0
+    for t, off in zip(types, offsets):
+        if t != "BSLightingShaderProperty":
+            continue
+        q = off + 4                                   # shader type
+        n_extra = struct.unpack_from('<I', buf, q + 4)[0]
+        q += 8 + 4 * n_extra + 4                      # name, extra data, controller
+        f1, f2 = struct.unpack_from('<II', buf, q)
+        nf1, nf2 = f1 & ~SLSF1_VERTEX_ALPHA, f2 | SLSF2_TREE_ANIM
+        if (nf1, nf2) != (f1, f2):
+            struct.pack_into('<II', buf, q, nf1, nf2)
+            changed += 1
+    return bytes(buf), changed
 
 
 def summarize(report: dict) -> str:
