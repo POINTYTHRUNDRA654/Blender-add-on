@@ -3551,7 +3551,11 @@ class FO4_PT_BatchProcessingPanel(_FO4SubPanel):
         row = lod_box.row()
         row.enabled = len(selected_meshes) > 0
         row.scale_y = 1.2
-        row.operator("fo4.batch_generate_lod", text="Batch Generate LOD", icon='OUTLINER_OB_MESH')
+        # fo4.batch_generate_lod only made decimated copies and downscaled
+        # textures -- no NIFs, no BGSMs -- so a user pressing it got "separate
+        # textures, no meshes or materials" (2026-11-09). fo4.generate_lods is
+        # the full pipeline and already processes every selected mesh.
+        row.operator("fo4.generate_lods", text="Generate + Export LODs (Selected)", icon='OUTLINER_OB_MESH')
         row = lod_box.row()
         row.enabled = len(selected_meshes) > 0
         row.scale_y = 1.2
@@ -5503,7 +5507,9 @@ class FO4_PT_BatchToolsPanel(_FO4SubPanel):
         go_op.output_dir     = scene.fo4_batch_output
         go_op.apply_fo4_prep = scene.fo4_batch_fo4_prep
         lod = layout.box(); lod.label(text="Batch LOD Generate + Export", icon='MOD_DECIM')
-        lod.operator("fo4.batch_generate_lod", text="Auto LOD1/2/3 for Selected", icon='OUTLINER_OB_MESH')
+        # Same full pipeline as Setup > FO4: LOD + Collision Pipeline (see the
+        # Batch Processing panel's note): writes the LOD NIFs, BGSMs and textures.
+        lod.operator("fo4.generate_lods", text="Generate + Export LODs (Selected)", icon='OUTLINER_OB_MESH')
         pre = layout.box(); pre.label(text="Workflow Presets", icon='PRESET')
         pre.prop(scene, "fo4_workflow_preset_name", text="Name")
         row = pre.row(align=True)
