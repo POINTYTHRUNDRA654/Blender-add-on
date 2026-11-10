@@ -1557,8 +1557,18 @@ class FO4_OT_GenerateLODs(Operator):
     )
     mesh_subpath: StringProperty(
         name="Mesh Sub-path",
-        description="Path under [Mod Output Folder]/Meshes/ where NIFs go (MO2 mod folders have no Data\\ wrapper)",
+        description=(
+            "Where the LOD NIFs go under Meshes\\ (LOD files go in Meshes\\LOD\\<this>). "
+            "Click the folder button and pick the mesh folder, e.g. "
+            "...\\YourMod\\Meshes\\Landscape\\Dirtcliffs: only the part after Meshes\\ is used, "
+            "and an empty Mod Output Folder is taken from the same pick. Typing "
+            "Landscape\\Dirtcliffs works too"
+        ),
         default="",
+        # A folder picker like Mod Output Folder has (Billy, 2026-11-09: he had
+        # to type this one by hand). _clean_mesh_subpath reduces the picked
+        # full path to the part under Meshes\.
+        subtype='DIR_PATH',
     )
     generate_lod1: BoolProperty(name="LOD1 (30%)", default=True)
     generate_lod2: BoolProperty(name="LOD2 (12%)", default=True)
@@ -1879,7 +1889,22 @@ class FO4_OT_GenerateLODs(Operator):
         # "Meshes/LOD/Landscape/Trees/..." location. Strip one leading "LOD"
         # path segment so both destinations land where the rest of this
         # operator's own logic already expects them.
-        _clean_subpath = _clean_mesh_subpath(self.mesh_subpath)
+        _picked_sub = self.mesh_subpath or ""
+        if _picked_sub.startswith("//"):          # Blender-relative path from the picker
+            _picked_sub = bpy.path.abspath(_picked_sub)
+        _clean_subpath = _clean_mesh_subpath(_picked_sub)
+        # A picked ...\YourMod\Meshes\... folder also tells us the mod folder
+        # when Mod Output Folder was left empty.
+        _picked_mod_root = ""
+        _pp = [p for p in re.split(r"[\\/]+", _picked_sub) if p]
+        _pl = [p.lower() for p in _pp]
+        if "meshes" in _pl and (_pp[0].endswith(":") or _picked_sub.startswith(("\\\\", "//"))):
+            _mi = len(_pl) - 1 - _pl[::-1].index("meshes")
+            _picked_mod_root = os.sep.join(_pp[:_mi])
+            if _pp[0].endswith(":") and _mi == 1:
+                _picked_mod_root += os.sep
+            elif _picked_sub.startswith(("\\\\", "//")):
+                _picked_mod_root = "\\\\" + _picked_mod_root
         if _clean_subpath.replace("/", "\\").lower() != self.mesh_subpath.strip("/\\").replace("/", "\\").lower():
             self.report(
                 {'INFO'},
@@ -1889,6 +1914,9 @@ class FO4_OT_GenerateLODs(Operator):
             )
 
         mod_folder = bpy.path.abspath(self.mod_folder).strip() if self.mod_folder else ""
+        if not mod_folder and _picked_mod_root:
+            mod_folder = _picked_mod_root
+            self.report({'INFO'}, f"Mod Output Folder taken from the picked mesh folder: {mod_folder}")
         if mod_folder:
             mod_folder, _root_note = resolve_mod_root(mod_folder)
             if _root_note:
