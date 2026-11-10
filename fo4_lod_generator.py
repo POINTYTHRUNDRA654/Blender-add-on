@@ -252,6 +252,20 @@ def generate_lod_shell(source_obj, lod_name: str, target_tris: int,
         new_obj.select_set(True)
         return bpy.ops.object.modifier_apply(modifier=mod.name)
 
+    # Thicken first: a voxel remesh needs volume, and a thin open sheet (a
+    # cliff face) thinner than one voxel simply vanished while the chunky
+    # spores on it survived -- Billy's merged GSDirtCliffLarge01 LOD came out
+    # "only the plants" (2026-11-09: the 41-unit cliff piece kept 28.6% of
+    # its vertices on the LOD1 shell, another piece 0%).
+    sd = new_obj.modifiers.new("FO4_LOD_Solidify", 'SOLIDIFY')
+    sd.thickness = voxel * 1.5
+    sd.offset = 0.0
+    # NOT even thickness: on thin, sharp-cornered plant cards it pushed spikes
+    # out hundreds of units (a test shell's bounding sphere grew from ~1,440
+    # to 10,373 game units, 2026-11-09).
+    sd.use_even_offset = False
+    _apply(sd)
+
     rm = new_obj.modifiers.new("FO4_LOD_Remesh", 'REMESH')
     rm.mode = 'VOXEL'
     rm.voxel_size = voxel
@@ -291,6 +305,18 @@ def generate_lod_shell(source_obj, lod_name: str, target_tris: int,
         bpy.data.objects.remove(new_obj, do_unlink=True)
         return None, (f"voxel remesh at {voxel:.3g} lost the shape "
                       "(parts thinner than one voxel)")
+    # Nor may the shell stick out past the source (spikes from thickening).
+    if any((mn[i] - rmn[i]) > 3 * voxel or (rmx[i] - mx[i]) > 3 * voxel for i in range(3)):
+        bpy.data.objects.remove(new_obj, do_unlink=True)
+        return None, f"voxel remesh at {voxel:.3g} grew past the model's bounds"
+    # The bounding box alone is not enough: plants spread over a cliff keep
+    # the box while the cliff itself is gone. Check how much of the source's
+    # SURFACE AREA the shell still covers.
+    cov = _surface_coverage(source_obj, new_obj, 2.5 * voxel)
+    if cov < _SHELL_MIN_COVERAGE:
+        bpy.data.objects.remove(new_obj, do_unlink=True)
+        return None, (f"voxel remesh at {voxel:.3g} kept only {cov:.0%} of the surface "
+                      "(thin parts lost)")
 
     tris_now = len(new_obj.data.polygons) * 2  # remesh output is quads
     if tris_now > target_tris:
@@ -314,6 +340,35 @@ def generate_lod_shell(source_obj, lod_name: str, target_tris: int,
     n_tris = len(new_obj.data.polygons)
     return new_obj, (f"LOD '{lod_name}': {n_tris} triangles "
                      f"(solid shell, voxel {voxel:.3g})")
+
+
+# Share of the source's surface area a LOD1 shell must still cover. The
+# thickened GSDirtCliffLarge01 shell covers 84% (cliff piece 96%); without the
+# thickening the cliff piece kept under 30% and the LOD showed "only the plants".
+_SHELL_MIN_COVERAGE = 0.80
+
+
+def _surface_coverage(source_obj, shell_obj, max_dist: float) -> float:
+    """Share of *source_obj*'s surface AREA lying within *max_dist* of
+    *shell_obj* (both in world space): 1.0 = nothing lost."""
+    import bmesh as _bmesh
+    from mathutils.bvhtree import BVHTree
+    bm = _bmesh.new()
+    bm.from_mesh(shell_obj.data)
+    bm.transform(shell_obj.matrix_world)
+    bvh = BVHTree.FromBMesh(bm)
+    bm.free()
+    mw = source_obj.matrix_world
+    total = near = 0.0
+    for poly in source_obj.data.polygons:
+        a = poly.area
+        if a <= 0:
+            continue
+        total += a
+        hit = bvh.find_nearest(mw @ poly.center)
+        if hit[0] is not None and hit[3] <= max_dist:
+            near += a
+    return near / total if total > 0 else 1.0
 
 
 def reduce_lod_shell(prev_obj, lod_name: str, target_tris: int) -> "tuple[object, str]":
@@ -1905,12 +1960,17 @@ class FO4_OT_GenerateLODs(Operator):
                     lod_obj = None
                     if self.lod_method == 'SHELL' and not is_skinned:
                         target = max(12, min(_LOD_MAX_TRIS[lod_key], int(ratio * n_src_tris)))
-                        lod_obj, msg = generate_lod_shell(
-                            obj, lod_name, target, _SHELL_VOXEL_DIV[lod_key])
-                        if lod_obj is None and last_shell is not None:
-                            steps.append(f"{obj.name} {lod_key}: {msg} -- reduced "
-                                         f"{last_shell.name} instead")
+                        # Remesh once (the finest level); every farther level
+                        # reduces the previous shell. Coarser remeshes kept
+                        # losing thin parts differently per level -- the cliff
+                        # of GSDirtCliffLarge01 kept 96% of its area at LOD1's
+                        # voxel but 67% at LOD3's (2026-11-09) -- so levels
+                        # did not even share a shape.
+                        if last_shell is not None:
                             lod_obj, msg = reduce_lod_shell(last_shell, lod_name, target)
+                        else:
+                            lod_obj, msg = generate_lod_shell(
+                                obj, lod_name, target, _SHELL_VOXEL_DIV[lod_key])
                         if lod_obj is None:
                             steps.append(f"{obj.name} {lod_key}: {msg} -- used Decimate instead")
                             if len([s for s in obj.material_slots if s.material]) > 1:
