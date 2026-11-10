@@ -1037,10 +1037,19 @@ class AnimationHelpers:
     # same across each piece (spread 0-2 of 255; the old height painting 7-35).
     WIND_PROFILE = {'GRASS': 'slice'}
 
+    # How the wind rises along each piece, measured on every vanilla wind
+    # mesh (2026-11-10, 1,256 Tree_Anim shapes, alpha / piece max in 10 steps
+    # from the attached end): trees rise early (~t^0.7), plants steadily
+    # (~t), shrubs mostly at the tip (~t^2.5: the lower 40% of a vine barely
+    # moves), water plants very late (~t^3). A curve that is too strong in
+    # the middle of a thick vine still reads as 'breathing' in game
+    # (GS_BushM01 with the old smoothstep, 2026-11-10).
+    WIND_CURVE = {'TREE': 0.7, 'PLANT': 1.0, 'SHRUB': 2.5, 'WATER': 3.0}
+
     @staticmethod
     def _wind_weights_per_piece(coords, edges, height_w, axis_idx=2, invert=False,
                                 max_weight=1.0, anchor_low=False, raw_height=None,
-                                profile='ramp'):
+                                profile='ramp', curve=1.0):
         """Wind weight per vertex, painted ALONG each connected piece.
 
         A whole-object height gradient gives the top and bottom of a thick,
@@ -1114,7 +1123,7 @@ class AnimationHelpers:
             t = (s - lo) / (hi - lo)
             if lo_end > hi_end:
                 t = 1.0 - t
-            t = t * t * (3.0 - 2.0 * t)
+            t = _np.clip(t, 0.0, 1.0) ** float(curve)
             out[ids] = t * reach
         return out.tolist()
 
@@ -1224,7 +1233,8 @@ class AnimationHelpers:
                     weights = AnimationHelpers._wind_weights_per_piece(
                         coords, _edges, weights, axis_idx=idx, invert=invert,
                         max_weight=_mx, anchor_low=_anchor_low, raw_height=raw_heights,
-                        profile=AnimationHelpers.WIND_PROFILE.get(wtype, 'ramp'))
+                        profile=AnimationHelpers.WIND_PROFILE.get(wtype, 'ramp'),
+                        curve=AnimationHelpers.WIND_CURVE.get(wtype, 1.0))
                 except Exception as _pp_exc:
                     print(f"[AnimationHelpers] per-piece wind weights failed, "
                           f"using the height gradient: {_pp_exc}")
