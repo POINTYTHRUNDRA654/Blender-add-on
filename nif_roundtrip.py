@@ -1065,8 +1065,38 @@ def _patch_wind_shader_flags_bytes(data: bytes):
     types, offsets, _sizes = _block_layout(data)
     buf = bytearray(data)
     changed = 0
+    # Tree_Anim makes the shader read the wind from the vertex colours. In
+    # all 215,073 vanilla NIFs, 114,363 shapes have Tree_Anim and every one
+    # has vertex colours; a shape with Tree_Anim but no vertex colours
+    # (GS_BushM01.nif re-exported from a wind-rooted original, 2026-11-10)
+    # froze the game a few seconds after loading a save near it. So
+    # Tree_Anim goes only on shaders whose shapes carry vertex colours, and
+    # is cleared on the others.
+    no_vc_shaders = set()
     for t, off in zip(types, offsets):
+        if t not in ("BSTriShape", "BSMeshLODTriShape", "BSSubIndexTriShape", "BSDynamicTriShape"):
+            continue
+        try:
+            q = off
+            n_extra = struct.unpack_from('<I', buf, q + 4)[0]
+            q += 8 + 4 * n_extra + 4 + 4 + 52 + 4 + 16     # NiAVObject + bounding sphere
+            _skin, shader, _alpha = struct.unpack_from('<iii', buf, q)
+            vdesc = struct.unpack_from('<Q', buf, q + 12)[0]
+            if not (((vdesc >> 44) & 0xFFF) & 0x20):
+                no_vc_shaders.add(shader)
+        except struct.error:
+            pass
+    for idx, (t, off) in enumerate(zip(types, offsets)):
         if t != "BSLightingShaderProperty":
+            continue
+        if idx in no_vc_shaders:
+            q = off + 4
+            n_extra = struct.unpack_from('<I', buf, q + 4)[0]
+            q += 8 + 4 * n_extra + 4
+            f1, f2 = struct.unpack_from('<II', buf, q)
+            if f2 & SLSF2_TREE_ANIM:
+                struct.pack_into('<II', buf, q, f1, f2 & ~SLSF2_TREE_ANIM)
+                changed += 1
             continue
         q = off + 4                                   # shader type
         n_extra = struct.unpack_from('<I', buf, q + 4)[0]

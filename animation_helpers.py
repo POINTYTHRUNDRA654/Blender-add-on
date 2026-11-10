@@ -906,8 +906,74 @@ class AnimationHelpers:
         return ready2, actions, remaining
 
     @staticmethod
+    def _wind_weights_per_piece(coords, edges, height_w, axis_idx=2, invert=False):
+        """Wind weight per vertex, painted ALONG each connected piece.
+
+        A whole-object height gradient gives the top and bottom of a thick,
+        sideways vine different weights, so FO4's tree shader moves them by
+        different amounts and the vine swells and shrinks ("breathing";
+        Billy's GS_BushM01, 2026-11-09). Bethesda's DLC04 Briar_BushM01.nif
+        (the same 426-vertex vine mesh) paints each piece from 0 at its
+        attached end up along its length (max ~170 of 255) and leaves its five
+        biggest stems at 0; its flat leaf cards carry one value per card (255).
+        So: weight = ramp along the piece's main axis (root = the end lower
+        down the plant), scaled by how high the piece reaches; every slice
+        across a vine gets the same value, so it bends instead of breathing.
+        Truly flat cards get one uniform value.
+        """
+        import numpy as _np
+        n = len(coords)
+        par = list(range(n))
+
+        def find(a):
+            while par[a] != a:
+                par[a] = par[par[a]]
+                a = par[a]
+            return a
+        for a, b in edges:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                par[ra] = rb
+        islands = {}
+        for i in range(n):
+            islands.setdefault(find(i), []).append(i)
+        P = _np.asarray(coords, dtype=float)
+        H = _np.asarray(height_w, dtype=float)
+        out = _np.zeros(n)
+        for ids in islands.values():
+            ids = _np.asarray(ids)
+            pts = P[ids]
+            if len(ids) < 3:
+                out[ids] = H[ids].mean()
+                continue
+            c = pts.mean(axis=0)
+            cov = _np.cov((pts - c).T)
+            vals, vecs = _np.linalg.eigh(cov)
+            main = vecs[:, -1]
+            ext = _np.sqrt(_np.maximum(vals, 0.0))
+            flatness = ext[0] / ext[-1] if ext[-1] > 0 else 0.0
+            reach = float(H[ids].max())            # how far up the plant it goes
+            if flatness < 0.05:                    # flat card: one value
+                out[ids] = reach
+                continue
+            s = (pts - c) @ main
+            lo, hi = s.min(), s.max()
+            if hi - lo < 1e-9:
+                out[ids] = reach
+                continue
+            # Root = the end that sits lower on the plant.
+            lo_end = H[ids][s <= lo + 0.2 * (hi - lo)].mean()
+            hi_end = H[ids][s >= hi - 0.2 * (hi - lo)].mean()
+            t = (s - lo) / (hi - lo)
+            if lo_end > hi_end:
+                t = 1.0 - t
+            t = t * t * (3.0 - 2.0 * t)
+            out[ids] = t * reach
+        return out.tolist()
+
+    @staticmethod
     def generate_wind_weights(mesh_obj, group_name="Wind", axis='Z', invert=False,
-                              base_anchor=0.15):
+                              base_anchor=0.15, per_piece=True):
         """Generate a wind‑weight vertex group with an anchored (solid) base.
 
         The algorithm computes a falloff along the specified local axis
@@ -972,6 +1038,7 @@ class AnimationHelpers:
             # Height (0..1) of the anchor line above the base.  Below this the
             # plant is solid; above it, weight ramps 0 -> 1 up to the tip.
             span = 1.0 - base_anchor  # normalized height of the moving region
+            weights = []
             for i, val in enumerate(values):
                 # normalized position along the axis, 0 = base, 1 = tip
                 pos = (val - minv) / diff
@@ -985,7 +1052,18 @@ class AnimationHelpers:
                     # remap the moving region to 0..1, then smoothstep ease-in
                     t = (pos - base_anchor) / span
                     w = t * t * (3.0 - 2.0 * t)
+                weights.append(w)
 
+            if per_piece:
+                try:
+                    weights = AnimationHelpers._wind_weights_per_piece(
+                        coords, [tuple(e.vertices) for e in mesh.edges], weights,
+                        axis_idx=idx, invert=invert)
+                except Exception as _pp_exc:
+                    print(f"[AnimationHelpers] per-piece wind weights failed, "
+                          f"using the height gradient: {_pp_exc}")
+
+            for i, w in enumerate(weights):
                 # Floor at 0.001: pure 0.0 weight is treated as "unweighted"
                 # by PyNifly's exporter and causes a hard error.  0.001 is
                 # imperceptibly small and won't cause visible root-sway.
