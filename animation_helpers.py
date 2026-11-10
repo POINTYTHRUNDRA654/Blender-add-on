@@ -905,8 +905,142 @@ class AnimationHelpers:
         ready2, remaining, _ = AnimationHelpers.scan_wind_readiness(mesh_obj)
         return ready2, actions, remaining
 
+    # Vanilla wind by plant type, from a scan of every wind mesh in the game
+    # (2026-11-10: 1,256 Tree_Anim shapes in 479 NIFs, 72,955 pieces):
+    # (highest weight, anchor pieces that stay in the bottom half).
+    # Max = vanilla median of the highest wind per moving piece: trees 255,
+    # shrubs ~185, plants ~130, grass ~155, water plants ~127 (kelp gets the
+    # half via alpha_scale). Pieces staying in the bottom half are mostly
+    # anchored at 0 in shrubs (76%), plants (59%) and trees (35%), but almost
+    # never in grass (~1%) or water plants.
+    WIND_PLANT_TYPES = {
+        'TREE':  (1.00, True),
+        'SHRUB': (0.73, True),
+        'PLANT': (0.51, True),
+        'GRASS': (0.61, False),
+        'WATER': (0.50, False),   # vanilla water plants top out ~127 (KelpAnim01 153)
+    }
+
+    # Cloth and signs (same scan): the wind grows with distance from where
+    # the cloth is fastened ("pinned") -- banners 36/36 pieces, tablecloths
+    # 17/24, tents 10/16, nets 34/61, sails 26/52 -- or downward from the top
+    # for hanging signs (6/6). Highest wind (median): signs 255, tents 255,
+    # tablecloths 255, nets 200, banners 161, sails 50. Windmills: all 0 (the
+    # blades turn by their own animation, not wind).
+    # (highest weight, how it is pinned)
+    WIND_CLOTH_TYPES = {
+        'SIGN':   (1.00, 'top'),
+        'BANNER': (0.63, 'pins'),
+        'CLOTH':  (1.00, 'pins'),
+        'NET':    (0.78, 'pins'),
+        'SAIL':   (0.20, 'pins'),
+    }
+    WIND_PIN_GROUP = "WindPin"
+
     @staticmethod
-    def _wind_weights_per_piece(coords, edges, height_w, axis_idx=2, invert=False):
+    def detect_wind_plant_type(mesh_obj) -> str:
+        """Wind type from object/mesh/material names, with the same keywords
+        used to group the vanilla wind scan (plants, cloth, signs)."""
+        # The object's own name decides first (DLC04_Sign_KingColasCourt01 has
+        # a banner material but is a sign); materials only when it says nothing.
+        own = " ".join(n.lower() for n in (mesh_obj.name, getattr(mesh_obj.data, "name", "")) if n)
+        mats = []
+        for s in getattr(mesh_obj, "material_slots", []):
+            if s.material:
+                mats += [s.material.name, str(s.material.get("BSLSP_Shader_Name") or "")]
+        for t in (own, " ".join(n.lower() for n in mats if n)):
+            hit = AnimationHelpers._wind_type_from_text(t, mesh_obj)
+            if hit:
+                return hit
+        return 'PLANT'
+
+    @staticmethod
+    def _wind_type_from_text(t: str, mesh_obj=None):
+        if not t:
+            return None
+        # Cloth words before "sign": vanilla street-lamp banners keep their material
+        # under a "Signage" folder, so "sign" alone would mislabel them.
+        if "banner" in t or "flag" in t:
+            return 'BANNER'
+        if "sail" in t:
+            return 'SAIL'
+        if "campnet" in t or "_net" in t or " net" in t or t.startswith("net"):
+            return 'NET'
+        if any(k in t for k in ("cloth", "tent", "tarp", "curtain", "drape", "awning", "canvas")):
+            return 'CLOTH'
+        if "sign" in t:
+            return 'SIGN'
+        if (mesh_obj is not None and mesh_obj.get("fo4_underwater")) or any(
+                k in t for k in ("kelp", "seaweed", "coral", "algae", "cattail", "reed", "lily")):
+            return 'WATER'
+        if "grass" in t:
+            return 'GRASS'
+        if "tree" in t:
+            return 'TREE'
+        if any(k in t for k in ("shrub", "bush", "briar", "hedge", "holly")):
+            return 'SHRUB'
+        if any(k in t for k in ("plant", "flower", "fung", "shroom", "spore", "bramble", "crop", "vine", "ivy")):
+            return 'PLANT'
+        return None
+
+    @staticmethod
+    def _wind_weights_cloth(coords, edges, pinned, mode='pins', max_weight=1.0):
+        """Cloth/sign wind: per connected piece, the weight grows with the
+        distance from where it is fastened, 0 at the pinned vertices up to
+        *max_weight* at the point furthest from them (vanilla banners, tents,
+        nets, tablecloths, sails). mode 'top', or a piece without any pinned
+        vertex, pins the piece along its top edge, so it hangs and swings
+        from there (vanilla signs)."""
+        import numpy as _np
+        n = len(coords)
+        par = list(range(n))
+
+        def find(a):
+            while par[a] != a:
+                par[a] = par[par[a]]
+                a = par[a]
+            return a
+        for a, b in edges:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                par[ra] = rb
+        islands = {}
+        for i in range(n):
+            islands.setdefault(find(i), []).append(i)
+        P = _np.asarray(coords, dtype=float)
+        PIN = _np.asarray(pinned, dtype=bool) if pinned is not None else _np.zeros(n, bool)
+        out = _np.zeros(n)
+        for ids in islands.values():
+            ids = _np.asarray(ids)
+            pts = P[ids]
+            pin = PIN[ids] if mode == 'pins' else _np.zeros(len(ids), bool)
+            if not pin.any():
+                z = pts[:, 2]
+                pin = z >= z.max() - 0.05 * ((z.max() - z.min()) or 1.0)
+            anchors = pts[pin]
+            dist = _np.full(len(ids), _np.inf)
+            for k in range(0, len(anchors), 256):
+                chunk = anchors[k:k + 256]
+                dist = _np.minimum(dist, _np.linalg.norm(pts[:, None, :] - chunk[None, :, :], axis=2).min(axis=1))
+            m = dist.max()
+            out[ids] = (dist / m if m > 0 else 0.0) * max_weight
+        return out.tolist()
+
+    # Which painting each type gets, picked by comparing with Bethesda's own
+    # wind meshes (2026-11-10, 7 vanilla meshes re-painted in Blender and
+    # compared vertex by vertex): grass keeps vanilla's height pattern best
+    # when the height is evened out per slice of each blade (pattern match
+    # 0.86 vs vanilla's own height 0.92, no breathing); for trees, shrubs,
+    # plants and water plants the ramp along each piece is closest to the
+    # vanilla values (e.g. Creosote01 avg diff 21 vs 37) and keeps the most
+    # vanilla-anchored parts still (57-76%). All of these keep the wind the
+    # same across each piece (spread 0-2 of 255; the old height painting 7-35).
+    WIND_PROFILE = {'GRASS': 'slice'}
+
+    @staticmethod
+    def _wind_weights_per_piece(coords, edges, height_w, axis_idx=2, invert=False,
+                                max_weight=1.0, anchor_low=False, raw_height=None,
+                                profile='ramp'):
         """Wind weight per vertex, painted ALONG each connected piece.
 
         A whole-object height gradient gives the top and bottom of a thick,
@@ -939,12 +1073,16 @@ class AnimationHelpers:
             islands.setdefault(find(i), []).append(i)
         P = _np.asarray(coords, dtype=float)
         H = _np.asarray(height_w, dtype=float)
+        RH = _np.asarray(raw_height if raw_height is not None else height_w, dtype=float)
         out = _np.zeros(n)
         for ids in islands.values():
             ids = _np.asarray(ids)
             pts = P[ids]
+            if anchor_low and float(RH[ids].max()) < 0.5:
+                out[ids] = 0.0                     # stays in the bottom half: anchored
+                continue
             if len(ids) < 3:
-                out[ids] = H[ids].mean()
+                out[ids] = H[ids].mean() * max_weight
                 continue
             c = pts.mean(axis=0)
             cov = _np.cov((pts - c).T)
@@ -953,10 +1091,19 @@ class AnimationHelpers:
             ext = _np.sqrt(_np.maximum(vals, 0.0))
             flatness = ext[0] / ext[-1] if ext[-1] > 0 else 0.0
             reach = float(H[ids].max())            # how far up the plant it goes
-            if flatness < 0.05:                    # flat card: one value
+            reach *= max_weight
+            s = (pts - c) @ main
+            if flatness < 0.05 and profile != 'slice':   # flat card: one value
                 out[ids] = reach
                 continue
-            s = (pts - c) @ main
+            if profile == 'slice':
+                # Height wind evened out per slice: the plant's own height
+                # pattern, fitted along the piece so every slice across it
+                # carries one value.
+                A = _np.vstack([s, _np.ones_like(s)]).T
+                coef, *_ = _np.linalg.lstsq(A, H[ids], rcond=None)
+                out[ids] = _np.clip(A @ coef, 0.0, 1.0) * max_weight
+                continue
             lo, hi = s.min(), s.max()
             if hi - lo < 1e-9:
                 out[ids] = reach
@@ -973,7 +1120,7 @@ class AnimationHelpers:
 
     @staticmethod
     def generate_wind_weights(mesh_obj, group_name="Wind", axis='Z', invert=False,
-                              base_anchor=0.15, per_piece=True):
+                              base_anchor=0.15, per_piece=True, plant_type='AUTO'):
         """Generate a wind‑weight vertex group with an anchored (solid) base.
 
         The algorithm computes a falloff along the specified local axis
@@ -1039,6 +1186,10 @@ class AnimationHelpers:
             # plant is solid; above it, weight ramps 0 -> 1 up to the tip.
             span = 1.0 - base_anchor  # normalized height of the moving region
             weights = []
+            raw_heights = []
+            wtype = plant_type if plant_type and plant_type != 'AUTO' else \
+                AnimationHelpers.detect_wind_plant_type(mesh_obj)
+            mesh_obj["fo4_wind_type"] = wtype
             for i, val in enumerate(values):
                 # normalized position along the axis, 0 = base, 1 = tip
                 pos = (val - minv) / diff
@@ -1053,12 +1204,27 @@ class AnimationHelpers:
                     t = (pos - base_anchor) / span
                     w = t * t * (3.0 - 2.0 * t)
                 weights.append(w)
+                raw_heights.append(pos)
 
-            if per_piece:
+            _edges = [tuple(e.vertices) for e in mesh.edges]
+            if wtype in AnimationHelpers.WIND_CLOTH_TYPES:
+                _mx, _mode = AnimationHelpers.WIND_CLOTH_TYPES[wtype]
+                _pg = mesh_obj.vertex_groups.get(AnimationHelpers.WIND_PIN_GROUP)
+                _pinned = [False] * len(mesh.vertices)
+                if _pg is not None:
+                    for v in mesh.vertices:
+                        for g in v.groups:
+                            if g.group == _pg.index and g.weight > 0.5:
+                                _pinned[v.index] = True
+                weights = AnimationHelpers._wind_weights_cloth(
+                    coords, _edges, _pinned, mode=_mode, max_weight=_mx)
+            elif per_piece:
+                _mx, _anchor_low = AnimationHelpers.WIND_PLANT_TYPES.get(wtype, (1.0, False))
                 try:
                     weights = AnimationHelpers._wind_weights_per_piece(
-                        coords, [tuple(e.vertices) for e in mesh.edges], weights,
-                        axis_idx=idx, invert=invert)
+                        coords, _edges, weights, axis_idx=idx, invert=invert,
+                        max_weight=_mx, anchor_low=_anchor_low, raw_height=raw_heights,
+                        profile=AnimationHelpers.WIND_PROFILE.get(wtype, 'ramp'))
                 except Exception as _pp_exc:
                     print(f"[AnimationHelpers] per-piece wind weights failed, "
                           f"using the height gradient: {_pp_exc}")
@@ -1281,7 +1447,7 @@ class AnimationHelpers:
 
     @staticmethod
     def apply_vegetation_wind(mesh_obj, amplitude: float = 0.2, period: float = 60.0,
-                              alpha_scale: float = 1.0):
+                              alpha_scale: float = 1.0, plant_type: str = 'AUTO'):
         """Set up FO4 vegetation wind using vertex groups and vertex color alpha.
 
         FO4 vegetation wind is procedural in-engine.  The BSLeafAnimNode reads
@@ -1304,7 +1470,8 @@ class AnimationHelpers:
         ready, fixes, remaining = AnimationHelpers.ensure_wind_ready(mesh_obj, auto_fix=True)
         fix_note = f" [prep: {', '.join(fixes)}]" if fixes else ""
 
-        ok, msg = AnimationHelpers.generate_wind_weights(mesh_obj, group_name="Wind")
+        ok, msg = AnimationHelpers.generate_wind_weights(mesh_obj, group_name="Wind",
+                                                         plant_type=plant_type)
         if not ok:
             return False, msg
 

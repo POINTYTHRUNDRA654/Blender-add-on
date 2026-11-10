@@ -3783,10 +3783,32 @@ class FO4_OT_VegetationWindSetup(Operator):
     period: FloatProperty(name="Wind Period", default=60.0, min=1.0,
                           description="Animation loop length in frames")
     apply_all_selected: BoolProperty(name="Apply to All Selected", default=False)
+    wind_type: EnumProperty(
+        name="Wind Type",
+        description=("How the wind is painted, matched to how Bethesda paints that kind of "
+                     "object (scan of every wind mesh in the game)"),
+        items=[
+            ('AUTO',   "Auto (from the name)", "Picks the type from the object/material name"),
+            ('TREE',   "Tree",          "Wind rises along each branch, up to full; low pieces anchored"),
+            ('SHRUB',  "Shrub / Bush",  "Along each piece, up to ~185 of 255; low pieces anchored"),
+            ('PLANT',  "Plant / Flower / Fungus", "Along each piece, up to ~130; low pieces anchored"),
+            ('GRASS',  "Grass",         "Along each blade, up to ~155; nothing anchored"),
+            ('WATER',  "Water Plant",   "Along each piece; kelp/coral presets halve it"),
+            ('SIGN',   "Hanging Sign",  "Hangs from its top edge, swings most at the bottom"),
+            ('BANNER', "Banner / Flag", "Grows from the 'WindPin' vertices (else the top), up to ~161"),
+            ('CLOTH',  "Cloth / Tent / Tarp", "Grows from the 'WindPin' vertices (else the top), up to full"),
+            ('NET',    "Net",           "Grows from the 'WindPin' vertices (else the top), up to ~200"),
+            ('SAIL',   "Sail",          "Grows from the 'WindPin' vertices (else the top), gentle (~50)"),
+        ],
+        default='AUTO',
+    )
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "preset")
+        layout.prop(self, "wind_type")
+        if self.wind_type in ('BANNER', 'CLOTH', 'NET', 'SAIL'):
+            layout.label(text="Put the fastened vertices in a vertex group named 'WindPin'", icon='PINNED')
         if self.preset == 'NONE':
             layout.prop(self, "amplitude")
             layout.prop(self, "period")
@@ -3835,10 +3857,19 @@ class FO4_OT_VegetationWindSetup(Operator):
             return {'CANCELLED'}
 
         ok_count = 0
+        # A preset implies its type unless the user picked one explicitly.
+        _preset_type = {'GRASS': 'GRASS', 'SHRUB': 'SHRUB', 'SHRUB_STORM': 'SHRUB',
+                        'TREE': 'TREE', 'TREE_STORM': 'TREE',
+                        'KELP': 'WATER', 'CORAL_SOFT': 'WATER'}.get(self.preset, 'AUTO')
+        _wtype = self.wind_type if self.wind_type != 'AUTO' else _preset_type
         for obj in targets:
-            alpha_scale = {'KELP': 0.5, 'CORAL_SOFT': 0.35}.get(self.preset, 1.0)
+            # The Water Plant type already caps the wind at 50% (vanilla);
+            # soft coral goes a bit lower on top of that (35% overall).
+            alpha_scale = {'KELP': 1.0, 'CORAL_SOFT': 0.7}.get(self.preset, 1.0)
             ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(
-                obj, amp, per, alpha_scale=alpha_scale)
+                obj, amp, per, alpha_scale=alpha_scale, plant_type=_wtype)
+            if ok:
+                msg += f" [wind type: {obj.get('fo4_wind_type', _wtype)}]"
             if alpha_scale < 1.0:
                 obj["fo4_underwater"] = True
             if ok:
@@ -3948,7 +3979,7 @@ class FO4_OT_SmartWindSetup(Operator):
         # fo4_underwater custom property so Smart Wind picks it automatically.
         if obj_class == 'VEGETATION' and _looks_underwater(obj):
             ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(
-                obj, 0.09, 170.0, alpha_scale=0.5)
+                obj, 0.09, 170.0, alpha_scale=1.0, plant_type='WATER')
             obj["fo4_underwater"] = True
             label = "UNDERWATER VEGETATION (Kelp current)"
         elif obj_class == 'VEGETATION':
