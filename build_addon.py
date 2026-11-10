@@ -364,6 +364,12 @@ def main(argv=None):
         default=".",
         help="Output directory for the zip files (default: repo root)",
     )
+    parser.add_argument(
+        "--nexus-bundle",
+        action="store_true",
+        help="Also build the all-variants Nexus bundle zip (off by default: "
+             "releases ship only the separate per-Blender-version zips)",
+    )
     args = parser.parse_args(argv)
 
     root = Path(__file__).parent.resolve()
@@ -440,8 +446,9 @@ def main(argv=None):
     for key in keys:
         built.append(build_variant(root, outdir, addon_version, key, VARIANTS[key]))
 
-    # Build the Nexus bundle whenever all variants are requested
-    if args.version == "all":
+    # The Nexus bundle only on request: releases ship the separate zips
+    # (Billy, 2026-11-09: "I don't release the Nexus bundle").
+    if args.version == "all" and args.nexus_bundle:
         print()
         print("Building Nexus Mods bundle…")
         build_nexus_bundle(outdir, addon_version, built)
