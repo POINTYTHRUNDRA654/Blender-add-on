@@ -140,9 +140,19 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
 
     # Explicitly carry material slots from source (handles both DATA- and
     # OBJECT-linked slots; ensures PyNifly-imported textures travel with the LOD)
+    # materials.clear() also resets every face's material index to 0, so a
+    # LOD of a many-material model (a cliff with its plants) ended up with
+    # every face on the first material -- the plants drew the cliff/grass
+    # texture (measured 2026-11-09: 9 materials on the source, 1 on the LOD).
+    # Keep the indices and put them back.
+    _mi = [0] * len(new_mesh.polygons)
+    new_mesh.polygons.foreach_get("material_index", _mi)
     new_obj.data.materials.clear()
     for slot in source_obj.material_slots:
         new_obj.data.materials.append(slot.material)
+    if _mi:
+        new_mesh.polygons.foreach_set("material_index", _mi)
+        new_mesh.update()
 
     # Strip shape keys before decimating — Blender refuses to apply any
     # modifier to a mesh that has shape keys (RuntimeError).  LOD copies never
@@ -408,6 +418,60 @@ def reduce_lod_shell(prev_obj, lod_name: str, target_tris: int) -> "tuple[object
     n_tris = len(new_obj.data.polygons)
     return new_obj, (f"LOD '{lod_name}': {n_tris} triangles "
                      f"(reduced from {prev_obj.name}'s shell)")
+
+
+def split_lod_by_material(lod_obj) -> list:
+    """Split *lod_obj* into one object per used material (each keeping only
+    its own slot), named <lod>_<material>, for a one-shape-per-texture NIF."""
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = lod_obj
+    lod_obj.select_set(True)
+    before = set(bpy.data.objects)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.separate(type='MATERIAL')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    parts = [lod_obj] + [o for o in bpy.data.objects if o not in before]
+    base = lod_obj.name
+    for p in parts:
+        used = {poly.material_index for poly in p.data.polygons}
+        # Drop every slot this piece does not use, so its first (only) slot is
+        # the material PyNifly writes.
+        for i in reversed(range(len(p.material_slots))):
+            if i not in used:
+                p.active_material_index = i
+                bpy.ops.object.select_all(action='DESELECT')
+                bpy.context.view_layer.objects.active = p
+                p.select_set(True)
+                bpy.ops.object.material_slot_remove()
+    # Pieces whose materials point at the same .bgsm (three grass pieces, three
+    # cliff pieces of one NIF) become ONE shape: one shape per texture.
+    groups = {}
+    for p in parts:
+        m = p.material_slots[0].material if p.material_slots else None
+        key = str(m.get("BSLSP_Shader_Name") or m.name).lower() if m else ""
+        groups.setdefault(key, []).append(p)
+    out = []
+    for key, grp in groups.items():
+        head = grp[0]
+        if len(grp) > 1:
+            bpy.ops.object.select_all(action='DESELECT')
+            for g in grp:
+                g.select_set(True)
+            bpy.context.view_layer.objects.active = head
+            bpy.ops.object.join()
+            # All faces on the first slot, then drop the duplicate slots.
+            n = len(head.data.polygons)
+            head.data.polygons.foreach_set("material_index", [0] * n)
+            for i in reversed(range(1, len(head.material_slots))):
+                head.active_material_index = i
+                bpy.ops.object.material_slot_remove()
+        m = head.material_slots[0].material if head.material_slots else None
+        tag = re.sub(r"[^A-Za-z0-9_]+", "_",
+                     os.path.splitext(os.path.basename(str(m.get("BSLSP_Shader_Name") or m.name)))[0]) if m else "part"
+        head.name = f"{base}_{tag}"
+        out.append(head)
+    return out
 
 
 def _reuv_for_bake(lod_obj) -> None:
@@ -1049,8 +1113,34 @@ def _lod_texture_output_dir(src_path: str, out_subdir: str = "LOD",
     return os.path.join(textures_root, out_subdir, rel_subdir) if rel_subdir else os.path.join(textures_root, out_subdir)
 
 
+def _texture_has_alpha(path: str, img=None) -> bool:
+    """True when a source texture carries an alpha channel worth keeping
+    (cut-out leaves, grass): DXT3/DXT5/BC2/BC3/BC7 or uncompressed RGBA DDS,
+    or a 4-channel PNG/TGA. A LOD diffuse written as BC1 from such a source
+    turned every leaf card into a solid square."""
+    try:
+        if path.lower().endswith(".dds"):
+            with open(path, "rb") as fh:
+                h = fh.read(148)
+            cc = h[84:88]
+            if cc in (b"DXT2", b"DXT3", b"DXT4", b"DXT5"):
+                return True
+            if cc == b"DX10" and len(h) >= 132:
+                import struct as _st
+                return _st.unpack_from("<I", h, 128)[0] in (
+                    2, 10, 24, 27, 28, 29, 74, 75, 77, 78, 87, 88, 91, 98, 99)
+            if cc == b"\x00\x00\x00\x00":           # uncompressed: alpha bitmask set?
+                import struct as _st
+                return bool(_st.unpack_from("<I", h, 104)[0])
+            return False
+    except OSError:
+        return False
+    return bool(img is not None and getattr(img, "channels", 3) == 4)
+
+
 def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
-                         out_subdir: str = "LOD", textures_root: str = "") -> tuple:
+                         out_subdir: str = "LOD", textures_root: str = "",
+                         max_size: int = 0) -> tuple:
     """Give every object in *lod_objects* a shared, downscaled copy of the
     source's textures instead of the full-resolution original.
 
@@ -1157,8 +1247,16 @@ def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
                     )
                     continue
 
-                new_w = _nearest_pow2(src_w * scale_factor)
-                new_h = _nearest_pow2(src_h * scale_factor)
+                if max_size:
+                    # Fixed LOD size like vanilla (529 vanilla LOD textures:
+                    # 256 x 72%, 128 x 22%, 512 x 5%; none 1024): the longer
+                    # side becomes max_size, aspect kept.
+                    _f = min(1.0, float(max_size) / float(max(src_w, src_h)))
+                    new_w = _nearest_pow2(src_w * _f)
+                    new_h = _nearest_pow2(src_h * _f)
+                else:
+                    new_w = _nearest_pow2(src_w * scale_factor)
+                    new_h = _nearest_pow2(src_h * scale_factor)
                 if new_w >= src_w and new_h >= src_h:
                     shared_cache[key] = img  # already small enough — share as-is
                     node.image = img
@@ -1192,9 +1290,16 @@ def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
                 try:
                     from . import nvtt_helpers as _nv
                     _dds = os.path.splitext(out_path)[0] + ".dds"
-                    _slot = "Normal" if stem.lower().endswith("_n") else (
-                        "Specular" if stem.lower().endswith("_s") else "Diffuse")
-                    _ok_dds, _dds_msg = _nv.NVTTHelpers.convert_to_dds(out_path, _dds, slot=_slot)
+                    # Formats as vanilla LODs use them (529 checked): _n and
+                    # _s BC5, _d BC3 when the source has alpha (cut-out
+                    # leaves/grass), else BC1.
+                    _low = stem.lower()
+                    if _low.endswith("_n") or _low.endswith("_s"):
+                        _fmt = 'bc5'
+                    else:
+                        _fmt = 'bc3' if _texture_has_alpha(src_path, img) else 'bc1'
+                    _ok_dds, _dds_msg = _nv.NVTTHelpers.convert_to_dds(
+                        out_path, _dds, compression_format=_fmt)
                 except Exception as _exc:
                     _ok_dds, _dds_msg = False, str(_exc)
                 if _ok_dds and os.path.isfile(_dds):
@@ -1618,6 +1723,30 @@ class FO4_OT_GenerateLODs(Operator):
         ],
         default='512',
     )
+    lod_textures: EnumProperty(
+        name="LOD Textures",
+        description="How the LOD gets its look",
+        items=[
+            ('ORIGINAL', "Original Textures, Shrunk (like vanilla)",
+             "Every part keeps its own original texture (diffuse, normal, specular), "
+             "shrunk to the LOD Texture Size and shared by all LOD levels, with one "
+             "LOD shape per texture -- how Bethesda's LODs look so clear (the bark "
+             "keeps tiling, nothing is squeezed). Best quality"),
+            ('BAKE', "One Baked Texture",
+             "Bake the whole model onto one new texture per LOD level (fewer files; "
+             "a texture that tiles many times gets squeezed and looks noisier)"),
+        ],
+        default='ORIGINAL',
+    )
+    lod_tex_size: EnumProperty(
+        name="LOD Texture Size",
+        description=("Longest side of the shrunk LOD textures. Vanilla LOD textures are "
+                     "256 (72%), 128 (22%) or 512 (5%); never 1024"),
+        items=[('256', "256", "Vanilla's most common size"),
+               ('512', "512", "Sharper; for detailed or large models"),
+               ('1024', "1024", "Very sharp; uses 4x the memory of 512")],
+        default='512',
+    )
     collision_from_lod3: BoolProperty(
         name="Auto-Collision from LOD3",
         description=(
@@ -1763,7 +1892,12 @@ class FO4_OT_GenerateLODs(Operator):
 
         layout.separator()
 
-        layout.prop(self, "lod_method")
+        layout.prop(self, "lod_textures")
+        if self.lod_textures == 'ORIGINAL':
+            layout.prop(self, "lod_tex_size")
+            layout.label(text="Keeps each part's own UVs and textures (shape: Decimate)", icon='INFO')
+        else:
+            layout.prop(self, "lod_method")
 
         # ── LOD ratios ────────────────────────────────────────────────────────
         row = layout.row()
@@ -1976,6 +2110,11 @@ class FO4_OT_GenerateLODs(Operator):
 
             lod_objects = []
             last_shell = None
+            # Original-textures mode (default): the LOD keeps the source's UVs
+            # and materials so each part shows its own original texture,
+            # shrunk -- the way vanilla LODs stay sharp. That needs the source
+            # UVs, so the geometry is a Decimate (a remeshed shell has new UVs).
+            _original_mode = (self.lod_textures == 'ORIGINAL' and not is_skinned)
             n_src_tris = sum(len(p.loop_indices) - 2 for p in obj.data.polygons)
             for lod_key, ratio in lods_to_gen:
                 lod_name = f"{base_name}_{lod_key}"
@@ -1986,7 +2125,9 @@ class FO4_OT_GenerateLODs(Operator):
 
                 try:
                     lod_obj = None
-                    if self.lod_method == 'SHELL' and not is_skinned:
+                    if _original_mode:
+                        pass   # Decimate below keeps UVs and material slots
+                    elif self.lod_method == 'SHELL' and not is_skinned:
                         target = max(12, min(_LOD_MAX_TRIS[lod_key], int(ratio * n_src_tris)))
                         # Remesh once (the finest level); every farther level
                         # reduces the previous shell. Coarser remeshes kept
@@ -2210,7 +2351,7 @@ class FO4_OT_GenerateLODs(Operator):
                 # So a decimated LOD of such a model gets fresh UVs and the
                 # same bake as a shell.
                 _n_src_mats = len({s.material for s in obj.material_slots if s.material})
-                if _n_src_mats > 1:
+                if _n_src_mats > 1 and not _original_mode:
                     for _lo in lod_objects:
                         if not _lo.get("fo4_lod_shell"):
                             _reuv_for_bake(_lo)
@@ -2221,9 +2362,35 @@ class FO4_OT_GenerateLODs(Operator):
                 decimated = [o for o in lod_objects if not _baked(o)]
                 if decimated:
                     _ok, tex_msg = create_lod_textures(
-                        decimated, scale_factor=0.25, textures_root=textures_root)
+                        decimated, scale_factor=0.25, textures_root=textures_root,
+                        max_size=int(self.lod_tex_size) if _original_mode else 0)
                     steps.append(tex_msg)
-                for lod_obj in lod_objects:
+                if _original_mode:
+                    # One LOD material per SOURCE material, shared by every LOD
+                    # level and every model using that material, like vanilla's
+                    # ElmTrunksLOD / ElmBranchesLOD: Materials\LOD\<source
+                    # material's folder>\<SourceName>LOD.bgsm, pointing at the
+                    # shrunk textures. Built from the source .bgsm (alpha test
+                    # etc. kept); is_lod export turns tree/glow off.
+                    for lod_obj in lod_objects:
+                        for _slot in lod_obj.material_slots:
+                            _m = _slot.material
+                            if _m is None or _m.get("fo4_lod_material"):
+                                continue
+                            _src = str(_m.get("BSLSP_Shader_Name") or "")
+                            _pp = [p for p in re.split(r"[\\/]+", _src) if p]
+                            if _src.lower().endswith(".bgsm") and len(_pp) >= 2 and _pp[0].lower() == "materials":
+                                _mdir = "\\".join(_pp[1:-1])
+                                _stem = os.path.splitext(_pp[-1])[0]
+                            else:
+                                _mdir = rel_dir
+                                _stem = re.sub(r"[^A-Za-z0-9_]+", "_", _m.name.split(".")[0]) or safe
+                            if _stem.lower().endswith("_wind"):
+                                _stem = _stem[:-5]
+                            _m["BSLSP_Shader_Name"] = ("materials\\LOD\\" + (_mdir + "\\" if _mdir else "")
+                                                       + _stem + "LOD.bgsm")
+                            _m["fo4_lod_material"] = True
+                for lod_obj in (lod_objects if not _original_mode else []):
                     lod_key = lod_obj.get("fo4_lod_level", "LOD1")
                     base = f"{safe}LOD{int(lod_key[-1]) - 1}"
                     bgsm_rel = "materials\\LOD\\" + (rel_dir + "\\" if rel_dir else "") + base + ".bgsm"
@@ -2295,9 +2462,19 @@ class FO4_OT_GenerateLODs(Operator):
                         bpy.ops.object.select_all(action='DESELECT')
                         lod_obj.select_set(True)
 
-                        result = export_helpers.ExportHelpers.export_mesh_to_nif(
-                            lod_obj, nif_path
-                        )
+                        if _original_mode and len([s for s in lod_obj.material_slots if s.material]) > 1:
+                            # One shape per texture in ONE NIF, like a vanilla
+                            # tree LOD (trunk shape + branches shape). PyNifly
+                            # writes an object with several material slots as a
+                            # single shape using only the first material -- the
+                            # plants then showed the cliff texture (2026-11-09).
+                            _parts = split_lod_by_material(lod_obj)
+                            result = export_helpers.ExportHelpers.export_scene_as_single_nif(
+                                context.scene, nif_path, objects=_parts)
+                        else:
+                            result = export_helpers.ExportHelpers.export_mesh_to_nif(
+                                lod_obj, nif_path
+                            )
                         ok  = result[0] if isinstance(result, tuple) else \
                               result in ({'FINISHED'}, 'FINISHED')
                         msg = result[1] if isinstance(result, tuple) else str(result)
