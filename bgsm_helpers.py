@@ -1308,6 +1308,13 @@ def blender_mat_to_bgsm(mat, is_lod: bool = False) -> BGSMData:
         data.subsurface_lighting = False
         data.tree = False
         data.root_material_path = ""
+        # LODs do not glow (Billy, 2026-11-09): no glow map, no emittance.
+        data.glowmap = False
+        data.emit_enabled = False
+        data.glow_texture = ""
+        data.greyscale_texture = ""
+        data.shader_flags1 &= ~SF1_EMIT_ENABLED
+        data.shader_flags2 &= ~SF2_GLOW_MAP
 
     return data
 

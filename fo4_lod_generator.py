@@ -316,11 +316,114 @@ def generate_lod_shell(source_obj, lod_name: str, target_tris: int,
                      f"(solid shell, voxel {voxel:.3g})")
 
 
+def reduce_lod_shell(prev_obj, lod_name: str, target_tris: int) -> "tuple[object, str]":
+    """Next, coarser LOD made by decimating the previous level's shell.
+
+    At the coarser voxel sizes of LOD2/LOD3 a remesh can lose a thin open
+    surface entirely (a cliff face with plants on it, 2026-11-09: LOD1's
+    shell worked, LOD2 and LOD3 fell back to plain Decimate, which kept the
+    merged source's three materials and wrote downscaled copies of every
+    source texture while the exported LOD used only the cliff one). The
+    previous shell is already one fused surface, so reducing it keeps every
+    level a single-material, baked LOD.
+    """
+    import math as _math
+    new_obj = prev_obj.copy()
+    new_obj.data = prev_obj.data.copy()
+    new_obj.name = lod_name
+    new_obj.data.name = lod_name
+    bpy.context.collection.objects.link(new_obj)
+    new_obj.modifiers.clear()
+    tris_now = len(new_obj.data.polygons)
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = new_obj
+    new_obj.select_set(True)
+    if tris_now > target_tris:
+        dm = new_obj.modifiers.new("FO4_LOD_Decimate", 'DECIMATE')
+        dm.decimate_type = 'COLLAPSE'
+        dm.ratio = max(0.001, target_tris / tris_now)
+        bpy.ops.object.modifier_apply(modifier=dm.name)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.quads_convert_to_tris()
+    bpy.ops.uv.smart_project(angle_limit=_math.radians(66), island_margin=0.003)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    for poly in new_obj.data.polygons:
+        poly.use_smooth = True
+    n_tris = len(new_obj.data.polygons)
+    return new_obj, (f"LOD '{lod_name}': {n_tris} triangles "
+                     f"(reduced from {prev_obj.name}'s shell)")
+
+
+def _lod_source_meshes(objs) -> list:
+    """The meshes a LOD run should use from *objs*: no collision objects
+    (PyNifly's "bhkPhysicsSystem", UCX_ hulls) and no earlier LOD output."""
+    return [o for o in objs if getattr(o, "type", "") == 'MESH'
+            and not o.name.lower().startswith(("ucx_", "bhk"))
+            and not o.get("fo4_lod_level") and not o.get("fo4_billboard")]
+
+
+def _model_name(pieces, active=None) -> str:
+    """Name of the model the selected pieces come from: the NIF they were
+    imported from when known (GSDirtCliffLarge01.nif -> GSDirtCliffLarge01),
+    else the active piece's name without PyNifly's ':02' / '.001' suffixes."""
+    order = ([active] if active is not None else []) + list(pieces)
+    for o in order:
+        src = o.get("fo4_source_nif") if o is not None else None
+        if src:
+            return os.path.splitext(os.path.basename(str(src)))[0]
+    base = (active or (pieces[0] if pieces else None))
+    name = base.name if base is not None else "Model"
+    name = re.split(r"[:]", name)[0]
+    name = re.sub(r"\.\d{3}$", "", name).strip()
+    return name or "Model"
+
+
+def merge_copies_for_lod(pieces, model_name: str):
+    """One temporary mesh joined from COPIES of *pieces* (the pieces
+    themselves are not touched), placed where they sit in the world, for a
+    single LOD set of a multi-piece model. Caller removes it afterwards."""
+    copies = []
+    for o in pieces:
+        c = o.copy()
+        c.data = o.data.copy()
+        bpy.context.scene.collection.objects.link(c)
+        mw = o.matrix_world.copy()
+        c.parent = None
+        c.matrix_world = mw
+        c.modifiers.clear()
+        if c.data.shape_keys:
+            c.shape_key_clear()
+        copies.append(c)
+    bpy.ops.object.select_all(action='DESELECT')
+    for c in copies:
+        c.select_set(True)
+    bpy.context.view_layer.objects.active = copies[0]
+    if len(copies) > 1:
+        bpy.ops.object.join()
+    merged = bpy.context.view_layer.objects.active
+    merged.name = model_name + "_LODSource"
+    merged.data.name = merged.name
+    merged["fo4_lod_basename"] = model_name
+    merged["fo4_lod_merged_tmp"] = True
+    for k in ("fo4_source_nif",):
+        if k in merged:
+            del merged[k]
+    return merged
+
+
 def _lod_rel_dir(source_mat, fallback_sub: str) -> str:
     """Folder under Materials\\LOD\\ and Textures\\LOD\\ for an asset's LOD
     files, matching vanilla (materials\\LOD\\Architecture\\Skybridge\\...,
-    LOD\\Architecture\\Shacks\\ShackLOD01_d.dds): the source material's own
-    folder under Materials\\, else the mesh sub-path."""
+    LOD\\Architecture\\Shacks\\ShackLOD01_d.dds): the Mesh Sub-path the user
+    typed, else the source material's own folder under Materials\\.
+
+    The typed sub-path wins: a merged model's "active" material is just the
+    first slot, so a cliff with grass and plant pieces put its LOD textures
+    under Grass or Plants depending on slot order (2026-11-09)."""
+    typed = "\\".join(p for p in re.split(r"[\\/]+", fallback_sub or "") if p)
+    if typed:
+        return typed
     name = (source_mat.get("BSLSP_Shader_Name", "") if source_mat else "") or ""
     parts = [p for p in re.split(r"[\\/]+", name) if p]
     if len(parts) >= 2 and parts[0].lower() == "materials":
@@ -536,6 +639,49 @@ def bake_lod_textures(source_obj, lod_obj, tex_size: int, textures_root: str,
     return paths, notes
 
 
+_LOD_DROP_FLAGS = {
+    # Wind: a LOD never sways (a merged cliff whose first material was a
+    # swaying grass piece exported its LODs with Tree_Anim on, 2026-11-09).
+    # Vertex alpha: LODs carry no vertex colours.
+    # Glow: LODs do not glow (Billy, 2026-11-09; his first LODs had Glow_Map
+    # on and the Decimate path wrote downscaled _g textures).
+    "Shader_Flags_1": ("VERTEX_ALPHA", "OWN_EMIT", "EXTERNAL_EMITTANCE"),
+    "Shader_Flags_2": ("TREE_ANIM", "GLOW_MAP"),
+}
+
+
+def _is_glow_node(node) -> bool:
+    label = f"{node.label} {node.name}".lower()
+    img = getattr(node, "image", None)
+    stem = ""
+    if img is not None:
+        stem = os.path.splitext(os.path.basename(img.filepath or img.name))[0].lower()
+    return "glow" in label or stem.endswith("_g")
+
+
+def strip_lod_material(mat) -> None:
+    """Make *mat* a LOD material: no wind, no vertex alpha, no glow.
+
+    Removes those shader flags from PyNifly's Shader_Flags_1/2 text, the
+    wind request, the glow texture slot and every glow image node, so
+    neither the NIF nor the .bgsm (see blender_mat_to_bgsm's is_lod) asks
+    for wind or a glow map."""
+    if mat is None:
+        return
+    for key, drops in _LOD_DROP_FLAGS.items():
+        val = mat.get(key)
+        if isinstance(val, str):
+            kept = [t.strip() for t in val.split("|")
+                    if t.strip() and t.strip().upper() not in drops]
+            mat[key] = " | ".join(kept)
+    for k in ("fo4_bgsm_tree", "fo4_bgsm_name_before_wind", "BSShaderTextureSet_Glow"):
+        if k in mat:
+            del mat[k]
+    if getattr(mat, "use_nodes", False) and mat.node_tree:
+        for n in [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and _is_glow_node(n)]:
+            mat.node_tree.nodes.remove(n)
+
+
 def make_lod_material(source_mat, lod_obj, tex_paths: dict, bgsm_rel: str,
                       opaque: bool) -> "object":
     """Give *lod_obj* its own copy of *source_mat* pointing at the LOD
@@ -554,6 +700,7 @@ def make_lod_material(source_mat, lod_obj, tex_paths: dict, bgsm_rel: str,
         del mat["fo4_bgsm_path"]
     if "BSShaderTextureSet_RootMaterialPath" in mat:
         del mat["BSShaderTextureSet_RootMaterialPath"]
+    strip_lod_material(mat)
     if not mat.use_nodes:
         mat.use_nodes = True
     nodes = mat.node_tree.nodes
@@ -830,6 +977,9 @@ def create_lod_textures(lod_objects: list, scale_factor: float = 0.25,
             if mat.users > 1:
                 mat = mat.copy()
                 slot.material = mat
+            # No wind or glow on a LOD: drop the flags and the glow nodes
+            # before downscaling, so no _g texture is written either.
+            strip_lod_material(mat)
 
             for node in mat.node_tree.nodes:
                 if node.type != 'TEX_IMAGE' or not node.image:
@@ -1278,6 +1428,16 @@ class FO4_OT_GenerateLODs(Operator):
     mod_folder: StringProperty(
         name="Mod Output Folder", default="", subtype='DIR_PATH',
     )
+    merge_selected: BoolProperty(
+        name="Merge Selected Into One Model",
+        description=(
+            "ON: the selected meshes are pieces of ONE model (one NIF, e.g. a cliff with "
+            "its plants): a temporary joined copy gets ONE LOD set named after the model; "
+            "your pieces are left as they are. OFF: every selected mesh is its own model "
+            "and gets its own LOD set"
+        ),
+        default=False,
+    )
     mesh_subpath: StringProperty(
         name="Mesh Sub-path",
         description="Path under [Mod Output Folder]/Meshes/ where NIFs go (MO2 mod folders have no Data\\ wrapper)",
@@ -1398,6 +1558,11 @@ class FO4_OT_GenerateLODs(Operator):
             self.detected_source_class = src_class
 
             n_tris = sum(len(p.loop_indices) - 2 for p in obj.data.polygons)
+            if self.merge_selected:
+                # One model from all selected pieces: size the ratios on the total.
+                n_tris = sum(len(p.loop_indices) - 2
+                             for o in _lod_source_meshes(context.selected_objects)
+                             for p in o.data.polygons) or n_tris
             # Auto-adjust ratios so none exceed FO4 max per level
             if n_tris > 0:
                 self.lod1_ratio = min(0.30, _LOD_MAX_TRIS["LOD1"] / n_tris)
@@ -1435,6 +1600,17 @@ class FO4_OT_GenerateLODs(Operator):
         layout = self.layout
         obj    = context.active_object
         src    = self.detected_source_class
+
+        # ── Mode: one model from all pieces, or one LOD set per mesh ──────────
+        _pieces = _lod_source_meshes(context.selected_objects)
+        box = layout.box()
+        box.prop(self, "merge_selected")
+        if self.merge_selected:
+            box.label(text=f"ONE LOD set for {len(_pieces)} selected piece(s), named "
+                           f"'{_model_name(_pieces, obj)}'", icon='AUTOMERGE_ON')
+        else:
+            box.label(text=f"A separate LOD set for each of {len(_pieces)} selected mesh(es)",
+                      icon='OUTLINER_OB_MESH')
 
         # ── Source info ───────────────────────────────────────────────────────
         if obj and obj.type == 'MESH':
@@ -1539,9 +1715,37 @@ class FO4_OT_GenerateLODs(Operator):
             active = context.active_object
             if active and active.type == 'MESH':
                 targets = [active]
+        # Selecting a whole loaded scene also selects the collision objects
+        # PyNifly imports ("bhkPhysicsSystem", UCX_ hulls) and LODs from an
+        # earlier run; those got LODs and billboards of their own
+        # (bhkPhysicsSystem_LOD_FLAT, 2026-11-09). Process real meshes only.
+        _kept = _lod_source_meshes(targets)
+        _skipped_targets = [o.name for o in targets if o not in _kept]
+        targets = _kept
+        if _skipped_targets:
+            self.report({'INFO'}, "Skipped (collision or existing LOD objects): "
+                        + ", ".join(_skipped_targets[:8])
+                        + (" ..." if len(_skipped_targets) > 8 else ""))
         if not targets:
             self.report({'ERROR'}, "Select a mesh object.")
             return {'CANCELLED'}
+
+        # ── One model from several pieces ─────────────────────────────────────
+        # Pieces of ONE NIF (a cliff with its plants) need ONE LOD set; a
+        # temporary joined copy is the LOD source, the pieces stay untouched.
+        # Separately loaded models are processed one by one (merge off).
+        _merged_tmp = None
+        if self.merge_selected and len(targets) > 1:
+            _active = context.active_object if context.active_object in targets else None
+            _name = _model_name(targets, _active)
+            try:
+                _merged_tmp = merge_copies_for_lod(targets, _name)
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not merge the selected pieces: {e}")
+                return {'CANCELLED'}
+            self.report({'INFO'}, f"Merged a copy of {len(targets)} piece(s) into one model "
+                                  f"'{_name}' for its LOD set (your pieces are unchanged)")
+            targets = [_merged_tmp]
 
         # ── Normalize a user-typed "Mesh Sub-path" that already starts with
         # "LOD" ──────────────────────────────────────────────────────────────
@@ -1595,6 +1799,16 @@ class FO4_OT_GenerateLODs(Operator):
         total_lod_count = 0
 
         for obj in targets:
+            # File names come from the model: the temporary merged copy's model
+            # name, or the NIF a mesh was imported from when it is the only
+            # selected piece of that NIF (GSFungusSpore06_LOD_0.nif, like
+            # vanilla), else the object's own name.
+            base_name = obj.get("fo4_lod_basename") or ""
+            _src_nif = obj.get("fo4_source_nif")
+            if not base_name and _src_nif and not any(
+                    o is not obj and o.get("fo4_source_nif") == _src_nif for o in targets):
+                base_name = os.path.splitext(os.path.basename(str(_src_nif)))[0]
+            base_name = base_name or obj.name
             # ── Detect source mesh class ──────────────────────────────────────
             # Use the dialog-detected value from invoke() only for the object
             # that was actually active when the dialog opened (that's the only
@@ -1618,9 +1832,10 @@ class FO4_OT_GenerateLODs(Operator):
                 )
 
             lod_objects = []
+            last_shell = None
             n_src_tris = sum(len(p.loop_indices) - 2 for p in obj.data.polygons)
             for lod_key, ratio in lods_to_gen:
-                lod_name = f"{obj.name}_{lod_key}"
+                lod_name = f"{base_name}_{lod_key}"
                 # Remove existing LOD with same name
                 existing = bpy.data.objects.get(lod_name)
                 if existing:
@@ -1632,10 +1847,20 @@ class FO4_OT_GenerateLODs(Operator):
                         target = max(12, min(_LOD_MAX_TRIS[lod_key], int(ratio * n_src_tris)))
                         lod_obj, msg = generate_lod_shell(
                             obj, lod_name, target, _SHELL_VOXEL_DIV[lod_key])
+                        if lod_obj is None and last_shell is not None:
+                            steps.append(f"{obj.name} {lod_key}: {msg} -- reduced "
+                                         f"{last_shell.name} instead")
+                            lod_obj, msg = reduce_lod_shell(last_shell, lod_name, target)
                         if lod_obj is None:
                             steps.append(f"{obj.name} {lod_key}: {msg} -- used Decimate instead")
+                            if len([s for s in obj.material_slots if s.material]) > 1:
+                                steps.append(
+                                    f"⚠ {obj.name} has several materials: a decimated LOD keeps "
+                                    "them and their separate textures; Shell needs to succeed "
+                                    "for one baked LOD texture")
                         else:
                             lod_obj["fo4_lod_shell"] = True
+                            last_shell = lod_obj
                     if lod_obj is None:
                         lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name)
                     # Move to LOD collection
@@ -1650,6 +1875,19 @@ class FO4_OT_GenerateLODs(Operator):
                     lod_obj["fo4_lod_level"]    = lod_key
                     lod_obj["fo4_lod_source"]   = obj.name
                     lod_obj["fo4_object_type"]  = src_class   # ← propagate type to LOD
+                    for _k in ("fo4_lod_merged_tmp", "fo4_lod_basename", "fo4_source_nif"):
+                        if _k in lod_obj:
+                            del lod_obj[_k]
+                    # A copy keeps the source's parent: the imported NIF root,
+                    # which still holds the source's bhkPhysicsSystem
+                    # collision. PyNifly then exported that collision with
+                    # every LOD and failed ("pack_compressed_mesh: max 255
+                    # verts per section", GSDirtCliffLarge01, 2026-11-09).
+                    # Detach the LOD, keeping where it sits in the world.
+                    if lod_obj.parent is not None:
+                        _mw = lod_obj.matrix_world.copy()
+                        lod_obj.parent = None
+                        lod_obj.matrix_world = _mw
                     lod_objects.append(lod_obj)
                     steps.append(msg)
                 except Exception as e:
@@ -1718,7 +1956,7 @@ class FO4_OT_GenerateLODs(Operator):
                 )
                 if lod3_obj:
                     try:
-                        ucx_name = f"UCX_{obj.name}"
+                        ucx_name = f"UCX_{base_name}"
                         # Remove existing UCX if present
                         existing_ucx = bpy.data.objects.get(ucx_name)
                         if existing_ucx:
@@ -1801,7 +2039,7 @@ class FO4_OT_GenerateLODs(Operator):
                 rel_dir = _lod_rel_dir(src_mat, _clean_subpath)
                 textures_root = (os.path.join(mod_folder, "Textures") if mod_folder
                                  else _tf.mkdtemp(prefix="fo4lod_tex_"))
-                safe = re.sub(r"[^A-Za-z0-9_]+", "_", obj.name)
+                safe = re.sub(r"[^A-Za-z0-9_]+", "_", base_name)
                 decimated = [o for o in lod_objects if not o.get("fo4_lod_shell")]
                 if decimated:
                     _ok, tex_msg = create_lod_textures(
@@ -1850,7 +2088,7 @@ class FO4_OT_GenerateLODs(Operator):
                         # naming is one-based, so subtract 1 for the index.
                         _lod_index = int(lod_key[-1]) - 1 if lod_key and lod_key[-1].isdigit() else 0
                         suffix   = f"_LOD_{_lod_index}"   # _LOD_0, _LOD_1, _LOD_2
-                        nif_name = f"{obj.name}{suffix}.nif"
+                        nif_name = f"{base_name}{suffix}.nif"
                         sub      = _clean_subpath
                         # NOTE: no "Data" segment here. self.mod_folder is the
                         # user's MO2 mod folder (e.g. ".../mods/MyMod"), which
@@ -1900,7 +2138,7 @@ class FO4_OT_GenerateLODs(Operator):
             # shared with LOD1/2/3 via create_lod_textures's downscale pass.
             if self.generate_billboard and not is_skinned:
                 try:
-                    billboard_name = f"{obj.name}_LOD_FLAT"
+                    billboard_name = f"{base_name}_LOD_FLAT"
                     existing_bb = bpy.data.objects.get(billboard_name)
                     if existing_bb:
                         bpy.data.objects.remove(existing_bb, do_unlink=True)
@@ -1918,6 +2156,45 @@ class FO4_OT_GenerateLODs(Operator):
 
                     if self.export_nifs and mod_folder:
                         from . import export_helpers as _eh_bb
+                        # The billboard's picture was only rendered to a temp
+                        # PNG and its material had no BSLSP_Shader_Name, so the
+                        # NIF said material "None" and no texture or .bgsm
+                        # reached the mod (2026-11-09). Put a DDS in the mod's
+                        # Textures\LOD\... and give it its own .bgsm first.
+                        try:
+                            from . import nvtt_helpers as _nv_bb
+                            _bb_mat = bb_obj.active_material
+                            _bb_node = next((n for n in _bb_mat.node_tree.nodes
+                                             if n.type == 'TEX_IMAGE' and n.image), None) if _bb_mat else None
+                            _bb_png = bpy.path.abspath(_bb_node.image.filepath) if _bb_node else ""
+                            _bb_rel = _lod_rel_dir(obj.active_material, _clean_subpath)
+                            _bb_safe = re.sub(r"[^A-Za-z0-9_]+", "_", base_name) + "_LOD_FLAT"
+                            _bb_dir = os.path.join(mod_folder, "Textures", "LOD",
+                                                   *[p for p in _bb_rel.split("\\") if p])
+                            os.makedirs(_bb_dir, exist_ok=True)
+                            _bb_dds = os.path.join(_bb_dir, f"{_bb_safe}_d.dds")
+                            if _bb_png and os.path.isfile(_bb_png):
+                                # texconv names its output after the INPUT file,
+                                # so give the PNG the final name first.
+                                import shutil as _sh_bb, tempfile as _tf_bb
+                                _bb_named = os.path.join(_tf_bb.mkdtemp(prefix="fo4bb_"),
+                                                         f"{_bb_safe}_d.png")
+                                _sh_bb.copy2(_bb_png, _bb_named)
+                                _ok_bb, _msg_bb = _nv_bb.NVTTHelpers.convert_to_dds(
+                                    _bb_named, _bb_dds, compression_format='bc3')
+                            else:
+                                _ok_bb, _msg_bb = False, "no rendered image"
+                            if _ok_bb and os.path.isfile(_bb_dds):
+                                _bb_bgsm = ("materials\\LOD\\" + (_bb_rel + "\\" if _bb_rel else "")
+                                            + _bb_safe + ".bgsm")
+                                make_lod_material(_bb_mat, bb_obj, {"Diffuse": _bb_dds},
+                                                  _bb_bgsm, opaque=False)
+                                steps.append(f"Billboard texture -> {_bb_dds}")
+                            else:
+                                steps.append(f"⚠ Billboard texture not converted to DDS ({_msg_bb}); "
+                                             "its NIF would have no usable texture")
+                        except Exception as _bbe:
+                            steps.append(f"⚠ Billboard texture/material failed: {_bbe}")
                         sub = _clean_subpath
                         # Real convention (verified against the exported
                         # reference folder, e.g.
@@ -1976,6 +2253,17 @@ class FO4_OT_GenerateLODs(Operator):
                     )
             elif mat:
                 steps.append(f"{lod_obj.name}: material '{mat.name}' has no nodes — assign textures")
+
+        # The temporary merged copy has done its job (LODs, bakes and NIFs are
+        # made from it); the user's own pieces were never changed.
+        if _merged_tmp is not None:
+            try:
+                _tmp_mesh = _merged_tmp.data
+                bpy.data.objects.remove(_merged_tmp, do_unlink=True)
+                if _tmp_mesh is not None and _tmp_mesh.users == 0:
+                    bpy.data.meshes.remove(_tmp_mesh)
+            except Exception as _ce:
+                steps.append(f"Temporary merged copy left in the scene: {_ce}")
 
         for s in steps:
             self.report({'INFO'}, s)

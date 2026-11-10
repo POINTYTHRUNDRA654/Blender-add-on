@@ -1923,10 +1923,23 @@ class FO4_PT_LODCollisionPipeline(_FO4SubPanel):
         lod_box = layout.box()
         lod_box.label(text="Step 1 — Generate LODs", icon='MOD_DECIM')
         lod_box.label(text="LOD0=original  LOD1=30%  LOD2=12%  LOD3=8%", icon='DOT')
+        # Two buttons so separate models and the pieces of one model never get
+        # mixed up (Billy, 2026-11-09): merging separately loaded plants with a
+        # cliff gave one LOD whose textures mixed both.
         row = lod_box.row()
         row.enabled = has_mesh
-        row.operator("fo4.generate_lods", text="Generate LOD0–LOD3", icon='DUPLICATE')
-        lod_box.label(text="LOD3 materials cleared — collision candidate", icon='DOT')
+        row.scale_y = 1.2
+        op = row.operator("fo4.generate_lods", text="LODs for Each Selected Mesh", icon='OUTLINER_OB_MESH')
+        op.merge_selected = False
+        lod_box.label(text="Separate models (each plant, each rock): one LOD set each", icon='DOT')
+        row = lod_box.row()
+        row.enabled = has_mesh
+        row.scale_y = 1.2
+        op = row.operator("fo4.generate_lods", text="One LOD for Selected (Merged Model)", icon='AUTOMERGE_ON')
+        op.merge_selected = True
+        lod_box.label(text="Pieces of ONE model (a cliff and its plants): one LOD set,", icon='DOT')
+        lod_box.label(text="all pieces' textures baked into one texture; pieces stay unchanged")
+        lod_box.label(text="LODs get no wind and no glow", icon='DOT')
 
         # ── Collision Mesh ───────────────────────────────────────────────
         layout.separator()
@@ -3555,7 +3568,8 @@ class FO4_PT_BatchProcessingPanel(_FO4SubPanel):
         # textures -- no NIFs, no BGSMs -- so a user pressing it got "separate
         # textures, no meshes or materials" (2026-11-09). fo4.generate_lods is
         # the full pipeline and already processes every selected mesh.
-        row.operator("fo4.generate_lods", text="Generate + Export LODs (Selected)", icon='OUTLINER_OB_MESH')
+        _op = row.operator("fo4.generate_lods", text="LODs for Each Selected Mesh", icon='OUTLINER_OB_MESH')
+        _op.merge_selected = False
         row = lod_box.row()
         row.enabled = len(selected_meshes) > 0
         row.scale_y = 1.2
@@ -5509,7 +5523,10 @@ class FO4_PT_BatchToolsPanel(_FO4SubPanel):
         lod = layout.box(); lod.label(text="Batch LOD Generate + Export", icon='MOD_DECIM')
         # Same full pipeline as Setup > FO4: LOD + Collision Pipeline (see the
         # Batch Processing panel's note): writes the LOD NIFs, BGSMs and textures.
-        lod.operator("fo4.generate_lods", text="Generate + Export LODs (Selected)", icon='OUTLINER_OB_MESH')
+        _op = lod.operator("fo4.generate_lods", text="LODs for Each Selected Mesh", icon='OUTLINER_OB_MESH')
+        _op.merge_selected = False
+        _op = lod.operator("fo4.generate_lods", text="One LOD for Selected (Merged Model)", icon='AUTOMERGE_ON')
+        _op.merge_selected = True
         pre = layout.box(); pre.label(text="Workflow Presets", icon='PRESET')
         pre.prop(scene, "fo4_workflow_preset_name", text="Name")
         row = pre.row(align=True)
