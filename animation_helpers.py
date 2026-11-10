@@ -1129,7 +1129,8 @@ class AnimationHelpers:
 
     @staticmethod
     def generate_wind_weights(mesh_obj, group_name="Wind", axis='Z', invert=False,
-                              base_anchor=0.15, per_piece=True, plant_type='AUTO'):
+                              base_anchor=0.15, per_piece=True, plant_type='AUTO',
+                              reference_nif=None):
         """Generate a wind‑weight vertex group with an anchored (solid) base.
 
         The algorithm computes a falloff along the specified local axis
@@ -1239,16 +1240,116 @@ class AnimationHelpers:
                     print(f"[AnimationHelpers] per-piece wind weights failed, "
                           f"using the height gradient: {_pp_exc}")
 
+            # Keep Bethesda's own wind on every vertex that is still the
+            # original mesh's (retextures, added leaf cards, trimmed copies).
+            ref_note = ""
+            if reference_nif:
+                kept, ref_note = AnimationHelpers._reference_wind_alpha(
+                    coords, reference_nif)
+                if kept:
+                    weights = list(weights)
+                    for i, a in kept.items():
+                        weights[i] = a
+                    mesh_obj["fo4_wind_reference"] = str(reference_nif)
+            mesh_obj["fo4_wind_reference_note"] = ref_note
+
             for i, w in enumerate(weights):
                 # Floor at 0.001: pure 0.0 weight is treated as "unweighted"
                 # by PyNifly's exporter and causes a hard error.  0.001 is
                 # imperceptibly small and won't cause visible root-sway.
                 vg.add([i], max(0.001, w), 'REPLACE')
 
+        note = mesh_obj.get("fo4_wind_reference_note", "")
         return True, (
             f"Wind weights ('{group_name}') generated "
-            f"(base {int(base_anchor * 100)}% anchored)"
+            f"(base {int(base_anchor * 100)}% anchored)" + (f"; {note}" if note else "")
         )
+
+    @staticmethod
+    def _reference_wind_alpha(coords, ref_path, tol_frac=0.002):
+        """Vertex alpha from the original NIF for every vertex that is still
+        where the original had one: ``({vertex index: alpha 0..1}, note)``.
+
+        Why: FO4's wind shader times each vertex's sway with
+        ``(1 + k * alpha) * (a number from the object's world position)``
+        (Shaders011.fxp, disassembled 2026-11-10), so even small alpha
+        differences along a thick vine make its parts swing out of step and
+        it stretches and squashes. Bethesda's hand painting avoids that on
+        its own meshes (Briar_BushM01: the lower half or more of each thick
+        vine exactly 0); rules only get close (GS_BushM01, 2026-11-10). So a
+        mesh built from a vanilla one keeps the vanilla values; only new
+        geometry is painted by the rules.
+
+        The reference is matched in position after trying a few alignments
+        (as is, bounding-box corner, bounding-box centre; scale 1, the
+        reference's own size, and Blender-metre sizes), keeping the one that
+        matches the most vertices.
+        """
+        import os
+        import numpy as _np
+        if not ref_path or not os.path.isfile(ref_path):
+            return {}, f"reference NIF not found: {ref_path}"
+        try:
+            from io_scene_nifly.pyn import pynifly as _pyn
+            nif = _pyn.NifFile(str(ref_path))
+        except Exception as exc:
+            return {}, f"could not read the reference NIF ({exc})"
+        RP, RA = [], []
+        for sh in nif.shapes:
+            try:
+                cols = sh.colors
+                if not cols:
+                    continue
+                v = _np.asarray(sh.verts, dtype=float)
+                t = sh.transform
+                rot = _np.asarray([list(r) for r in t.rotation], dtype=float) \
+                    if hasattr(t, "rotation") else _np.eye(3)
+                v = (v * float(getattr(t, "scale", 1.0))) @ rot.T + \
+                    _np.asarray(list(t.translation), dtype=float)
+                RP.append(v)
+                RA.append(_np.asarray([c[3] for c in cols], dtype=float))
+            except Exception as exc:
+                print(f"[AnimationHelpers] reference shape skipped: {exc}")
+        if not RP:
+            return {}, "the reference NIF has no shapes with vertex colours (no wind to copy)"
+        RP = _np.vstack(RP); RA = _np.concatenate(RA)
+        P = _np.asarray([tuple(c) for c in coords], dtype=float)
+        if len(P) == 0:
+            return {}, ""
+        rmin, rmax = RP.min(0), RP.max(0)
+        pmin, pmax = P.min(0), P.max(0)
+        tol = tol_frac * float(_np.linalg.norm(rmax - rmin) or 1.0)
+        try:
+            from scipy.spatial import cKDTree as _KD
+            tree = _KD(RP)
+
+            def nearest(Q):
+                return tree.query(Q)
+        except Exception:
+            def nearest(Q):
+                d = _np.empty(len(Q)); ix = _np.empty(len(Q), dtype=int)
+                for k in range(0, len(Q), 256):
+                    dd = _np.linalg.norm(Q[k:k + 256, None, :] - RP[None, :, :], axis=2)
+                    ix[k:k + 256] = dd.argmin(1); d[k:k + 256] = dd.min(1)
+                return d, ix
+        ext_r = float(_np.max(rmax - rmin) or 1.0)
+        ext_p = float(_np.max(pmax - pmin) or 1.0)
+        best = (0, None, None)
+        for s in {1.0, ext_r / ext_p, 100.0, 70.0, 10.0}:
+            Q0 = P * s
+            qmin, qmax = Q0.min(0), Q0.max(0)
+            for off in (_np.zeros(3), rmin - qmin, (rmin + rmax) / 2 - (qmin + qmax) / 2):
+                d, ix = nearest(Q0 + off)
+                hit = int((d < tol).sum())
+                if hit > best[0]:
+                    best = (hit, d, ix)
+        hit, d, ix = best
+        if hit < max(4, 0.2 * min(len(P), len(RP))):
+            return {}, ("no match with the reference NIF (fewer than 20% of the vertices "
+                        "line up), painted by the rules instead")
+        kept = {int(i): float(RA[ix[i]]) for i in _np.nonzero(d < tol)[0]}
+        return kept, (f"kept the original wind on {len(kept)} of {len(P)} vertices from "
+                      f"{os.path.basename(ref_path)}, painted the other {len(P) - len(kept)}")
 
     @staticmethod
     def wind_enabled(obj) -> bool:
@@ -1457,7 +1558,8 @@ class AnimationHelpers:
 
     @staticmethod
     def apply_vegetation_wind(mesh_obj, amplitude: float = 0.2, period: float = 60.0,
-                              alpha_scale: float = 1.0, plant_type: str = 'AUTO'):
+                              alpha_scale: float = 1.0, plant_type: str = 'AUTO',
+                              reference_nif=None):
         """Set up FO4 vegetation wind using vertex groups and vertex color alpha.
 
         FO4 vegetation wind is procedural in-engine.  The BSLeafAnimNode reads
@@ -1481,7 +1583,8 @@ class AnimationHelpers:
         fix_note = f" [prep: {', '.join(fixes)}]" if fixes else ""
 
         ok, msg = AnimationHelpers.generate_wind_weights(mesh_obj, group_name="Wind",
-                                                         plant_type=plant_type)
+                                                         plant_type=plant_type,
+                                                         reference_nif=reference_nif)
         if not ok:
             return False, msg
 
@@ -1509,6 +1612,8 @@ class AnimationHelpers:
         return True, (
             f"Vegetation wind applied to '{mesh_obj.name}' "
             f"(vertex group + vertex color alpha gradient){fix_note}{vc_note}"
+            + (f" -- {mesh_obj.get('fo4_wind_reference_note')}"
+               if mesh_obj.get("fo4_wind_reference_note") else "")
         )
 
     @staticmethod

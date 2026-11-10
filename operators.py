@@ -3802,11 +3802,28 @@ class FO4_OT_VegetationWindSetup(Operator):
         ],
         default='AUTO',
     )
+    reference_nif: StringProperty(
+        name="Keep Wind From",
+        description=("Optional: the original game NIF this mesh was made from "
+                     "(e.g. the unpacked vanilla mesh). Every vertex that is still "
+                     "where the original had one keeps Bethesda's own wind value; only "
+                     "new parts (an added leaf card) are painted by the rules. Bethesda "
+                     "hand-paints thick vines so they don't stretch in the wind"),
+        subtype='FILE_PATH',
+        default="",
+    )
+
+    def invoke(self, context, event):
+        obj = context.active_object
+        if obj is not None and not self.reference_nif:
+            self.reference_nif = obj.get("fo4_wind_reference", "")
+        return context.window_manager.invoke_props_dialog(self)
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "preset")
         layout.prop(self, "wind_type")
+        layout.prop(self, "reference_nif")
         if self.wind_type in ('BANNER', 'CLOTH', 'NET', 'SAIL'):
             layout.label(text="Put the fastened vertices in a vertex group named 'WindPin'", icon='PINNED')
         if self.preset == 'NONE':
@@ -3866,8 +3883,10 @@ class FO4_OT_VegetationWindSetup(Operator):
             # The Water Plant type already caps the wind at 50% (vanilla);
             # soft coral goes a bit lower on top of that (35% overall).
             alpha_scale = {'KELP': 1.0, 'CORAL_SOFT': 0.7}.get(self.preset, 1.0)
+            _ref = bpy.path.abspath(self.reference_nif) if self.reference_nif else None
             ok, msg = animation_helpers.AnimationHelpers.apply_vegetation_wind(
-                obj, amp, per, alpha_scale=alpha_scale, plant_type=_wtype)
+                obj, amp, per, alpha_scale=alpha_scale, plant_type=_wtype,
+                reference_nif=_ref)
             if ok:
                 msg += f" [wind type: {obj.get('fo4_wind_type', _wtype)}]"
             if alpha_scale < 1.0:
@@ -3880,9 +3899,6 @@ class FO4_OT_VegetationWindSetup(Operator):
 
         self.report({'INFO'}, f"Vegetation wind applied to {ok_count}/{len(targets)} mesh(es)")
         return {'FINISHED'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
 
 
 class FO4_OT_FixWindVertexColors(Operator):
