@@ -355,6 +355,20 @@ def reduce_lod_shell(prev_obj, lod_name: str, target_tris: int) -> "tuple[object
                      f"(reduced from {prev_obj.name}'s shell)")
 
 
+def _reuv_for_bake(lod_obj) -> None:
+    """Fresh, non-overlapping UVs on a decimated LOD so several source
+    materials can be baked onto one texture (the source's own UVs overlap
+    between materials)."""
+    import math as _math
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = lod_obj
+    lod_obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.smart_project(angle_limit=_math.radians(66), island_margin=0.003)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
 def _lod_source_meshes(objs) -> list:
     """The meshes a LOD run should use from *objs*: no collision objects
     (PyNifly's "bhkPhysicsSystem", UCX_ hulls) and no earlier LOD output."""
@@ -650,6 +664,32 @@ _LOD_DROP_FLAGS = {
 }
 
 
+# Bit values of the dropped flags (PyNifly nifconstants ShaderFlags1/2).
+_FLAG_BITS = {
+    "Shader_Flags_1": {"VERTEX_ALPHA": 1 << 3, "OWN_EMIT": 1 << 22, "EXTERNAL_EMITTANCE": 1 << 29},
+    "Shader_Flags_2": {"TREE_ANIM": 1 << 29, "GLOW_MAP": 1 << 6},
+}
+
+
+def _clean_mesh_subpath(text: str) -> str:
+    """Mesh Sub-path as the part under Meshes\\ (without a leading LOD).
+
+    A full folder path typed or pasted into the field
+    (C:\\Users\\...\\Downloads\\Meshes\\LOD\\Landscape) was joined as-is: the
+    NIFs still landed right, but the .bgsm and textures went to
+    Materials\\LOD\\Users\\Owner\\Downloads\\Meshes\\LOD\\Landscape and every
+    NIF's material path started with "materials\\LOD\\C:\\..." (2026-11-09)."""
+    parts = [p for p in re.split(r"[\\/]+", text or "") if p]
+    low = [p.lower() for p in parts]
+    if "meshes" in low:
+        parts = parts[len(low) - 1 - low[::-1].index("meshes") + 1:]
+    elif parts and (parts[0].endswith(":") or (text or "").startswith(("\\\\", "//"))):
+        parts = parts[-1:]                 # some other absolute path: keep its last folder
+    if parts and parts[0].upper() == "LOD":
+        parts = parts[1:]
+    return "/".join(parts)
+
+
 def _is_glow_node(node) -> bool:
     label = f"{node.label} {node.name}".lower()
     img = getattr(node, "image", None)
@@ -668,12 +708,34 @@ def strip_lod_material(mat) -> None:
     for wind or a glow map."""
     if mat is None:
         return
-    for key, drops in _LOD_DROP_FLAGS.items():
-        val = mat.get(key)
-        if isinstance(val, str):
-            kept = [t.strip() for t in val.split("|")
-                    if t.strip() and t.strip().upper() not in drops]
-            mat[key] = " | ".join(kept)
+
+    def _strip(val, key):
+        if not isinstance(val, str):
+            return val
+        if val.strip().isdigit():          # numeric flag word
+            n = int(val.strip())
+            for name in _LOD_DROP_FLAGS[key]:
+                n &= ~_FLAG_BITS[key].get(name, 0)
+            return str(n)
+        return " | ".join(t.strip() for t in val.split("|")
+                          if t.strip() and t.strip().upper() not in _LOD_DROP_FLAGS[key])
+
+    # Older PyNifly: custom properties. PyNifly 30.2 (Billy's Blender 5.1):
+    # material.pyn_shader.Shader_Flags_1/2, which is what its exporter reads
+    # (shader_io._export_shader_attrs -> pyn_props.shader_store). Stripping
+    # only the custom property left Glow_Map on the exported LODs.
+    for key in _LOD_DROP_FLAGS:
+        if key in mat:
+            mat[key] = _strip(mat.get(key), key)
+    grp = getattr(mat, "pyn_shader", None)
+    if grp is not None:
+        for key in _LOD_DROP_FLAGS:
+            try:
+                val = getattr(grp, key, None)
+                if isinstance(val, str):
+                    setattr(grp, key, _strip(val, key))
+            except Exception:
+                pass
     for k in ("fo4_bgsm_tree", "fo4_bgsm_name_before_wind", "BSShaderTextureSet_Glow"):
         if k in mat:
             del mat[k]
@@ -1762,15 +1824,13 @@ class FO4_OT_GenerateLODs(Operator):
         # "Meshes/LOD/Landscape/Trees/..." location. Strip one leading "LOD"
         # path segment so both destinations land where the rest of this
         # operator's own logic already expects them.
-        _clean_subpath = self.mesh_subpath.strip("/\\")
-        _sub_parts = [p for p in re.split(r'[\\/]+', _clean_subpath) if p]
-        if _sub_parts and _sub_parts[0].upper() == "LOD":
-            _clean_subpath = "/".join(_sub_parts[1:])
+        _clean_subpath = _clean_mesh_subpath(self.mesh_subpath)
+        if _clean_subpath.replace("/", "\\").lower() != self.mesh_subpath.strip("/\\").replace("/", "\\").lower():
             self.report(
                 {'INFO'},
-                f"Mesh Sub-path started with 'LOD' -- stripped it since LOD "
-                f"NIFs already go under Meshes/LOD/ automatically (now using "
-                f"'{_clean_subpath or '(none)'}')."
+                f"Mesh Sub-path '{self.mesh_subpath}' is used as the part under Meshes\\ "
+                f"(LOD files go under Meshes\\LOD\\ automatically): "
+                f"'{_clean_subpath or '(none)'}'."
             )
 
         mod_folder = bpy.path.abspath(self.mod_folder).strip() if self.mod_folder else ""
@@ -1878,6 +1938,20 @@ class FO4_OT_GenerateLODs(Operator):
                     for _k in ("fo4_lod_merged_tmp", "fo4_lod_basename", "fo4_source_nif"):
                         if _k in lod_obj:
                             del lod_obj[_k]
+                    # No wind on a LOD: drop the vertex colours (their alpha is
+                    # the plants' wind sway, which PyNifly exports with
+                    # Vertex_Alpha on -> 12,590 of 13,305 vertices of a decimated
+                    # cliff LOD under the alpha-test threshold, 2026-11-09) and
+                    # the Wind vertex group. The bake carries the colour.
+                    try:
+                        for _ca in list(lod_obj.data.color_attributes):
+                            lod_obj.data.color_attributes.remove(_ca)
+                        _wg = lod_obj.vertex_groups.get("Wind")
+                        if _wg is not None:
+                            lod_obj.vertex_groups.remove(_wg)
+                        lod_obj["fo4_no_wind"] = True
+                    except Exception as _ve:
+                        steps.append(f"⚠ {lod_obj.name}: could not remove vertex colours ({_ve})")
                     # A copy keeps the source's parent: the imported NIF root,
                     # which still holds the source's bhkPhysicsSystem
                     # collision. PyNifly then exported that collision with
@@ -2040,7 +2114,23 @@ class FO4_OT_GenerateLODs(Operator):
                 textures_root = (os.path.join(mod_folder, "Textures") if mod_folder
                                  else _tf.mkdtemp(prefix="fo4lod_tex_"))
                 safe = re.sub(r"[^A-Za-z0-9_]+", "_", base_name)
-                decimated = [o for o in lod_objects if not o.get("fo4_lod_shell")]
+                # A model with several materials (a cliff with its plants) must
+                # end up with ONE baked texture set per LOD. Downscaling each
+                # source texture instead gave "one dirt cliff and one plant"
+                # texture and a LOD that kept only the first material
+                # (2026-11-09, merged GSDirtCliffLarge01 that went to Decimate).
+                # So a decimated LOD of such a model gets fresh UVs and the
+                # same bake as a shell.
+                _n_src_mats = len({s.material for s in obj.material_slots if s.material})
+                if _n_src_mats > 1:
+                    for _lo in lod_objects:
+                        if not _lo.get("fo4_lod_shell"):
+                            _reuv_for_bake(_lo)
+                            _lo["fo4_lod_bake"] = True
+                            steps.append(f"{_lo.name}: {_n_src_mats} materials in the source, so this "
+                                         "decimated LOD is baked onto one texture set")
+                _baked = lambda o: bool(o.get("fo4_lod_shell") or o.get("fo4_lod_bake"))
+                decimated = [o for o in lod_objects if not _baked(o)]
                 if decimated:
                     _ok, tex_msg = create_lod_textures(
                         decimated, scale_factor=0.25, textures_root=textures_root)
@@ -2049,7 +2139,7 @@ class FO4_OT_GenerateLODs(Operator):
                     lod_key = lod_obj.get("fo4_lod_level", "LOD1")
                     base = f"{safe}LOD{int(lod_key[-1]) - 1}"
                     bgsm_rel = "materials\\LOD\\" + (rel_dir + "\\" if rel_dir else "") + base + ".bgsm"
-                    if lod_obj.get("fo4_lod_shell"):
+                    if _baked(lod_obj):
                         if src_mat is None:
                             steps.append(f"⚠ {lod_obj.name}: source has no material, nothing to bake")
                             continue
