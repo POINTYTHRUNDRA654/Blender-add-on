@@ -11150,7 +11150,33 @@ class FO4_OT_AddCustomCollision(Operator):
                 obj, collision_type=self.collision_type)
             if not collision_obj:
                 raise RuntimeError("helper failed to create collision mesh")
-            if collision_obj.get("fo4_collision_used_hull_fallback"):
+            _plant_words = ("tree", "plant", "bush", "shrub", "fung", "spore", "shroom",
+                            "grass", "vine", "briar", "kelp", "flower", "leaf", "stock")
+            _is_plant = (
+                str(getattr(obj, "fo4_collision_type", "")).upper() in ("TREE", "VEGETATION", "PLANT", "GRASS", "MUSHROOM")
+                or str(getattr(obj, "fo4_mesh_type", "")).upper() in ("TREE", "VEGETATION", "PLANT", "GRASS", "FLORA")
+                or bool(obj.vertex_groups.get("Wind"))
+                or any(w in obj.name.lower() for w in _plant_words)
+                or any(s.material is not None and (s.material.get("fo4_bgsm_tree")
+                       or any(w in str(s.material.get("BSLSP_Shader_Name", "")).lower() for w in _plant_words))
+                       for s in obj.material_slots)
+            )
+            if collision_obj.get("fo4_collision_used_hull_fallback") and _is_plant:
+                # A tree or plant has no doors or windows: a convex hull is
+                # the normal shape (the mod's own GSFungusTree01.nif ships
+                # one 34-vertex hull around the whole tree). Say that, so a
+                # plant does not get a building warning (2026-11-11).
+                self.report(
+                    {'INFO'},
+                    f"'{obj.name}' has too many vertices for an exact-mesh "
+                    f"collision (limit 255), so it got a convex hull "
+                    f"({len(collision_obj.data.polygons)} tris). For a tree or "
+                    f"plant that is the normal shape. If it is several separate "
+                    f"plants, use Add Collision instead: it gives each one its "
+                    f"own hull.",
+                )
+                _notify(f"Collision for {obj.name}: convex hull (normal for a tree or plant)", 'INFO')
+            elif collision_obj.get("fo4_collision_used_hull_fallback"):
                 # The exact-mesh shape couldn't be decimated under FO4's
                 # hard 255-vertex Havok mesh-shape limit, so the helper
                 # silently sealed it into a convex hull instead -- exactly
