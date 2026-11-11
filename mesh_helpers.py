@@ -1375,6 +1375,38 @@ class MeshHelpers:
         return msg
 
     @staticmethod
+    def _world_matrix(o):
+        """World matrix from the parent chain (parent world @ parent inverse
+        @ basis), so it is right even before the depsgraph updates."""
+        if o.parent is None:
+            return o.matrix_basis.copy()
+        return MeshHelpers._world_matrix(o.parent) @ o.matrix_parent_inverse @ o.matrix_basis
+
+    @staticmethod
+    def _parent_keep_world(child, parent):
+        """Parent *child* to *parent* without moving it.
+
+        The collision generators used to set only the parent inverse, which
+        drops every transform above the mesh: a tree under a moved and
+        rotated NIF node (GSFungusTree01:5, turned 63 degrees) got collision
+        about 600 units off to the side (2026-11-11). Plants directly under
+        the root were fine because that chain is identity.
+        """
+        world = MeshHelpers._world_matrix(child)
+        child.parent = parent
+        child.matrix_parent_inverse = MeshHelpers._world_matrix(parent).inverted()
+        child.matrix_basis = world
+
+    @staticmethod
+    def _parent_in_object_space(child, parent):
+        """Parent *child* whose mesh data is in *parent*'s local space (built
+        from parent.data directly), so it sits exactly on *parent*."""
+        from mathutils import Matrix as _M
+        child.parent = parent
+        child.matrix_parent_inverse = _M.Identity(4)
+        child.matrix_basis = _M.Identity(4)
+
+    @staticmethod
     def _collision_piece_points(cobj, max_pieces: int = 32):
         """Split *cobj*'s mesh into separate plant/prop clumps for collision.
 
@@ -1710,8 +1742,7 @@ class MeshHelpers:
         # parent collision mesh to the source object so they are exported as a
         # unit.  Clear parent inverse so the collision sits at the same world
         # position as the original.
-        collision_obj.parent = obj
-        collision_obj.matrix_parent_inverse = obj.matrix_world.inverted()
+        MeshHelpers._parent_keep_world(collision_obj, obj)
 
         # Configure as a static Rigid Body so the Niftools NIF exporter can
         # emit the correct bhkCollisionObject / bhkRigidBody nodes for FO4.
@@ -1899,8 +1930,7 @@ class MeshHelpers:
         used_hull_fallback = MeshHelpers._enforce_vert_limit(collision_obj, limit=255)
         collision_obj["fo4_collision_used_hull_fallback"] = used_hull_fallback
 
-        collision_obj.parent = obj
-        collision_obj.matrix_parent_inverse = obj.matrix_world.inverted()
+        MeshHelpers._parent_keep_world(collision_obj, obj)
         obj["pynCollisionTarget"] = collision_obj.name
 
         try:
@@ -2089,8 +2119,7 @@ class MeshHelpers:
         MeshHelpers._enforce_vert_limit_hull(collision_obj, limit=255)
 
         # Parent to source mesh so they are exported as a unit.
-        collision_obj.parent = source_obj
-        collision_obj.matrix_parent_inverse = source_obj.matrix_world.inverted()
+        MeshHelpers._parent_keep_world(collision_obj, source_obj)
 
         # See add_collision_mesh's matching comment: this is PyNifly's real
         # collision-discovery key, not parenting/naming.
@@ -2478,8 +2507,8 @@ class MeshHelpers:
             ucx_obj.vertex_groups.clear()
             ucx_obj.display_type = 'WIRE'
             ucx_obj.hide_render = True
-            ucx_obj.parent = obj
-            ucx_obj.matrix_parent_inverse = obj.matrix_world.inverted()
+            # Hull data comes from obj.data (obj's local space).
+            MeshHelpers._parent_in_object_space(ucx_obj, obj)
             try:
                 bpy.ops.object.select_all(action='DESELECT')
                 ucx_obj.select_set(True)

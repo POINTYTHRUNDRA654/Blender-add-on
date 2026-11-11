@@ -17204,8 +17204,9 @@ class FO4_OT_GenerateMultiConvexCollision(Operator):
             if hole_loops and any(loop <= vert_indices for loop in hole_loops):
                 sealed_holes += 1
 
-            piece.parent = obj
-            piece.matrix_parent_inverse = obj.matrix_world.inverted()
+            # The piece is built from obj.data (obj's local space): sit it
+            # exactly on obj, whatever transforms obj's parents carry.
+            mesh_helpers.MeshHelpers._parent_in_object_space(piece, obj)
             collection.objects.link(piece)
 
             # Configure rigid body
