@@ -1427,6 +1427,9 @@ class AnimationHelpers:
             r, g, b, _a = item.color
             item.color = (1.0, 1.0, 1.0, 1.0) if created else (r, g, b, 1.0)
         mesh.update()
+        # No wind: vertex alpha is transparency again, so put the preview
+        # link back that applying wind took out.
+        AnimationHelpers.set_vertex_alpha_preview(mesh_obj, as_transparency=True)
         what = "white vertex colors added" if created else "vertex colors kept"
         return True, f"'{mesh_obj.name}': {what}, alpha solid, no wind (exports with a normal NiNode root)"
 
@@ -1552,9 +1555,63 @@ class AnimationHelpers:
                 return False, f"Could not write vertex colors: {exc}"
 
         mesh.update()
+        # The sway values now sit in vertex alpha. Blender's material preview
+        # (PyNifly's AlphaProperty node) still reads them as transparency, so
+        # every part swaying less than the alpha cutoff vanished from the
+        # viewport the moment Wind was applied (a fungus plant, 2026-11-11).
+        AnimationHelpers.set_vertex_alpha_preview(mesh_obj, as_transparency=False)
         if wrote_alpha_map:
             return True, "Wind vertex colors written to 'VERTEX_ALPHA' (PyNifly's alpha channel) + 'Col'"
         return True, f"Wind vertex colors written to '{attr_name}' (alpha = Wind weight)"
+
+    _VA_UNLINK_KEY = "fo4_wind_vertex_alpha_unlinked"
+
+    @staticmethod
+    def set_vertex_alpha_preview(mesh_obj, as_transparency: bool) -> int:
+        """Wire vertex alpha into the Blender material preview as transparency
+        (no wind) or take it out (wind: vertex alpha is sway).
+
+        PyNifly does the same on import for tree materials ("it must NOT be
+        wired into the shader as alpha -- that would make the trunk
+        invisible", nif/shader_io.py). Only the preview changes: PyNifly's
+        export takes vertex alpha from the mesh's VERTEX_ALPHA attribute, not
+        from this link. Returns the number of links changed.
+        """
+        import json as _json
+        changed = 0
+        for slot in getattr(mesh_obj, "material_slots", []):
+            mat = slot.material
+            if mat is None or not getattr(mat, "use_nodes", False) or mat.node_tree is None:
+                continue
+            nt = mat.node_tree
+            try:
+                if not as_transparency:
+                    saved = _json.loads(mat.get(AnimationHelpers._VA_UNLINK_KEY, "[]") or "[]")
+                    for node in nt.nodes:
+                        sock = node.inputs.get("Vertex Alpha") if hasattr(node, "inputs") else None
+                        if sock is None or not sock.is_linked:
+                            continue
+                        for link in list(sock.links):
+                            saved.append([link.from_node.name, link.from_socket.name, node.name])
+                            nt.links.remove(link)
+                            changed += 1
+                    if saved:
+                        mat[AnimationHelpers._VA_UNLINK_KEY] = _json.dumps(saved)
+                else:
+                    saved = _json.loads(mat.get(AnimationHelpers._VA_UNLINK_KEY, "[]") or "[]")
+                    for from_name, from_sock, to_name in saved:
+                        fn, tn = nt.nodes.get(from_name), nt.nodes.get(to_name)
+                        if fn is None or tn is None or from_sock not in fn.outputs:
+                            continue
+                        to_sock = tn.inputs.get("Vertex Alpha")
+                        if to_sock is not None and not to_sock.is_linked:
+                            nt.links.new(fn.outputs[from_sock], to_sock)
+                            changed += 1
+                    if AnimationHelpers._VA_UNLINK_KEY in mat:
+                        del mat[AnimationHelpers._VA_UNLINK_KEY]
+            except Exception as exc:
+                print(f"[AnimationHelpers] vertex alpha preview not changed on '{mat.name}': {exc}")
+        return changed
 
     @staticmethod
     def apply_vegetation_wind(mesh_obj, amplitude: float = 0.2, period: float = 60.0,
