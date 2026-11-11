@@ -546,6 +546,73 @@ def _block_layout(data: bytes):
     return [names[i] for i in type_idx], offsets, list(sizes)
 
 
+def patch_bgsm_emissive_black(exported_path) -> dict:
+    """Set Emissive Color to black on every BSLightingShaderProperty that
+    names a BGSM/BGEM material (the glow comes from the material file).
+
+    Exports used to copy the BGSM's emittance colour into the NIF, where the
+    game's own files had black, and those plants did not show in game until
+    the NIF Emissive Color was set back to 0,0,0 (Billy, in game,
+    2026-11-11). Black with a BGSM is also a vanilla layout (596 vanilla
+    glow-map shapes). Shapes without a material file keep their colour.
+    Writes in place, same size; Emissive Multiple is left alone.
+    """
+    report = {"restored": [], "could_not_restore": []}
+    try:
+        data = bytearray(open(exported_path, "rb").read())
+        types, offsets, _sizes = _block_layout(bytes(data))
+        strings = _header_strings(bytes(data))
+    except Exception as e:
+        report["could_not_restore"].append(f"emissive colour check ({e})")
+        return report
+    fixed = 0
+    for i, t in enumerate(types):
+        if t != "BSLightingShaderProperty":
+            continue
+        so = offsets[i]
+        # FO4 BSLightingShaderProperty: u32 shader type, then NiObjectNET
+        # (name, extra data list, controller), Shader Flags 1/2, UV offset,
+        # UV scale, texture set ref, Emissive Color (3 floats).
+        name_idx = struct.unpack_from("<i", data, so + 4)[0]
+        name = strings[name_idx] if 0 <= name_idx < len(strings) else ""
+        if not name.lower().endswith((".bgsm", ".bgem")):
+            continue
+        n_extra = struct.unpack_from("<I", data, so + 8)[0]
+        eo = so + 12 + 4 * n_extra + 4 + 8 + 8 + 8 + 4
+        if struct.unpack_from("<3f", data, eo) != (0.0, 0.0, 0.0):
+            struct.pack_into("<3f", data, eo, 0.0, 0.0, 0.0)
+            fixed += 1
+    if fixed:
+        open(exported_path, "wb").write(bytes(data))
+        report["restored"].append(
+            f"NIF Emissive Color set to black on {fixed} shape(s) that use a material file (the glow comes from the BGSM)")
+    return report
+
+
+def _header_strings(data: bytes):
+    """The header string table of a FO4 NIF (block names, material paths)."""
+    o = data.index(b'\n') + 1
+    _ver, _endian, _user, nblocks = struct.unpack_from('<IBII', data, o)
+    o += 13
+    bsver = struct.unpack_from('<I', data, o)[0]
+    o += 4
+    for _ in range(4 if bsver >= 103 else 3):
+        o += 1 + data[o]
+    ntypes = struct.unpack_from('<H', data, o)[0]
+    o += 2
+    for _ in range(ntypes):
+        o += 4 + struct.unpack_from('<I', data, o)[0]
+    o += 2 * nblocks + 4 * nblocks
+    nstrings = struct.unpack_from('<I', data, o)[0]
+    o += 8
+    out = []
+    for _ in range(nstrings):
+        n = struct.unpack_from('<I', data, o)[0]
+        out.append(data[o + 4:o + 4 + n].decode('latin1'))
+        o += 4 + n
+    return out
+
+
 def patch_native_collision_multi(exported_path, collision_objs) -> dict:
     """Attach several convex collision pieces, each as its own one-body
     bhkPhysicsSystem on its own bhkNPCollisionObject (piece 0 on the root

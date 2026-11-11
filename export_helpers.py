@@ -705,8 +705,22 @@ class ExportHelpers:
                     entry['strength_link_from'] = (link.from_node.name, link.from_socket.name)
                     nt.links.remove(link)
 
-                color_in.default_value = tuple(grp.inputs['Emission Color'].default_value[:])
-                strength_in.default_value = grp.inputs['Emission Strength'].default_value
+                # A shape that uses a BGSM gets its glow from the BGSM. PyNifly
+                # fills the MTS group's Emission Color from the BGSM's
+                # emittance on import, so copying it wrote the BGSM colour
+                # into the NIF, where the game's own files had black: plants
+                # exported that way stopped showing in game and came back
+                # when the NIF Emissive Color was set to 0,0,0 (tested in game
+                # 2026-11-11, GSFungs01 / GSFungusSpore7). Black with a BGSM is
+                # also a vanilla layout (596 vanilla glow-map shapes). Shapes
+                # without a BGSM keep the tint: there the NIF is the material.
+                _bgsm = str(mat.get("BSLSP_Shader_Name") or mat.get("fo4_bgsm_path") or "")
+                if _bgsm.lower().endswith((".bgsm", ".bgem")):
+                    color_in.default_value = (0.0, 0.0, 0.0, 1.0)[:len(color_in.default_value)]
+                    strength_in.default_value = 1.0
+                else:
+                    color_in.default_value = tuple(grp.inputs['Emission Color'].default_value[:])
+                    strength_in.default_value = grp.inputs['Emission Strength'].default_value
 
                 restore.append(entry)
             except Exception as _e:
@@ -2063,6 +2077,14 @@ class ExportHelpers:
                         print(f"[FO4Export] Native collision patch skipped: {_ce}")
 
                     try:
+                        from . import nif_roundtrip as _nrt
+                        _em_summary = _nrt.summarize(_nrt.patch_bgsm_emissive_black(filepath))
+                        if _em_summary:
+                            _roundtrip_note += f"  [{_em_summary}]"
+                    except Exception as _eme:
+                        print(f"[FO4Export] Emissive colour patch skipped: {_eme}")
+
+                    try:
                         ExportHelpers._write_kit_credits(obj, filepath)
                     except Exception as _cre:
                         print(f"[FO4Export] Kit-credit write skipped: {_cre}")
@@ -2850,7 +2872,14 @@ class ExportHelpers:
                                     break  # root is patched once for the whole file
                         except Exception as _le:
                             print(f"[FO4Export] Wind root patch skipped: {_le}")
-                        _staged_note = ("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""
+                        try:
+                            from . import nif_roundtrip as _nrt
+                            _em_summary = _nrt.summarize(_nrt.patch_bgsm_emissive_black(filepath))
+                            if _em_summary:
+                                _leaf_note += f"  [{_em_summary}]"
+                        except Exception as _eme:
+                            print(f"[FO4Export] Emissive colour patch skipped: {_eme}")
+                        _staged_note =("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""
                         if _wind_mat_notes:
                             _staged_note += "  [Wind: " + "; ".join(_wind_mat_notes) + "]"
                         return True, (f"Exported {mesh_count} mesh(es) as single NIF via "
