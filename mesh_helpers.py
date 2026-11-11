@@ -1375,6 +1375,46 @@ class MeshHelpers:
         return msg
 
     @staticmethod
+    def smart_project_only(obj, **kwargs):
+        """Smart UV Project on *obj* alone.
+
+        bpy.ops.object.mode_set(mode='EDIT') puts EVERY selected mesh into
+        Edit Mode, and uv.smart_project then re-unwraps all of them. Here
+        only *obj* is selected and active while it runs; the previous
+        selection, active object and mode are put back afterwards.
+        """
+        ctx = bpy.context
+        vl = ctx.view_layer
+        prev_sel = [o for o in ctx.selected_objects]
+        prev_act = vl.objects.active
+        prev_mode = ctx.mode
+        try:
+            if prev_mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            for o in prev_sel:
+                o.select_set(False)
+            obj.select_set(True)
+            vl.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(**kwargs)
+            bpy.ops.object.mode_set(mode='OBJECT')
+        finally:
+            try:
+                if ctx.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                obj.select_set(False)
+                for o in prev_sel:
+                    try:
+                        o.select_set(True)
+                    except ReferenceError:
+                        pass
+                if prev_act is not None:
+                    vl.objects.active = prev_act
+            except Exception:
+                pass
+
+    @staticmethod
     def _world_matrix(o):
         """World matrix from the parent chain (parent world @ parent inverse
         @ basis), so it is right even before the depsgraph updates."""

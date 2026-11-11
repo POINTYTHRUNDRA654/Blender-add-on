@@ -1053,10 +1053,14 @@ class ExportHelpers:
         if not obj.data.uv_layers:
             obj.data.uv_layers.new(name="UVMap")
             try:
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
-                bpy.ops.uv.smart_project(angle_limit=66.0)
-                bpy.ops.object.mode_set(mode='OBJECT')
+                # Only THIS object may be in Edit Mode: with the rest of the
+                # export selected, Blender's multi-object Edit Mode made
+                # Smart UV Project re-unwrap every selected mesh, so one
+                # UV-less piece squeezed the UVs of 8 of 12 shapes of a cliff
+                # (tree, bushes, cliff body) into 0-1 in the exported NIF
+                # while the Blender scene looked fine (2026-11-11).
+                from .mesh_helpers import MeshHelpers as _MHuv
+                _MHuv.smart_project_only(obj, angle_limit=66.0)
                 print(
                     f"[FO4 Add-on] '{obj.name}' had no UV map — created one via "
                     "smart_project. For textured meshes, unwrap manually and align "

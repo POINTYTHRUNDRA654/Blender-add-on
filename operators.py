@@ -4354,10 +4354,9 @@ class FO4_OT_SetupLeafCard(Operator):
         # ── 2. UV map ─────────────────────────────────────────────────────────
         if not obj.data.uv_layers:
             prev = context.mode
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.uv.smart_project()
-            bpy.ops.object.mode_set(mode='OBJECT')
+            # This object only: Edit Mode with other meshes selected would
+            # re-unwrap them too.
+            mesh_helpers.MeshHelpers.smart_project_only(obj)
             steps.append("UV map created (Smart UV Project)")
 
         # ── 3. Alpha-clip material ────────────────────────────────────────────
@@ -10883,10 +10882,8 @@ class FO4_OT_QuickPrepareForExport(Operator):
             # Step 1: Ensure UV map exists (safe — only adds if missing)
             self.report({'INFO'}, "Step 1/3: Checking UV map...")
             if not obj.data.uv_layers:
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
-                bpy.ops.uv.smart_project()
-                bpy.ops.object.mode_set(mode='OBJECT')
+                # This object only (other selected meshes would be re-unwrapped).
+                mesh_helpers.MeshHelpers.smart_project_only(obj)
                 self.report({'INFO'}, "Created UV map (Smart UV Project)")
 
             # Step 2: Setup FO4 material if missing (safe — only adds if absent)
@@ -11008,10 +11005,8 @@ class FO4_OT_AutoFixCommonIssues(Operator):
 
             # Fix 4: Create UV map if missing
             if not obj.data.uv_layers:
-                bpy.ops.object.mode_set('EXEC_DEFAULT', mode='EDIT')
-                bpy.ops.mesh.select_all('EXEC_DEFAULT', action='SELECT')
-                bpy.ops.uv.smart_project('EXEC_DEFAULT')
-                bpy.ops.object.mode_set('EXEC_DEFAULT', mode='OBJECT')
+                # This object only (other selected meshes would be re-unwrapped).
+                mesh_helpers.MeshHelpers.smart_project_only(obj)
                 fixes_applied.append("Created UV map")
             
             self.report({'INFO'}, f"Applied {len(fixes_applied)} fixes")
