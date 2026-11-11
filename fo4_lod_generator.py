@@ -165,25 +165,38 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
         except Exception:
             pass
 
-    # Apply decimate modifier
-    mod = new_obj.modifiers.new("FO4_LOD_Decimate", 'DECIMATE')
-    mod.decimate_type = 'COLLAPSE'
-    mod.ratio = max(0.001, min(1.0, ratio))
-    # use_collapse_triangulate=True forces triangulation before edge collapse,
-    # which destroys quad flow on organic/plant meshes — leave it False.
-    mod.use_collapse_triangulate = False
-    mod.use_symmetry = False
+    # A model made of several materials (a cliff with its plants and trees)
+    # is decimated one material at a time, each with its own share of the
+    # triangle budget. One Decimate over the whole model removed the cliff
+    # first -- its few, big, flat triangles are the cheapest edges to
+    # collapse: GSDirtCliffLarge01_RubbleRock01 (848 cliff triangles out of
+    # ~14,000) came out with a broken 16-triangle cliff in LOD2 and none in
+    # LOD3 (2026-11-11).
+    _per_material_done = False
+    try:
+        _per_material_done = _decimate_per_material(new_obj, ratio)
+    except Exception as _pme:
+        print(f"[FO4 Add-on] per-material LOD decimate skipped for '{new_obj.name}': {_pme}")
+    if not _per_material_done:
+        # Apply decimate modifier
+        mod = new_obj.modifiers.new("FO4_LOD_Decimate", 'DECIMATE')
+        mod.decimate_type = 'COLLAPSE'
+        mod.ratio = max(0.001, min(1.0, ratio))
+        # use_collapse_triangulate=True forces triangulation before edge collapse,
+        # which destroys quad flow on organic/plant meshes — leave it False.
+        mod.use_collapse_triangulate = False
+        mod.use_symmetry = False
 
-    # Apply modifier. Check the result -- an unchecked CANCELLED here (e.g.
-    # new_obj somehow isn't the active/context object at call time) would
-    # leave the Decimate modifier un-applied while every triangle-count/
-    # loose-vertex cleanup step below silently keeps running against the
-    # full, un-decimated mesh and reports it as a successful LOD.
-    bpy.context.view_layer.objects.active = new_obj
-    _apply_result = bpy.ops.object.modifier_apply(modifier=mod.name)
-    if 'FINISHED' not in _apply_result:
-        print(f"[FO4 Add-on] LOD decimate modifier_apply did not finish for "
-              f"'{new_obj.name}': {_apply_result} -- LOD mesh may still be at full density")
+        # Apply modifier. Check the result -- an unchecked CANCELLED here (e.g.
+        # new_obj somehow isn't the active/context object at call time) would
+        # leave the Decimate modifier un-applied while every triangle-count/
+        # loose-vertex cleanup step below silently keeps running against the
+        # full, un-decimated mesh and reports it as a successful LOD.
+        bpy.context.view_layer.objects.active = new_obj
+        _apply_result = bpy.ops.object.modifier_apply(modifier=mod.name)
+        if 'FINISHED' not in _apply_result:
+            print(f"[FO4 Add-on] LOD decimate modifier_apply did not finish for "
+                  f"'{new_obj.name}': {_apply_result} -- LOD mesh may still be at full density")
 
     # Decimate's COLLAPSE algorithm can strand vertices whose surrounding
     # faces all collapsed away without cleaning up the vertex itself --
@@ -207,6 +220,69 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
         f"({ratio*100:.0f}% of original)"
     )
     return new_obj, msg
+
+
+def _decimate_per_material(obj, ratio: float) -> bool:
+    """Decimate *obj* one material at a time and join it back.
+
+    Each material gets a share of the whole budget (ratio x all triangles)
+    weighted half by its surface area and half by its triangle count, so a
+    big low-poly part (a cliff) keeps a sensible number of triangles next to
+    dense plants instead of collapsing first. Returns False (nothing done)
+    when the mesh uses fewer than two materials.
+    """
+    me = obj.data
+    stats = {}
+    for p in me.polygons:
+        s = stats.setdefault(p.material_index, [0, 0.0])
+        s[0] += len(p.vertices) - 2
+        s[1] += p.area
+    if len(stats) < 2:
+        return False
+    total_t = sum(s[0] for s in stats.values())
+    total_a = sum(s[1] for s in stats.values()) or 1.0
+    target_total = max(12.0, ratio * total_t)
+
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.separate(type='MATERIAL')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    parts = [o for o in bpy.context.selected_objects if o.type == 'MESH']
+    if obj not in parts:
+        parts.append(obj)
+
+    for part in parts:
+        t = sum(len(p.vertices) - 2 for p in part.data.polygons)
+        if t == 0:
+            continue
+        a = sum(p.area for p in part.data.polygons)
+        share = 0.5 * (a / total_a) + 0.5 * (t / total_t)
+        want = min(t, max(min(t, 12), int(round(target_total * share))))
+        r = want / t
+        if r >= 0.999:
+            continue
+        m = part.modifiers.new("FO4_LOD_Decimate", 'DECIMATE')
+        m.decimate_type = 'COLLAPSE'
+        m.ratio = max(0.001, r)
+        m.use_collapse_triangulate = False
+        m.use_symmetry = False
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.context.view_layer.objects.active = part
+        part.select_set(True)
+        res = bpy.ops.object.modifier_apply(modifier=m.name)
+        if 'FINISHED' not in res:
+            print(f"[FO4 Add-on] LOD decimate did not finish on part '{part.name}': {res}")
+
+    bpy.ops.object.select_all(action='DESELECT')
+    for part in parts:
+        part.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    if len(parts) > 1:
+        bpy.ops.object.join()
+    return True
 
 
 def _world_bounds(obj):
