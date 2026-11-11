@@ -460,10 +460,18 @@ class FO4_OT_PipelineStaticMesh(Operator):
                     steps.append(f"Collision already present: {existing[0].name} ✓")
                 else:
                     from . import mesh_helpers
-                    col_obj, col_msg = mesh_helpers.MeshHelpers.add_collision_mesh(
+                    # add_collision_mesh returns the collision object (or None),
+                    # not a tuple; unpacking it raised and reported a built
+                    # collision as "skipped".
+                    col_obj = mesh_helpers.MeshHelpers.add_collision_mesh(
                         obj, simplify_ratio=self.simplify_ratio
                     )
-                    steps.append(f"Generated collision: {col_msg}")
+                    if col_obj is None:
+                        warnings.append("Collision generation skipped: this collision type has no collision")
+                    else:
+                        n = obj.get("fo4_collision_pieces", 1)
+                        steps.append(f"Generated collision: {col_obj.name}"
+                                     + (f" ({n} pieces)" if n > 1 else "") + " ✓")
             except Exception as e:
                 warnings.append(f"Collision generation skipped: {e}")
 

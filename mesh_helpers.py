@@ -1375,6 +1375,98 @@ class MeshHelpers:
         return msg
 
     @staticmethod
+    def _collision_piece_points(cobj, max_pieces: int = 32):
+        """Split *cobj*'s mesh into separate plant/prop clumps for collision.
+
+        Returns a list of vertex-coordinate lists (one per clump), or None when
+        the mesh is one clump. A single convex hull around several separate
+        pieces (a merged mesh of six plants across a cliff, 2026-11-11) fills
+        the empty space between them with an invisible wall. A loose part
+        mostly inside another's bounding box joins it; the clumps are merged
+        further, cheapest bounding-box growth first, until at most
+        *max_pieces* remain.
+        """
+        import numpy as np
+        bm = bmesh.new()
+        bm.from_mesh(cobj.data)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+        bm.verts.ensure_lookup_table()
+        seen = set()
+        islands = []
+        for v in bm.verts:
+            if v.index in seen or not v.link_edges:
+                continue
+            stack = [v]
+            seen.add(v.index)
+            comp = []
+            while stack:
+                x = stack.pop()
+                comp.append(tuple(x.co))
+                for e in x.link_edges:
+                    o = e.other_vert(x)
+                    if o.index not in seen:
+                        seen.add(o.index)
+                        stack.append(o)
+            if len(comp) >= 4:
+                islands.append(comp)
+        bm.free()
+        if len(islands) <= 1:
+            return None
+        groups = [np.array(c, dtype=float) for c in islands]
+        lo = np.array([g.min(0) for g in groups])
+        hi = np.array([g.max(0) for g in groups])
+        # 1) a piece joins a bigger piece when at least half of its own
+        #    bounding box lies inside that piece's box (a cap or leaf tucked
+        #    into a plant).  Boxes are the ORIGINAL loose parts' boxes, never
+        #    grown ones, so stalks between two plants cannot chain the plants
+        #    into one hull.  Neighbouring plants keep their own hulls.
+        def _vol(a, b):
+            return np.prod(np.maximum(b - a, 1e-6), axis=-1)
+
+        vols = _vol(lo, hi)
+        host = list(range(len(groups)))
+        for i in range(len(groups)):
+            ilo = np.maximum(lo, lo[i])
+            ihi = np.minimum(hi, hi[i])
+            inter = np.where(np.all(ihi > ilo, axis=1), _vol(ilo, ihi), 0.0)
+            frac = inter / vols[i]
+            frac[(vols <= vols[i])] = 0.0      # only a bigger piece can host
+            j = int(np.argmax(frac))
+            if frac[j] >= 0.5:
+                host[i] = j
+
+        def _root(k):
+            while host[k] != k:
+                k = host[k]
+            return k
+
+        members = {}
+        for i in range(len(groups)):
+            members.setdefault(_root(i), []).append(i)
+        groups = [np.vstack([groups[k] for k in idx]) for idx in members.values()]
+        lo = np.array([g.min(0) for g in groups])
+        hi = np.array([g.max(0) for g in groups])
+        # 2) cap the count: join the pair whose shared box grows the least
+        while len(groups) > max_pieces:
+            vol = np.prod(np.maximum(hi - lo, 1e-6), axis=1)
+            ulo = np.minimum(lo[:, None, :], lo[None, :, :])
+            uhi = np.maximum(hi[:, None, :], hi[None, :, :])
+            cost = np.prod(np.maximum(uhi - ulo, 1e-6), axis=2) - vol[:, None] - vol[None, :]
+            np.fill_diagonal(cost, np.inf)
+            a, b = np.unravel_index(np.argmin(cost), cost.shape)
+            a, b = min(a, b), max(a, b)
+            groups[a] = np.vstack([groups[a], groups[b]])
+            lo[a] = groups[a].min(0)
+            hi[a] = groups[a].max(0)
+            del groups[b]
+            lo = np.delete(lo, b, axis=0)
+            hi = np.delete(hi, b, axis=0)
+        if len(groups) <= 1:
+            return None
+        groups.sort(key=lambda g: -float(np.prod(np.maximum(g.max(0) - g.min(0), 1e-6))))
+        return [g.tolist() for g in groups]
+
+    @staticmethod
     def add_collision_mesh(obj, simplify_ratio: float = None, collision_type: str = 'DEFAULT'):
         """Add a collision mesh for *obj* and return the new object.
 
@@ -1482,10 +1574,78 @@ class MeshHelpers:
         # collision object stays co-located with the source.
         bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
+        # A mesh made of separate pieces (several plants merged into one
+        # object) gets one hull per clump, not one hull around all of them.
+        # Each extra piece is its own UCX_<name>_NN child; the exporter gives
+        # every piece its own collision node + physics system.
+        try:
+            piece_points = MeshHelpers._collision_piece_points(collision_obj)
+        except Exception as exc:
+            print(f"[FO4 Add-on] collision piece split skipped: {exc}")
+            piece_points = None
+        hull_objs = [collision_obj]
+        if piece_points:
+            for k in range(1, 100):
+                stale = bpy.data.objects.get(f"{ucx_name}_{k:02d}")
+                if stale is None:
+                    break
+                bpy.data.objects.remove(stale, do_unlink=True)
+            for i, pts in enumerate(piece_points):
+                if i == 0:
+                    pobj = collision_obj
+                else:
+                    pobj = collision_obj.copy()
+                    pobj.data = collision_obj.data.copy()
+                    for coll in collision_obj.users_collection:
+                        coll.objects.link(pobj)
+                    pobj.name = f"{ucx_name}_{i:02d}"
+                    hull_objs.append(pobj)
+                pbm = bmesh.new()
+                for p in pts:
+                    pbm.verts.new(p)
+                pbm.to_mesh(pobj.data)
+                pbm.free()
+            obj["fo4_collision_pieces"] = len(hull_objs)
+        elif "fo4_collision_pieces" in obj:
+            del obj["fo4_collision_pieces"]
+
+        for collision_obj in hull_objs:
+            MeshHelpers._finish_collision_hull(
+                obj, collision_obj, collision_type, simplify_ratio,
+                decimate=not piece_points)
+
+        collision_obj = hull_objs[0]
+        # PyNifly's REAL collision-discovery mechanism (nif/collision.py,
+        # export_collisions()) does NOT look at parenting or the UCX_ name
+        # prefix at all -- it only checks for a COPY_TRANSFORMS constraint
+        # targeting the collision object, or this exact custom property.
+        # Without it, PyNifly silently exports with no collision at all (no
+        # error, no warning) despite the collision object being correctly
+        # selected and named -- confirmed by reading PyNifly's own exporter
+        # source directly after a parented-only UCX_ object produced no
+        # collision in the exported file.  (Extra pieces are found by
+        # ExportHelpers._find_collision_meshes and attached after export.)
+        obj["pynCollisionTarget"] = collision_obj.name
+
+        # restore original object as active/selected
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+
+        return collision_obj
+
+    @staticmethod
+    def _finish_collision_hull(obj, collision_obj, collision_type, simplify_ratio,
+                               decimate=True):
+        """Turn *collision_obj*'s geometry into a parented FO4 convex hull."""
+        bpy.ops.object.select_all(action='DESELECT')
+        collision_obj.select_set(True)
+        bpy.context.view_layer.objects.active = collision_obj
+
         # Optional pre-pass: reduce vertex count with Decimate so very high-poly
         # sources produce a simpler convex hull.  Skip when simplify_ratio is 1.0
         # (no simplification requested) to avoid an unnecessary modifier apply.
-        if simplify_ratio < 1.0:
+        if decimate and simplify_ratio < 1.0:
             modifier = collision_obj.modifiers.new(name="Decimate", type='DECIMATE')
             modifier.ratio = simplify_ratio
             bpy.ops.object.modifier_apply(modifier="Decimate")
@@ -1553,17 +1713,6 @@ class MeshHelpers:
         collision_obj.parent = obj
         collision_obj.matrix_parent_inverse = obj.matrix_world.inverted()
 
-        # PyNifly's REAL collision-discovery mechanism (nif/collision.py,
-        # export_collisions()) does NOT look at parenting or the UCX_ name
-        # prefix at all -- it only checks for a COPY_TRANSFORMS constraint
-        # targeting the collision object, or this exact custom property.
-        # Without it, PyNifly silently exports with no collision at all (no
-        # error, no warning) despite the collision object being correctly
-        # selected and named -- confirmed by reading PyNifly's own exporter
-        # source directly after a parented-only UCX_ object produced no
-        # collision in the exported file.
-        obj["pynCollisionTarget"] = collision_obj.name
-
         # Configure as a static Rigid Body so the Niftools NIF exporter can
         # emit the correct bhkCollisionObject / bhkRigidBody nodes for FO4.
         # The operation may not be available in every context; wrap in try/except.
@@ -1624,13 +1773,6 @@ class MeshHelpers:
         # shape instead of the usual see-through wire overlay.
         collision_obj.display_type = 'WIRE'
         collision_obj.hide_render = True
-
-        # restore original object as active/selected
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-        collision_obj.select_set(False)
-
-        return collision_obj
 
     @staticmethod
     def add_custom_collision(obj, collision_type: str = 'BUILDING'):

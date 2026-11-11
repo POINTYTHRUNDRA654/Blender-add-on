@@ -567,11 +567,24 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
     patch below sets body_id 0 and checks each points at its own system.
     """
     objs = [o for o in (collision_objs or []) if o is not None and o.type == 'MESH']
-    if len(objs) <= 1:
-        return patch_native_collision(exported_path, objs[0] if objs else None)
     report = {"restored": [], "could_not_restore": []}
-    if _pynifly is None:
+    if not objs:
         return report
+    if _pynifly is None:
+        report["could_not_restore"].append("Havok collision (PyNifly Python API not available)")
+        return report
+    # A file whose root already carries collision (a re-exported game mesh
+    # keeps its original collision, e.g. GSDirtCliffLarge01: cliff collision
+    # on the root + 4 child nodes) used to make both collision patches return
+    # without a word, so new pieces made in Blender (the cliff's big plants,
+    # 2026-11-11) never reached the file and the player walked through them.
+    # New pieces now go on their own child nodes next to the existing ones.
+    try:
+        _root_has_collision = _load(exported_path).root.collision_object is not None
+    except Exception:
+        _root_has_collision = False
+    if len(objs) <= 1 and not _root_has_collision:
+        return patch_native_collision(exported_path, objs[0])
     try:
         from io_scene_nifly.pyn.nifconstants import HAVOC_SCALE_FACTOR, game_collision_sf
         from io_scene_nifly.pyn.nifdefs import PynBufferTypes, TransformBuf
@@ -582,8 +595,10 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
 
     try:
         exp = _load(exported_path)
-        if exp.root.collision_object is not None:
-            return report  # already has one -- don't clobber
+        keep_root = exp.root.collision_object is not None   # existing collision stays as it is
+        types0, _o0, _s0 = _block_layout(open(exported_path, "rb").read())
+        existing_colls = sum(1 for t in types0 if t == 'bhkNPCollisionObject')
+        existing_phys = sum(1 for t in types0 if t == 'bhkPhysicsSystem')
         sf = HAVOC_SCALE_FACTOR * game_collision_sf.get(exp.game, 1.0)
         first = objs[0]
         rb = first.rigid_body
@@ -606,8 +621,10 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
             shapes.append(CollisionShape(
                 shape_type='polytope', name=o.name, transform=None, verts=verts,
                 faces=faces, convex_radius=0.0, children=[], physics=physics))
-        if len(shapes) <= 1:
-            return patch_native_collision(exported_path, objs[0]) if shapes else report
+        if not shapes:
+            return report
+        if len(shapes) == 1 and not keep_root:
+            return patch_native_collision(exported_path, objs[0])
 
         # flags 128: the value on all 1,401 vanilla landscape bhkNPCollisionObjects
         kwargs = {"flags": 128, "collision_type": PynBufferTypes.bhkNPCollisionObjectBufType}
@@ -617,12 +634,21 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
         except (TypeError, ValueError):
             has_body_id = False
         coll_kwargs = dict(kwargs, body_id=0) if has_body_id else kwargs
-        root_coll = exp.root.add_collision(None, **coll_kwargs)
-        _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes[:1], parent=root_coll)
-        for i in range(1, len(shapes)):
+        first_child = 0
+        if not keep_root:
+            root_coll = exp.root.add_collision(None, **coll_kwargs)
+            _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes[:1], parent=root_coll)
+            first_child = 1
+        existing_names = {n.lower() for n in getattr(exp, "nodes", {})}
+        for i in range(first_child, len(shapes)):
             xf = TransformBuf()
             xf.set_identity()
-            node = exp.add_node(f"{exp.root.name}_Collision{i:02d}", xf, parent=exp.root)
+            nm = f"{shapes[i].name}_Collision" if keep_root else f"{exp.root.name}_Collision{i:02d}"
+            base, k = nm, 1
+            while nm.lower() in existing_names:
+                nm = f"{base}{k:02d}"; k += 1
+            existing_names.add(nm.lower())
+            node = exp.add_node(nm, xf, parent=exp.root)
             coll = node.add_collision(None, **coll_kwargs)
             _pynifly.bhkPhysicsSystem.New(exp, shapes=shapes[i:i + 1], parent=coll)
         exp.save()
@@ -635,9 +661,12 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
         types, offsets, _sizes = _block_layout(bytes(data))
         colls = [i for i, t in enumerate(types) if t == 'bhkNPCollisionObject']
         phys = [i for i, t in enumerate(types) if t == 'bhkPhysicsSystem']
-        if len(phys) != len(shapes) or len(colls) != len(shapes):
+        want = (existing_phys + len(shapes)) if keep_root else len(shapes)
+        want_c = (existing_colls + len(shapes)) if keep_root else len(shapes)
+        if len(phys) != want or len(colls) != want_c:
             report["could_not_restore"].append(
-                f"multi-piece collision layout ({len(phys)} physics blocks, {len(colls)} collision objects for {len(shapes)} pieces)")
+                f"multi-piece collision layout ({len(phys)} physics blocks, {len(colls)} collision objects; "
+                f"expected {want} / {want_c})")
             return report
         used = set()
         for ci in colls:
@@ -655,7 +684,9 @@ def patch_native_collision_multi(exported_path, collision_objs) -> dict:
             struct.pack_into('<I', data, off + 10, 0)      # body_id
         with open(exported_path, "wb") as fh:
             fh.write(data)
-        report["restored"].append(f"Havok collision ({len(shapes)} convex pieces, one physics system each)")
+        report["restored"].append(
+            f"Havok collision ({len(shapes)} convex pieces, one physics system each"
+            + (f", added next to the {existing_colls} collision(s) the file already had)" if keep_root else ")"))
     except Exception as exc:
         report["could_not_restore"].append(f"Havok multi-piece collision ({exc})")
     return report
