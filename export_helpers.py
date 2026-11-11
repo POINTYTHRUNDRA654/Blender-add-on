@@ -2071,7 +2071,41 @@ class ExportHelpers:
                         _tex_note += "  [new textures: " + "; ".join(_stage_notes) + "]"
                     if _wind_mat_notes:
                         _bgsm_note += " | Wind: " + "; ".join(_wind_mat_notes)
-                    return True, (f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}"
+
+                    # A full drive leaves a 0-byte NIF while the exporter still
+                    # reports success (GS_BushM01, 2026-11-10: E: had 0 bytes
+                    # free). Never call that a successful export.
+                    try:
+                        if os.path.isfile(filepath) and os.path.getsize(filepath) == 0:
+                            import shutil as _sh
+                            _free = _sh.disk_usage(os.path.dirname(os.path.abspath(filepath))).free
+                            return False, (f"The exported NIF is EMPTY (0 bytes): {filepath}. Nothing was "
+                                           f"written; the drive has {_free / 1024**3:.2f} GB free. Free up space "
+                                           "(or close programs that have the file open) and export again.")
+                    except Exception:
+                        pass
+
+                    try:
+                        obj["fo4_last_export_nif"] = str(filepath)
+                    except Exception:
+                        pass
+
+                    # Compare the result with how the real game does it
+                    # (fo4_game_rules: vanilla shader catalog).
+                    _game_note = ""
+                    try:
+                        from . import fo4_game_rules as _gr
+                        from . import bgsm_helpers as _bh_gr
+                        _findings = _gr.check_nif(filepath, read_bgsm=_bh_gr.read_bgsm)
+                        for _gs_sev, _gs_msg in _findings:
+                            print(f"[FO4 Game Check] {_gs_sev}: {_gs_msg}")
+                        _gsum = _gr.summarize(_findings)
+                        if _gsum:
+                            _game_note = "  [" + _gsum + "]"
+                    except Exception as _ge:
+                        print(f"[FO4Export] game check skipped: {_ge}")
+
+                    return True, (f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}{_game_note}"
                                   f"{ExportHelpers._ck_crash_texture_note([obj])}"
                                   f"{ExportHelpers._absolute_segment_file_note(filepath)}")
 

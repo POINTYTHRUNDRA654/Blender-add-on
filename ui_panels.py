@@ -3431,6 +3431,9 @@ class FO4_PT_ExportPanel(_FO4SubPanel):
         row.enabled = bool(has_mesh)
         row.scale_y = 1.4
         row.operator("fo4.export_mesh", text="Export Mesh  (.nif)", icon='MESH_DATA')
+        row_gc = act_box.row(align=True)
+        row_gc.enabled = bool(has_mesh)
+        row_gc.operator("fo4.check_against_game", text="Check Against Game", icon='VIEWZOOM')
 
         row2 = act_box.row(align=True)
         row2.enabled = bool(has_mesh)

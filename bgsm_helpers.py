@@ -1064,6 +1064,20 @@ def blender_mat_to_bgsm(mat, is_lod: bool = False) -> BGSMData:
         return data
 
     orig_path = mat.get("fo4_bgsm_path") if hasattr(mat, "get") else None
+    if not (orig_path and os.path.isfile(orig_path)) and hasattr(mat, "get"):
+        # PyNifly keeps the NIF's own material path (BSLSP_Shader_Name) on
+        # every imported material even when it could not open the file. Start
+        # from the game's real BGSM when it is in the game Data folder, so a
+        # re-exported vanilla mesh keeps fields Blender cannot show
+        # (subsurface, non-occluder, back lighting, wetness...). Re-exporting
+        # Briars02 used to drop subsurface and non-occluder (2026-11-10).
+        _nif_mat = str(mat.get("BSLSP_Shader_Name") or "").replace("/", "\\")
+        _i = _nif_mat.lower().find("materials\\")
+        if _i >= 0 and _nif_mat.lower().endswith(".bgsm"):
+            _groot = _game_data_root()
+            _cand = os.path.join(_groot, _nif_mat[_i:]) if _groot else ""
+            if _cand and os.path.isfile(_cand):
+                orig_path = _cand
     if orig_path and os.path.isfile(orig_path):
         try:
             with open(orig_path, "rb") as fh:
@@ -1080,15 +1094,24 @@ def blender_mat_to_bgsm(mat, is_lod: bool = False) -> BGSMData:
     data.diffuse_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Diffuse"))
     data.normal_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Normal"))
     data.smooth_spec_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Specular"))
-    data.greyscale_texture = _bgsm_texture_ref(_get_image_node_path(mat, "Glow"))
+    # The "Glow" image node is the glow map (_g) and goes in glow_texture
+    # ONLY. greyscale_texture is the colour palette for greyscale-to-palette
+    # tinting (vehicles, robots, hair): vanilla never puts a glow map there
+    # (0 of 272 glow-map BGSMs; 478 of 487 BGSMs with a greyscale texture have
+    # the palette flag on; shader catalog 2026-11-10). It used to get the _g
+    # path too, which also overwrote a round-tripped material's real palette.
+    _glow = _bgsm_texture_ref(_get_image_node_path(mat, "Glow"))
+    if _glow:
+        data.glow_texture = _glow
+        if data.greyscale_texture == _glow:
+            data.greyscale_texture = ""
+    elif not (orig_path and os.path.isfile(orig_path)):
+        data.glow_texture = ""
     data.env_map_texture = _bgsm_texture_ref(_get_image_node_path(mat, "EnvMap"))
 
     # When a Glow (_g) texture is assigned, auto-enable the emission / glow-map
     # flags so the BGSM always exports with the correct shader settings.
-    # The greyscale_texture slot holds the _g.dds path; we also populate the
-    # dedicated glow_texture override slot so both fields reference the same map.
-    if data.greyscale_texture:
-        data.glow_texture = data.greyscale_texture
+    if data.glow_texture:
         data.glowmap = True
         data.emit_enabled = True
         data.shader_flags1 |= SF1_EMIT_ENABLED
@@ -1210,7 +1233,7 @@ def blender_mat_to_bgsm(mat, is_lod: bool = False) -> BGSMData:
             # with no texture is a legitimate real FO4 technique (emit
             # enabled, glowmap left off) -- only force glowmap on here if a
             # real glow texture is already present.
-            if data.greyscale_texture:
+            if data.glow_texture:
                 data.glowmap = True
             emit_col_sock = pbsdf.inputs.get("Emission Color") or pbsdf.inputs.get("Emission")
             if emit_col_sock and not emit_col_sock.is_linked:
@@ -1379,26 +1402,24 @@ def _apply_shader_hints(data: BGSMData, hint: str) -> None:
     if "facegen" in hint_lower or "face" in hint_lower:
         data.facegen = True
     if "two_sided" in hint_lower or "foliage" in hint_lower or "vegetation" in hint_lower:
+        # Vanilla foliage (shader catalog 2026-11-10, Materials/Landscape/
+        # Plants, Grass and Trees, 175 BGSMs): two-sided 82%, alpha test 91%,
+        # subsurface 61% (rolloff 0.3 the most common), back lighting only
+        # 25% (power 0.2-0.4 when on), rim lighting 0 of 175, non-occluder
+        # 48% (69% of plants). This used to force back lighting 0.6 + rim +
+        # soft lighting on every plant, which no vanilla plant has.
+        data.two_sided = True
         data.shader_flags2 |= SF2_DOUBLE_SIDED
-        # Back-lighting flag makes sunlight pass through leaf surfaces in-game.
-        # (Real v2 BGSM files have no translucency/subsurface data fields to
-        # set alongside this -- see the note in blender_mat_to_bgsm.)
-        data.shader_flags1 |= SF1_BACK_LIGHTING
-        # The flag above only tells the engine back-lighting is *available* --
-        # the BGSM file also carries its own back_lighting bool and a
-        # separate backlight_power magnitude (both packed unconditionally in
-        # every BGSM this addon writes), and neither was ever set here. That
-        # left every foliage material with the flag "on" but the file's own
-        # fields saying "off, strength 0.0" -- i.e. no actual light bleed
-        # through the leaves in-game despite the flag. Rim + soft lighting
-        # are the same idea applied to leaf-edge/canopy highlights, and their
-        # flag bits (SF2_RIM_LIGHTING / SF2_SOFT_LIGHTING) were likewise
-        # defined but never set by any hint until now.
-        data.back_lighting = True
-        data.backlight_power = 0.6
-        data.rim_lighting = True
-        data.shader_flags2 |= SF2_RIM_LIGHTING
-        data.shader_flags2 |= SF2_SOFT_LIGHTING
+        data.subsurface_lighting = True
+        data.subsurface_rolloff = 0.3
+        data.rim_lighting = False
+        data.shader_flags2 &= ~SF2_RIM_LIGHTING
+        if "tree" not in hint_lower:
+            data.non_occluder = True
+        if "backlit" in hint_lower or "back_lighting" in hint_lower:
+            data.back_lighting = True
+            data.backlight_power = 0.3
+            data.shader_flags1 |= SF1_BACK_LIGHTING
 
 
 def bgsm_to_blender_mat(data: BGSMData, mat) -> None:
@@ -1514,7 +1535,7 @@ def bgsm_to_blender_mat(data: BGSMData, mat) -> None:
         "Diffuse":  data.diffuse_texture,
         "Normal":   data.normal_texture,
         "Specular": data.smooth_spec_texture,
-        "Glow":     data.greyscale_texture,
+        "Glow":     data.glow_texture,
         "EnvMap":   data.env_map_texture,
     }
 

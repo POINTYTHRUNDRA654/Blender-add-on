@@ -235,6 +235,9 @@ class FO4_PT_VegetationPanel(_FO4SubPanel):
         row.enabled = bool(obj and obj.type == 'MESH')
         row.operator("fo4.export_vegetation_as_nif",
                      text="Export Vegetation NIF", icon='FILE_BLEND')
+        row = box.row()
+        row.enabled = bool(obj and obj.type == 'MESH')
+        row.operator("fo4.check_against_game", text="Check Against Game", icon='VIEWZOOM')
 
         # Baking
         box = layout.box()

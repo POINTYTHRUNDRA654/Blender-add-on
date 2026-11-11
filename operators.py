@@ -12806,6 +12806,113 @@ class FO4_OT_SetupVegetationMaterial(Operator):
         return {'FINISHED'}
 
 
+class FO4_OT_CheckAgainstGame(Operator):
+    """Compare the selected mesh's materials and textures with how the real
+    game does it (scan of every vanilla material, mesh and texture)"""
+    bl_idname = "fo4.check_against_game"
+    bl_label = "Check Against Game"
+    bl_options = {'REGISTER'}
+
+    _lines = []
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
+    def execute(self, context):
+        import os
+        try:
+            from . import fo4_game_rules as gr
+            from . import bgsm_helpers as bh
+        except Exception as exc:
+            self.report({'ERROR'}, f"Game rules not available: {exc}")
+            return {'CANCELLED'}
+        obj = context.active_object
+        findings, notes = [], []
+        slot_by_node = {"diffuse": "diffuse_texture", "normal": "normal_texture", "specular": "smooth_spec_texture",
+                        "glow": "glow_texture", "envmap": "env_map_texture"}
+        suffix_slot = {"_d": "diffuse_texture", "_n": "normal_texture", "_s": "smooth_spec_texture",
+                       "_g": "glow_texture", "_e": "env_map_texture"}
+        for ms in obj.material_slots:
+            mat = ms.material
+            if mat is None:
+                continue
+            try:
+                data = bh.blender_mat_to_bgsm(mat)
+            except Exception as exc:
+                findings.append((gr.WARN, f"{mat.name}: could not read the material ({exc})"))
+                continue
+            findings += gr.check_bgsm(data, mat.name)
+            # PyNifly keeps the NIF's material path on imported materials.
+            bgsm_path = mat.get("fo4_bgsm_path") or mat.get("BSLSP_Shader_Name") or ""
+            if bgsm_path:
+                findings += gr.check_category(data, bgsm_path, mat.name)
+                summ = gr.category_summary(bgsm_path)
+                if summ:
+                    notes.append(summ)
+            if mat.use_nodes:
+                for n in mat.node_tree.nodes:
+                    if n.type != 'TEX_IMAGE' or n.image is None:
+                        continue
+                    path = bpy.path.abspath(n.image.filepath or "")
+                    if not path or not os.path.isfile(path):
+                        continue
+                    key = (n.get("fo4_tex_slot") or n.name or "").lower()
+                    slot = slot_by_node.get(key)
+                    if slot is None:
+                        stem = os.path.splitext(os.path.basename(path))[0].lower()
+                        slot = suffix_slot.get(stem[-2:])
+                    if slot is None:
+                        continue
+                    if path.lower().endswith(".dds"):
+                        findings += gr.check_texture(path, slot, mat.name)
+                    else:
+                        notes.append(f"{mat.name}: {os.path.basename(path)} is not DDS yet; export converts it "
+                                     "(normal and specular to BC5, like vanilla).")
+        # Mesh-side wind check: Tree material but no vertex colours to drive it.
+        wind_mat = any(ms.material is not None and ms.material.get("fo4_bgsm_tree") for ms in obj.material_slots)
+        if wind_mat and not obj.data.color_attributes:
+            findings.append((gr.WARN, f"{obj.name}: a wind (tree) material but the mesh has no vertex colours; "
+                             "run Vegetation Wind so the game knows how far each vertex moves."))
+        if obj.get("fo4_last_export_nif") and os.path.isfile(obj["fo4_last_export_nif"]):
+            findings += gr.check_nif(obj["fo4_last_export_nif"], read_bgsm=bh.read_bgsm)
+
+        order = {gr.ERROR: 0, gr.WARN: 1, gr.INFO: 2}
+        findings.sort(key=lambda f: order.get(f[0], 3))
+        lines = [f"{s}: {m}" for s, m in findings] or ["No problems found: matches how vanilla does it."]
+        lines += [f"NOTE: {x}" for x in notes]
+        for l in lines:
+            print(f"[FO4 Game Check] {l}")
+        # Keep the full report in a text block the user can open.
+        txt = bpy.data.texts.get("FO4 Game Check") or bpy.data.texts.new("FO4 Game Check")
+        txt.clear()
+        txt.write(f"Game check for {obj.name}\n" + "\n".join(lines) + "\n")
+        FO4_OT_CheckAgainstGame._lines = lines
+        n_err = sum(1 for f in findings if f[0] == gr.ERROR)
+        n_warn = sum(1 for f in findings if f[0] == gr.WARN)
+        # WARNING, not ERROR: an ERROR report raises in scripted calls (Mossy).
+        level = {'WARNING'} if (n_err or n_warn) else {'INFO'}
+        self.report(level, f"Game check: {n_err} error(s), {n_warn} warning(s), "
+                    f"{len(findings) - n_err - n_warn} note(s). Full list in the 'FO4 Game Check' text.")
+        try:
+            if context.window is not None and not bpy.app.background:
+                context.window_manager.popup_menu(_draw_game_check_popup, title="Check Against Game", icon='INFO')
+        except Exception:
+            pass
+        return {'FINISHED'}
+
+
+def _draw_game_check_popup(self, context):
+    import textwrap
+    for line in FO4_OT_CheckAgainstGame._lines[:30]:
+        icon = 'ERROR' if line.startswith("ERROR") else ('CANCEL' if line.startswith("WARN") else 'INFO')
+        first = True
+        for part in textwrap.wrap(line, 110) or [""]:
+            self.layout.label(text=part, icon=icon if first else 'BLANK1')
+            first = False
+
+
 class FO4_OT_ExportVegetationAsNif(Operator):
     """Export the active mesh as a vegetation NIF (no collision, alpha-test ready).
 
@@ -17999,6 +18106,7 @@ classes = (
     FO4_OT_ImportGLBAsLOD,
     FO4_OT_BakeVegetationAO,
     FO4_OT_SetupVegetationMaterial,
+    FO4_OT_CheckAgainstGame,
     FO4_OT_ExportVegetationAsNif,
     FO4_OT_ExportLODChainAsNif,
     # Quest and dialogue operators
