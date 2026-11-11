@@ -1660,7 +1660,34 @@ class ExportHelpers:
         _gd_err = _game_data_overwrite_error(filepath)
         if _gd_err:
             return False, _gd_err
-        # ...existing code...
+
+        # A mesh imported from a multi-shape NIF shares its imported root with
+        # the other shapes of that model. Exporting just the selected one
+        # wrote a NIF with only that shape: a plant's original stock mesh
+        # vanished from GSFungusStock02.nif when only the custom mesh next to
+        # it was selected (2026-11-11). Export the whole model instead; hidden
+        # pieces stay out (hiding one can be deliberate) and are named.
+        _root = obj.parent
+        if (_root is not None and _root.get("pynRoot")
+                and not obj.get("fo4_lod_merged_tmp")):
+            _sibs, _hidden = [], []
+            for _c in _root.children:
+                if (_c is obj or _c.type != 'MESH' or ExportHelpers._is_collision_mesh(_c)
+                        or _c.get("fo4_reference") or _c.get("fo4_lod_merged_tmp")):
+                    continue
+                try:
+                    _vis = not _c.hide_get() and not _c.hide_viewport
+                except Exception:
+                    _vis = not _c.hide_viewport
+                (_sibs if _vis else _hidden).append(_c)
+            if _sibs:
+                _ok, _msg = ExportHelpers.export_scene_as_single_nif(
+                    bpy.context.scene, filepath, objects=[obj] + _sibs)
+                _note = (f"  [whole model exported: '{obj.name}' plus "
+                         f"{', '.join(repr(s.name) for s in _sibs)} from the same NIF")
+                if _hidden:
+                    _note += (f"; hidden, left out: {', '.join(repr(s.name) for s in _hidden)}")
+                return _ok, _msg + _note + "]"
 
         try:
             _diag_coll = ExportHelpers._find_collision_mesh(obj)
@@ -2860,11 +2887,25 @@ class ExportHelpers:
                         _leaf_note = ""
                         try:
                             from . import nif_roundtrip as _nrt
+                            from .animation_helpers import AnimationHelpers as _AHw
+                            # Tree_Anim only on the materials of the meshes that
+                            # really have wind (a custom wind mesh next to the
+                            # original game stock must not make the stock sway).
+                            _wind_names = set()
+                            for _wm in meshes:
+                                try:
+                                    if _AHw.wind_enabled(_wm):
+                                        for _s in _wm.material_slots:
+                                            if _s.material is not None and _s.material.get("BSLSP_Shader_Name"):
+                                                _wind_names.add(str(_s.material["BSLSP_Shader_Name"]))
+                                except Exception:
+                                    pass
                             for _wm in meshes:
                                 _wm_source = _wm.get("fo4_source_nif")
                                 _leaf_report = _nrt.patch_wind_root_node(
                                     filepath, _wm,
                                     _wm_source if _wm_source and os.path.isfile(_wm_source) else None,
+                                    wind_shader_names=_wind_names or None,
                                 )
                                 _leaf_summary = _nrt.summarize(_leaf_report)
                                 if _leaf_summary:

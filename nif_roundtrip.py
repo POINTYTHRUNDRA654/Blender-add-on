@@ -1025,7 +1025,8 @@ def _patch_root_to_leafanim_bytes(data: bytes) -> bytes:
     )
 
 
-def patch_wind_root_node(exported_path, obj=None, original_path=None) -> dict:
+def patch_wind_root_node(exported_path, obj=None, original_path=None,
+                         wind_shader_names=None) -> dict:
     """Reconstruct the ``BSLeafAnimNode`` root wrapper on a freshly exported
     wind-foliage NIF, when PyNifly's export dropped it in favor of a plain
     ``NiNode``.
@@ -1106,7 +1107,7 @@ def patch_wind_root_node(exported_path, obj=None, original_path=None) -> dict:
 
     # Shader flags first: they matter even when the root is already right.
     try:
-        data, n_flags = _patch_wind_shader_flags_bytes(data)
+        data, n_flags = _patch_wind_shader_flags_bytes(data, wind_shader_names)
         if n_flags:
             report["restored"].append(
                 f"shader flags -> Tree_Anim on, Vertex_Alpha off ({n_flags} shader(s))")
@@ -1140,7 +1141,19 @@ SLSF1_VERTEX_ALPHA = 1 << 3
 SLSF2_TREE_ANIM = 1 << 29
 
 
-def _patch_wind_shader_flags_bytes(data: bytes):
+def _norm_mat_name(name: str) -> str:
+    """BGSM path for comparing: lower case, backslashes, no Materials\\
+    prefix, and X_Wind.bgsm counted as X.bgsm (the wind copy of a material,
+    see bgsm_helpers.ensure_wind_material, is the same material)."""
+    n = (name or "").replace("/", "\\").lower().strip()
+    n = n[len("materials\\"):] if n.startswith("materials\\") else n
+    for ext in (".bgsm", ".bgem"):
+        if n.endswith("_wind" + ext):
+            n = n[:-len("_wind" + ext)] + ext
+    return n
+
+
+def _patch_wind_shader_flags_bytes(data: bytes, wind_shader_names=None):
     """Wind-foliage shader flags the way vanilla writes them: Tree_Anim on
     (vertex alpha = sway) and Vertex_Alpha off (vertex alpha != transparency).
 
@@ -1154,9 +1167,20 @@ def _patch_wind_shader_flags_bytes(data: bytes):
     the plant (GSFungusSpore12: 5,940 of 6,513 vertices). Billy confirmed in
     NifSkope that switching Tree on shows the whole plant.
 
+    *wind_shader_names*: when given, only shaders whose material (BGSM path)
+    is in it get Tree_Anim; every other shader keeps the flags PyNifly wrote.
+    A plant made of a custom wind mesh plus the original game stock
+    (GSFungusStock02, 2026-11-11) got Tree_Anim on the stock too, whose
+    vertex alpha is 1.0 everywhere and whose BGSM has Tree off; vanilla
+    BSLeafAnimNode NIFs leave non-swaying parts without it (397 shaders).
+
     Returns ``(new_bytes, number_of_shaders_changed)``. FO4 (BS stream 130)
     only; other versions are returned unchanged.
     """
+    wanted = None
+    if wind_shader_names:
+        wanted = {_norm_mat_name(n) for n in wind_shader_names if n}
+        strings = _header_strings(data)
     o = data.index(b'\n') + 1
     if struct.unpack_from('<I', data, o + 13)[0] != 130:
         return data, 0
@@ -1196,6 +1220,11 @@ def _patch_wind_shader_flags_bytes(data: bytes):
                 struct.pack_into('<II', buf, q, f1, f2 & ~SLSF2_TREE_ANIM)
                 changed += 1
             continue
+        if wanted is not None:
+            _ni = struct.unpack_from('<i', buf, off + 4)[0]
+            _nm = strings[_ni] if 0 <= _ni < len(strings) else ""
+            if _norm_mat_name(_nm) not in wanted:
+                continue
         q = off + 4                                   # shader type
         n_extra = struct.unpack_from('<I', buf, q + 4)[0]
         q += 8 + 4 * n_extra + 4                      # name, extra data, controller
