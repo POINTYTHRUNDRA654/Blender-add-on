@@ -137,6 +137,132 @@ def _load(path):
     return _pynifly.NifFile(str(path))
 
 
+def restore_uvs_from_source(obj, min_match: float = 0.9) -> "tuple[bool, str]":
+    """Give *obj* (a mesh with no UV map) the UVs of the NIF it came from.
+
+    A piece imported from a NIF can lose its UV map in Blender (it then
+    shows black). The export used to give it a Smart UV placeholder, so its
+    texture no longer lined up in game. Here every triangle is matched to
+    the original shape's triangle with the same corner positions, and each
+    corner gets the original UV, so seams come back exactly. Sources tried:
+    the mesh's own fo4_source_nif (or its imported root's), then the same
+    Meshes\\... path in the unpacked game data. Blender's 1/70 scale and 1:1
+    are both tried. Returns (True, note) when at least *min_match* of the
+    triangles matched; otherwise (False, reason) and the mesh is untouched.
+    """
+    if _pynifly is None:
+        return False, "PyNifly is not available"
+    me = obj.data
+    if not me.polygons:
+        return False, "no faces"
+    cands = []
+    p = obj
+    while p is not None:
+        s = p.get("fo4_source_nif") if hasattr(p, "get") else None
+        if s and str(s) not in cands:
+            cands.append(str(s))
+        p = p.parent
+    try:
+        from .bgsm_helpers import _game_data_root
+        gd = _game_data_root()
+    except Exception:
+        gd = ""
+    if gd:
+        # The game's own copy first: the source NIF is often the file the
+        # last export overwrote, which may already carry damaged UVs.
+        game = []
+        for c in list(cands):
+            parts = os.path.normpath(c).split(os.sep)
+            low = [x.lower() for x in parts]
+            if "meshes" in low:
+                i = len(low) - 1 - low[::-1].index("meshes")
+                g = os.path.join(gd, *parts[i:])
+                if os.path.isfile(g) and g not in cands and g not in game:
+                    game.append(g)
+        cands = game + cands
+    cands = [c for c in cands if os.path.isfile(c)]
+    if not cands:
+        return False, "no source NIF on record and no game copy found"
+
+    from mathutils import Vector as _V
+    from mathutils.kdtree import KDTree as _KD
+    bco = [v.co.copy() for v in me.vertices]
+    polys = [(poly.index, list(poly.vertices), list(poly.loop_indices)) for poly in me.polygons]
+    best = None   # (matched, total, path, shape name, loop -> uv)
+    for path in cands:
+        try:
+            nif = _pynifly.NifFile(path)
+        except Exception:
+            continue
+        for sh in nif.shapes:
+            uvs = getattr(sh, "uvs", None)
+            if not uvs:
+                continue
+            sv = sh.verts
+            tris = sh.tris
+            if not sv or not tris:
+                continue
+            xs = [v[0] for v in sv]; ys = [v[1] for v in sv]; zs = [v[2] for v in sv]
+            ext = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1.0
+            tol = ext * 1e-3
+            kd = _KD(len(sv))
+            for i, v in enumerate(sv):
+                kd.insert(_V(v), i)
+            kd.balance()
+            vert_tris = {}
+            for ti, t in enumerate(tris):
+                for k in t:
+                    vert_tris.setdefault(k, []).append(ti)
+            for scale in (1.0, 69.99125):
+                loop_uv = {}
+                matched = 0
+                for _pi, vids, lids in polys:
+                    if len(vids) != 3:
+                        continue
+                    # every original vertex near each corner (a UV seam
+                    # puts several vertices on one position)
+                    cand = [{i for (_c, i, _d) in kd.find_range(bco[v] * scale, tol)} for v in vids]
+                    if not all(cand):
+                        continue
+                    pick = None
+                    for k0 in cand[0]:
+                        for ti in vert_tris.get(k0, ()):
+                            t = tris[ti]
+                            ks = []
+                            for cset in cand:
+                                hit = [k for k in t if k in cset and k not in ks]
+                                if not hit:
+                                    break
+                                ks.append(hit[0])
+                            if len(ks) == 3:
+                                pick = ks
+                                break
+                        if pick:
+                            break
+                    if not pick:
+                        continue
+                    for k, li in zip(pick, lids):
+                        u, v = uvs[k]
+                        loop_uv[li] = (u, 1.0 - v)
+                    matched += 1
+                total = len(polys)
+                if best is None or matched > best[0]:
+                    best = (matched, total, path, sh.name, loop_uv)
+    if best is None or best[1] == 0:
+        return False, "no shape with UVs in the source NIF"
+    matched, total, path, sname, loop_uv = best
+    if matched < min_match * total:
+        return False, (f"only {matched} of {total} faces match '{sname}' in "
+                       f"{os.path.basename(path)} (the mesh was changed)")
+    layer = me.uv_layers.new(name="UVMap")
+    data = layer.data
+    for li, uv in loop_uv.items():
+        data[li].uv = uv
+    me.update()
+    return True, (f"UV map restored from the original '{sname}' in "
+                  f"{os.path.basename(path)} ({matched} of {total} faces)")
+
+
 def _match_shapes(orig_shapes, exp_shapes):
     """Pair up original <-> exported shapes by name, falling back to
     positional order when names don't line up (e.g. PyNifly de-duplicated

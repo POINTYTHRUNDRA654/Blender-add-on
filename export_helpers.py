@@ -19,6 +19,17 @@ _FO4_UNIT_SCALE_INV = 69.99125
 class ExportHelpers:
     """Helper functions for exporting to Fallout 4"""
 
+    # Notes from _prepare_mesh_for_nif about meshes that had no UV map
+    # (restored from the original NIF, or given a placeholder), shown in the
+    # export message instead of only the console.
+    _uv_notes = []
+
+    @staticmethod
+    def _take_uv_notes() -> str:
+        notes = list(dict.fromkeys(ExportHelpers._uv_notes))
+        ExportHelpers._uv_notes.clear()
+        return ("  [UV: " + "; ".join(notes) + "]") if notes else ""
+
     # Vertex group names used exclusively for FO4 procedural wind on vegetation.
     # Meshes whose groups are all in this set don't need an armature to export.
     _WIND_GROUP_NAMES = frozenset({
@@ -1050,6 +1061,23 @@ class ExportHelpers:
         #    If there truly is no UV map, create one via smart_project as a
         #    placeholder so the exporter doesn't crash; the user should unwrap
         #    properly before final export.
+        _uv_restored = False
+        if not obj.data.uv_layers:
+            # A piece imported from a NIF (or a game mesh) that lost its UV
+            # map gets the original UVs back, triangle by triangle, before
+            # any placeholder unwrap is considered.
+            try:
+                from . import nif_roundtrip as _nrt_uv
+                _uv_restored, _uv_note = _nrt_uv.restore_uvs_from_source(obj)
+            except Exception as _uve:
+                _uv_restored, _uv_note = False, f"UV restore failed: {_uve}"
+            if _uv_restored:
+                ExportHelpers._uv_notes.append(f"'{obj.name}' had no UV map: {_uv_note}")
+            else:
+                ExportHelpers._uv_notes.append(
+                    f"WARNING: '{obj.name}' had no UV map and it could not be restored "
+                    f"({_uv_note}); a placeholder unwrap was made, so its texture will "
+                    f"not line up in game -- give it its UV map back before exporting")
         if not obj.data.uv_layers:
             obj.data.uv_layers.new(name="UVMap")
             try:
@@ -1621,6 +1649,7 @@ class ExportHelpers:
         can produce collapsed or otherwise corrupted geometry.  We fail early in
         that case so the user can clean up the mesh.
         """
+        ExportHelpers._uv_notes.clear()
 
         if not filepath or not str(filepath).strip():
             return False, "Export filepath is empty — choose a destination file first"
@@ -2162,6 +2191,7 @@ class ExportHelpers:
                         print(f"[FO4Export] game check skipped: {_ge}")
 
                     return True, (f"Exported NIF via {exporter_label}: {filepath}{note}{_bgsm_note}{_tex_note}{_roundtrip_note}{_game_note}"
+                                  f"{ExportHelpers._take_uv_notes()}"
                                   f"{ExportHelpers._ck_crash_texture_note([obj])}"
                                   f"{ExportHelpers._absolute_segment_file_note(filepath)}")
 
@@ -2622,6 +2652,7 @@ class ExportHelpers:
         tuple[bool, str]
             ``(True, message)`` on success, ``(False, error_message)`` on failure.
         """
+        ExportHelpers._uv_notes.clear()
         # Collect all exportable (non-collision) mesh objects, from the
         # explicit *objects* subset when given, else the whole scene.
         source_objs = objects if objects else scene.objects
@@ -2935,6 +2966,7 @@ class ExportHelpers:
                             _staged_note += "  [Wind: " + "; ".join(_wind_mat_notes) + "]"
                         return True, (f"Exported {mesh_count} mesh(es) as single NIF via "
                                       f"{exporter_label}: {filepath}{multi_obj_note}{_coll_note}{_leaf_note}{_bgsm_note}{_staged_note}"
+                                      f"{ExportHelpers._take_uv_notes()}"
                                       f"{ExportHelpers._ck_crash_texture_note(meshes)}"
                                       f"{ExportHelpers._absolute_segment_file_note(filepath)}")
                     fallback_msg = f"NIF export did not finish ({result}); falling back to FBX."
