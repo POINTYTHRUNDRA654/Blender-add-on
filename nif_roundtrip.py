@@ -589,6 +589,90 @@ def patch_bgsm_emissive_black(exported_path) -> dict:
     return report
 
 
+def _nif_texture_path(p: str) -> str:
+    """A texture path the way vanilla NIF texture sets write it:
+    'Textures\\' + backslashes. (BGSMs write 'Landscape/Plants/x_d.dds'.)
+    Raw scan of all 1,709 vanilla landscape NIFs: 7,284 paths start with
+    'Textures\\', none use forward slashes; 91 have no prefix and are left as
+    they are when they already use backslashes (e.g. 'shinybright_e.dds')."""
+    if not p:
+        return p
+    if "/" not in p:
+        return p
+    q = p.replace("/", "\\").lstrip("\\")
+    if q.lower().endswith(".dds") and not q.lower().startswith("textures\\"):
+        q = "Textures\\" + q
+    return q
+
+
+def patch_texture_set_paths(exported_path) -> dict:
+    """Rewrite BGSM-style texture paths in BSShaderTextureSet blocks
+    ('Landscape/Plants/X_g.dds') to the NIF form ('Textures\\Landscape\\
+    Plants\\X_g.dds'). A plant's glow slot came out BGSM-style next to three
+    NIF-style slots (GSFungusStock02A, 2026-11-11). Rebuilds the changed
+    blocks and the header's block-size table."""
+    report = {"restored": [], "could_not_restore": []}
+    try:
+        data = open(exported_path, "rb").read()
+        types, offsets, sizes = _block_layout(data)
+    except Exception as e:
+        report["could_not_restore"].append(f"texture path check ({e})")
+        return report
+    new_blocks = {}
+    fixed = 0
+    for i, t in enumerate(types):
+        if t != "BSShaderTextureSet":
+            continue
+        q = offsets[i]
+        n = struct.unpack_from("<I", data, q)[0]
+        q += 4
+        out = [struct.pack("<I", n)]
+        changed = False
+        for _ in range(n):
+            ln = struct.unpack_from("<I", data, q)[0]
+            s = data[q + 4:q + 4 + ln].decode("latin1")
+            q += 4 + ln
+            ns = _nif_texture_path(s)
+            if ns != s:
+                changed = True
+                fixed += 1
+            b = ns.encode("latin1")
+            out.append(struct.pack("<I", len(b)) + b)
+        rest = data[q:offsets[i] + sizes[i]]
+        if changed:
+            new_blocks[i] = b"".join(out) + rest
+    if not new_blocks:
+        return report
+    # header block-size table position (same walk as _block_layout)
+    o = data.index(b'\n') + 1
+    _ver, _endian, _user, nblocks = struct.unpack_from('<IBII', data, o)
+    o += 13
+    bsver = struct.unpack_from('<I', data, o)[0]
+    o += 4
+    for _ in range(4 if bsver >= 103 else 3):
+        o += 1 + data[o]
+    ntypes = struct.unpack_from('<H', data, o)[0]
+    o += 2
+    for _ in range(ntypes):
+        o += 4 + struct.unpack_from('<I', data, o)[0]
+    o += 2 * nblocks
+    sizes_pos = o
+    head = bytearray(data[:offsets[0]])
+    body = []
+    for i in range(len(types)):
+        blk = new_blocks.get(i, data[offsets[i]:offsets[i] + sizes[i]])
+        struct.pack_into('<I', head, sizes_pos + 4 * i, len(blk))
+        body.append(blk)
+    tail = data[offsets[-1] + sizes[-1]:]
+    try:
+        open(exported_path, "wb").write(bytes(head) + b"".join(body) + tail)
+    except Exception as e:
+        report["could_not_restore"].append(f"texture paths (could not write: {e})")
+        return report
+    report["restored"].append(f"{fixed} texture path(s) written the NIF way (Textures\\..., backslashes)")
+    return report
+
+
 def _header_strings(data: bytes):
     """The header string table of a FO4 NIF (block names, material paths)."""
     o = data.index(b'\n') + 1

@@ -2108,8 +2108,11 @@ class ExportHelpers:
                         _em_summary = _nrt.summarize(_nrt.patch_bgsm_emissive_black(filepath))
                         if _em_summary:
                             _roundtrip_note += f"  [{_em_summary}]"
+                        _tp_summary = _nrt.summarize(_nrt.patch_texture_set_paths(filepath))
+                        if _tp_summary:
+                            _roundtrip_note += f"  [{_tp_summary}]"
                     except Exception as _eme:
-                        print(f"[FO4Export] Emissive colour patch skipped: {_eme}")
+                        print(f"[FO4Export] Emissive colour / texture path patch skipped: {_eme}")
 
                     try:
                         ExportHelpers._write_kit_credits(obj, filepath)
@@ -2918,8 +2921,11 @@ class ExportHelpers:
                             _em_summary = _nrt.summarize(_nrt.patch_bgsm_emissive_black(filepath))
                             if _em_summary:
                                 _leaf_note += f"  [{_em_summary}]"
+                            _tp_summary = _nrt.summarize(_nrt.patch_texture_set_paths(filepath))
+                            if _tp_summary:
+                                _leaf_note += f"  [{_tp_summary}]"
                         except Exception as _eme:
-                            print(f"[FO4Export] Emissive colour patch skipped: {_eme}")
+                            print(f"[FO4Export] Emissive colour / texture path patch skipped: {_eme}")
                         _staged_note =("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""
                         if _wind_mat_notes:
                             _staged_note += "  [Wind: " + "; ".join(_wind_mat_notes) + "]"
