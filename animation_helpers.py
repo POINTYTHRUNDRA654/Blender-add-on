@@ -1128,6 +1128,41 @@ class AnimationHelpers:
         return out.tolist()
 
     @staticmethod
+    def _fused_tree_wind(mesh_obj, coords, edges):
+        """Wind weights for a tree whose trunk and leaves are ONE connected piece
+        (AI-made and baked trees), or None for any other tree.
+
+        The per-piece ramp runs along the whole piece, so on a fused tree the
+        trunk moved as much as the leaves (Billy's tree, 2026-11-12: trunk 0.28
+        at the base -> 0.91 at the top). Bethesda's one-piece trees keep the
+        trunk almost still (0.03-0.06) and move the canopy by its distance from
+        the trunk; tree_structure.tree_wind_weights reproduces that (29/255 from
+        vanilla's own values against 43/255 for the ramp)."""
+        try:
+            from . import tree_structure as _ts
+        except ImportError:
+            import tree_structure as _ts
+        try:
+            mesh = mesh_obj.data
+            verts = [tuple(c) for c in coords]
+            faces = [tuple(p.vertices) for p in mesh.polygons]
+            if len(faces) < 8:
+                return None
+            zs = [c[2] for c in verts]
+            H = (max(zs) - min(zs)) or 1.0
+            core = _ts.core_vertices(verts, faces, _ts.core_faces(verts, faces, H))
+            if not _ts.is_fused_tree(verts, edges, core):
+                return None
+            mx = AnimationHelpers.WIND_PLANT_TYPES.get('TREE', (1.0, True))[0]
+            w = _ts.tree_wind_weights(verts, faces, max_weight=mx, core_mask=core, edges=edges)
+            if w is not None:
+                mesh_obj["fo4_wind_tree_fused"] = True
+            return w
+        except Exception as exc:
+            print(f"[AnimationHelpers] one-piece tree wind skipped: {exc}")
+            return None
+
+    @staticmethod
     def generate_wind_weights(mesh_obj, group_name="Wind", axis='Z', invert=False,
                               base_anchor=0.15, per_piece=True, plant_type='AUTO',
                               reference_nif=None):
@@ -1217,6 +1252,9 @@ class AnimationHelpers:
                 raw_heights.append(pos)
 
             _edges = [tuple(e.vertices) for e in mesh.edges]
+            _tree_w = None
+            if per_piece and wtype == 'TREE' and wtype not in AnimationHelpers.WIND_CLOTH_TYPES:
+                _tree_w = AnimationHelpers._fused_tree_wind(mesh_obj, coords, _edges)
             if wtype in AnimationHelpers.WIND_CLOTH_TYPES:
                 _mx, _mode = AnimationHelpers.WIND_CLOTH_TYPES[wtype]
                 _pg = mesh_obj.vertex_groups.get(AnimationHelpers.WIND_PIN_GROUP)
@@ -1228,6 +1266,10 @@ class AnimationHelpers:
                                 _pinned[v.index] = True
                 weights = AnimationHelpers._wind_weights_cloth(
                     coords, _edges, _pinned, mode=_mode, max_weight=_mx)
+            elif _tree_w is not None:
+                # Trunk and leaves are one piece: painted by distance from the
+                # trunk like Bethesda's one-piece trees (see tree_structure).
+                weights = _tree_w
             elif per_piece:
                 _mx, _anchor_low = AnimationHelpers.WIND_PLANT_TYPES.get(wtype, (1.0, False))
                 try:

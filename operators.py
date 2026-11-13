@@ -11157,20 +11157,35 @@ class FO4_OT_AddCustomCollision(Operator):
                        for s in obj.material_slots)
             )
             if collision_obj.get("fo4_collision_used_hull_fallback") and _is_plant:
-                # A tree or plant has no doors or windows: a convex hull is
-                # the normal shape (the mod's own GSFungusTree01.nif ships
-                # one 34-vertex hull around the whole tree). Say that, so a
-                # plant does not get a building warning (2026-11-11).
-                self.report(
-                    {'INFO'},
-                    f"'{obj.name}' has too many vertices for an exact-mesh "
-                    f"collision (limit 255), so it got a convex hull "
-                    f"({len(collision_obj.data.polygons)} tris). For a tree or "
-                    f"plant that is the normal shape. If it is several separate "
-                    f"plants, use Add Collision instead: it gives each one its "
-                    f"own hull.",
-                )
-                _notify(f"Collision for {obj.name}: convex hull (normal for a tree or plant)", 'INFO')
+                # Too detailed for an exact mesh (255-vertex limit). One hull
+                # over a whole tree is an invisible wall around its leaves
+                # (Billy's one-piece tree, 2026-11-12). Vanilla trees collide
+                # with the woody parts only (fungal trees ~9 hulls along the
+                # trunk, roots and crown), so rebuild with the piece-aware
+                # helper: one hull per separate plant, and for a tree whose
+                # leaves are fused to the trunk, compact hulls around the
+                # trunk, thick limbs and root flare.
+                _ctype = self.collision_type if self.collision_type not in ('BUILDING', 'DEFAULT') else (
+                    'TREE' if mesh_helpers.MeshHelpers._is_tree_like(obj) else 'VEGETATION')
+                for _c in list(obj.children):
+                    if _c.get("fo4_collision"):
+                        bpy.data.objects.remove(_c, do_unlink=True)
+                collision_obj = mesh_helpers.MeshHelpers.add_collision_mesh(obj, collision_type=_ctype)
+                if not collision_obj:
+                    raise RuntimeError("helper failed to create collision mesh")
+                _core = obj.get("fo4_collision_tree_core")
+                _n = obj.get("fo4_collision_pieces", 1)
+                if _core:
+                    msg = (f"'{obj.name}': {_n} collision hull(s) around the trunk, thick "
+                           f"branches and roots; the leaves have no collision, like "
+                           f"vanilla trees.")
+                elif _n > 1:
+                    msg = f"'{obj.name}': {_n} collision hulls, one per separate plant."
+                else:
+                    msg = (f"'{obj.name}': one convex hull ({len(collision_obj.data.polygons)} "
+                           f"tris); no separate trunk or plants were found to split it.")
+                self.report({'INFO'}, msg)
+                _notify(msg, 'INFO')
             elif collision_obj.get("fo4_collision_used_hull_fallback"):
                 # The exact-mesh shape couldn't be decimated under FO4's
                 # hard 255-vertex Havok mesh-shape limit, so the helper

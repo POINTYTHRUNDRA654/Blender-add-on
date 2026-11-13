@@ -1539,6 +1539,37 @@ class MeshHelpers:
         return [g.tolist() for g in groups]
 
     @staticmethod
+    def _is_tree_like(obj, collision_type=None):
+        """A tree or tree-sized plant (by collision type, wind type or name)."""
+        if str(collision_type or "").upper() == 'TREE':
+            return True
+        if str(obj.get("fo4_wind_type", "")).upper() == 'TREE':
+            return True
+        if str(getattr(obj, "fo4_collision_type", "")).upper() == 'TREE':
+            return True
+        return "tree" in obj.name.lower()
+
+    @staticmethod
+    def _tree_core_points(cobj, max_pieces: int = 12):
+        """Point lists for compact hulls around a tree's woody core (trunk,
+        thick limbs, root flare), or None when no core is found. See
+        tree_structure for how the core is found and what vanilla does."""
+        try:
+            from . import tree_structure as _ts
+        except ImportError:
+            import tree_structure as _ts
+        me = cobj.data
+        verts = [tuple(v.co) for v in me.vertices]
+        faces = [tuple(p.vertices) for p in me.polygons]
+        if len(faces) < 8:
+            return None
+        pieces = _ts.core_collision_pieces(verts, faces, max_pieces=max_pieces)
+        if not pieces:
+            return None
+        cobj["fo4_collision_tree_core"] = True
+        return pieces
+
+    @staticmethod
     def add_collision_mesh(obj, simplify_ratio: float = None, collision_type: str = 'DEFAULT'):
         """Add a collision mesh for *obj* and return the new object.
 
@@ -1655,6 +1686,19 @@ class MeshHelpers:
         except Exception as exc:
             print(f"[FO4 Add-on] collision piece split skipped: {exc}")
             piece_points = None
+        # A tree that is one piece (trunk and leaves fused, typical of AI-made
+        # trees) would get one hull over the whole canopy: an invisible wall
+        # around the leaves. Vanilla trees collide with the woody parts only
+        # (fungal trees ~9 hulls along trunk, roots and crown; burnt tree one
+        # tight trunk hull), so hull the woody core in compact parts instead.
+        if not piece_points and MeshHelpers._is_tree_like(obj, collision_type):
+            try:
+                piece_points = MeshHelpers._tree_core_points(collision_obj)
+                if piece_points:
+                    obj["fo4_collision_tree_core"] = len(piece_points)
+            except Exception as exc:
+                print(f"[FO4 Add-on] tree core collision skipped: {exc}")
+                piece_points = None
         hull_objs = [collision_obj]
         if piece_points:
             for k in range(1, 100):
