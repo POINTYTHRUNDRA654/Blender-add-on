@@ -2576,9 +2576,9 @@ class FO4_PT_NVTTPanel(_FO4SubPanel):
         # Info box
         info_box = layout.box()
         info_box.label(text="FO4 DDS Format Reference:", icon='INFO')
-        info_box.label(text="• BC1 (DXT1): Diffuse (_d), Specular (_s), Glow (_g), Env mask (_e)")
+        info_box.label(text="• BC1 (DXT1): Diffuse (_d), Glow (_g), Env mask (_e)")
         info_box.label(text="• BC3 (DXT5): Diffuse with alpha (transparency)")
-        info_box.label(text="• BC5 (ATI2): Normal maps (_n) - two-channel R+G")
+        info_box.label(text="• BC5 (ATI2): Normal (_n) and Specular (_s) - R+G, no alpha")
         info_box.label(text="• BC7: optional high quality variant", icon='BLANK1')
         info_box.label(text="• Mipmaps: auto-generated (required by FO4)", icon='BLANK1')
         info_box.label(text="• Dimensions: must be power of 2 (512/1024/2048)", icon='BLANK1')
