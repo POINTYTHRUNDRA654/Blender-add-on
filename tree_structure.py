@@ -51,6 +51,10 @@ MIN_CORE_PART = 0.01        # a core part smaller than this share of the core is
 WIND_DIST = (0.04, 0.15)    # distance from the trunk (of height): no wind -> full wind
 WIND_HEIGHT = (0.05, 0.55)  # height (of height): anchored base -> free crown
 TRUNK_BINS = 24
+# Solid parts thinner than the trunk (see flex_factor): thickness of height from
+# solid -> fully flexible, and thin path from the woody core from still -> free.
+FLEX_THICK = (0.02, 0.01)
+FLEX_DIST = (0.0, 0.06)
 
 
 def _smoothstep(x, a, b):
@@ -178,6 +182,21 @@ def is_fused_tree(verts, edges, core_mask):
         ra, rb = find(a), find(b)
         if ra != rb:
             par[ra] = rb
+    # copies at one spot are one surface: a tree imported from a NIF is split
+    # at every UV seam (GSFungusStock04: 14,754 open edges of 23,877), which
+    # made it look like many loose pieces and sent it to the height ramp
+    V = np.asarray(verts, dtype=float)
+    if n:
+        H = float(V[:, 2].max() - V[:, 2].min()) or 1.0
+        key = np.round(V / max(1e-5 * H, 1e-9)).astype(np.int64)
+        _, grp = np.unique(key, axis=0, return_inverse=True)
+        first = {}
+        for i, g in enumerate(grp.ravel().tolist()):
+            j = first.setdefault(g, i)
+            if j != i:
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    par[ra] = rb
     roots = np.array([find(i) for i in range(n)])
     vals, counts = np.unique(roots, return_counts=True)
     big = vals[np.argmax(counts)]
@@ -189,7 +208,8 @@ def is_fused_tree(verts, edges, core_mask):
 
 
 def tree_wind_weights(verts, faces, max_weight=1.0, core_mask=None,
-                      dist=WIND_DIST, height=WIND_HEIGHT, edges=None):
+                      dist=WIND_DIST, height=WIND_HEIGHT, edges=None, flex=True, flex_thick=FLEX_THICK,
+                      rigid_leaves=False):
     """Vanilla-style wind for a tree whose leaves are part of the trunk mesh:
     weight = (distance from the trunk at that height) x (height above the base).
     The trunk stays still, the outer canopy moves most, the base is anchored.
@@ -214,8 +234,215 @@ def tree_wind_weights(verts, faces, max_weight=1.0, core_mask=None,
     # distance from the trunk SURFACE at that height
     r = np.maximum(np.hypot(V[:, 0] - cx, V[:, 1] - cy) - cr, 0.0) / H
     w = _smoothstep(r, *dist) * _smoothstep(zf, *height)
+    fth = face_thickness(verts, faces, H) if (flex or rigid_leaves) else None
+    if flex:
+        w = w * flex_factor(verts, faces, H, core_mask, edges=edges, thick=flex_thick,
+                            vthick=_vertex_max(len(V), faces, fth))
     w = smooth_along_edges(w, V, faces, H, edges=edges)
+    if rigid_leaves:
+        w = rigid_leaf_blades(w, V, faces, H, fth / H)
     return (np.clip(w, 0.0, 1.0) * max_weight).tolist()
+
+
+# Solid wood that is thinner than the trunk (Billy's GSFungusStock04, 2026-11-13:
+# a crown of finger-like prongs, 1.1-2.3% of the height thick, below the 3% core
+# cut) swayed like canopy because it sits far from the trunk. What sets a prong
+# apart from a branch is the path: a branch turns thin a short way out from the
+# trunk and stays thin to its leaves (canopy median 0.55%, p90 1.34%); a prong
+# stays thick from the crown to its tip. So the sway is limited by how much THIN
+# material lies between a vertex and the woody core, measured along the mesh
+# (FLEX_THICK / FLEX_DIST, defined at the top).
+
+
+def vertex_thickness(verts, faces, height):
+    """Per vertex: the thickest of its faces (face_thickness)."""
+    return _vertex_max(len(verts), faces, face_thickness(verts, faces, height))
+
+
+def _vertex_max(n, faces, per_face):
+    vt = np.zeros(n)
+    for f, t in zip(faces, per_face):
+        idx = list(f)
+        vt[idx] = np.maximum(vt[idx], t)
+    return vt
+
+
+# Leaf blades move as one piece. The wind shader times each vertex's sway by
+# its alpha, so a leaf whose alpha changes from base to tip swings out of step
+# with itself and twists apart (Billy's GSFungusStock04, 2026-11-13: crumpled
+# AI leaves, 650 leaf triangles spanning more than 30/255). Bethesda's leaf
+# cards carry one value per card (78-86% within 10/255 in the vanilla scan).
+# On a one-piece tree a blade is told from a twig by its surface: both are
+# thin (under BLADE_THICK of the height), but a blade's faces point along one
+# axis (its two skins) while a twig's wrap round it. Each blade gets the
+# value of the twig where it attaches, so the joint does not tear either.
+BLADE_THICK = 0.012
+BLADE_COHERENCE = 0.7
+BLADE_VALUE = 'attach'
+# NOT on by default: on Bethesda's 4 one-piece trees it moved the painting away
+# from their own values (41.4 -> 45.4 of 255 with 'attach', 43.9 with 'mean',
+# 2026-11-13) -- their leaves do vary. Kept for crumpled AI leaves, as a test.
+
+
+def _weld_groups(V, H):
+    key = np.round(V / max(1e-5 * H, 1e-9)).astype(np.int64)
+    _, g = np.unique(key, axis=0, return_inverse=True)
+    return g.ravel()
+
+
+def leaf_blades(V, faces, H, fthick_rel, thick=BLADE_THICK, coherence=BLADE_COHERENCE):
+    """Face-index arrays, one per leaf blade (thin faces whose neighbourhood
+    normals line up along one axis), grouped by shared (welded) vertices."""
+    V = np.asarray(V, dtype=float)
+    g = _weld_groups(V, H)
+    nf = len(faces)
+    FN = np.zeros((nf, 3))
+    for i, f in enumerate(faces):
+        p = V[list(f)]
+        n = np.zeros(3)
+        for k in range(len(p)):
+            a, b = p[k], p[(k + 1) % len(p)]
+            n += ((a[1] - b[1]) * (a[2] + b[2]), (a[2] - b[2]) * (a[0] + b[0]), (a[0] - b[0]) * (a[1] + b[1]))
+        FN[i] = n * 0.5                                  # area-scaled normal
+    vf = [[] for _ in range(int(g.max()) + 1)]
+    for i, f in enumerate(faces):
+        for v in f:
+            vf[g[v]].append(i)
+    ring1 = [set(j for v in f for j in vf[g[v]]) for f in faces]
+    thin = np.asarray(fthick_rel) < thick
+    blade = np.zeros(nf, bool)
+    for i in np.nonzero(thin)[0]:
+        ring = set(ring1[i])
+        for j in ring1[i]:
+            ring |= ring1[j]
+        r = np.fromiter(ring, int)
+        a = np.linalg.norm(FN[r], axis=1)
+        Nn = FN[r] / np.maximum(a, 1e-12)[:, None] * np.sqrt(a)[:, None]
+        ev = np.linalg.eigvalsh(Nn.T @ Nn)
+        blade[i] = ev[-1] >= coherence * max(ev.sum(), 1e-12)
+    par = {}
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    first = {}
+    for i in np.nonzero(blade)[0]:
+        par.setdefault(int(i), int(i))
+        for v in faces[i]:
+            k = g[v]
+            if k in first:
+                ra, rb = find(int(i)), find(first[k])
+                if ra != rb:
+                    par[ra] = rb
+            else:
+                first[k] = int(i)
+    comp = {}
+    for i in np.nonzero(blade)[0]:
+        comp.setdefault(find(int(i)), []).append(int(i))
+    return [np.asarray(c) for c in comp.values()], blade, g
+
+
+def rigid_leaf_blades(w, V, faces, H, fthick_rel, value=None):
+    """Each leaf blade's vertices get one value: the mean of its vertices that
+    it shares with the twig (or the blade's lowest value if it touches
+    nothing). Copies of a vertex at one spot keep one value."""
+    w = np.asarray(w, dtype=float).copy()
+    V = np.asarray(V, dtype=float)
+    blades, is_blade, g = leaf_blades(V, faces, H, fthick_rel)
+    if not blades:
+        return w
+    other = set()
+    for i, f in enumerate(faces):
+        if not is_blade[i]:
+            other.update(int(g[v]) for v in f)
+    ng = int(g.max()) + 1
+    gw = np.zeros(ng); gc = np.zeros(ng)
+    np.add.at(gw, g, w); np.add.at(gc, g, 1)
+    gw /= np.maximum(gc, 1)
+    newg = gw.copy()
+    for c in blades:
+        gs = np.unique(np.concatenate([g[list(faces[i])] for i in c]))
+        att = [k for k in gs if int(k) in other]
+        mode = value or BLADE_VALUE
+        if mode == 'mean':
+            newg[gs] = gw[gs].mean()
+        else:
+            newg[gs] = gw[att].mean() if att else gw[gs].min()
+    changed = np.zeros(ng, bool)
+    for c in blades:
+        changed[np.unique(np.concatenate([g[list(faces[i])] for i in c]))] = True
+    return np.where(changed[g], newg[g], w)
+
+
+def flex_factor(verts, faces, H, core_mask, edges=None, thick=FLEX_THICK, dist=FLEX_DIST, vthick=None):
+    """0..1 per vertex: smoothstep of the distance travelled through thin
+    (flexible) parts from the nearest woody-core vertex, along mesh edges. Thick
+    parts cost nothing to cross, so a solid limb or prong stays at 0 all the
+    way out. Vertices on pieces with no core keep 1."""
+    import heapq
+    V = np.asarray(verts, dtype=float)
+    n = len(V)
+    if vthick is None:
+        vthick = vertex_thickness(verts, faces, H)
+    # thick = (solid at or above, fully flexible at or below); 0 = solid, 1 = thin
+    flex = 1.0 - _smoothstep(vthick / H, min(thick), max(thick))
+    if edges is None:
+        es = set()
+        for f in faces:
+            f = list(f)
+            for k in range(len(f)):
+                a, b = f[k], f[(k + 1) % len(f)]
+                es.add((min(a, b), max(a, b)))
+        edges = list(es)
+    adj = [[] for _ in range(n)]
+    for a, b in edges:
+        L = float(np.linalg.norm(V[a] - V[b])) / H
+        c = L * 0.5 * (flex[a] + flex[b])
+        adj[a].append((b, c)); adj[b].append((a, c))
+    # a mesh split at UV seams (an imported NIF: GSFungusStock04 has 14,754
+    # open edges of 23,877) is still one surface: copies at one spot connect
+    key = np.round(V / max(1e-5 * H, 1e-9)).astype(np.int64)
+    _, grp = np.unique(key, axis=0, return_inverse=True)
+    grp = grp.ravel()
+    order = np.argsort(grp, kind='stable')
+    gs = grp[order]
+    for k in range(1, n):
+        if gs[k] == gs[k - 1]:
+            a, b = int(order[k - 1]), int(order[k])
+            adj[a].append((b, 0.0)); adj[b].append((a, 0.0))
+    d = np.full(n, np.inf)
+    heap = []
+    for i in np.nonzero(core_mask)[0]:
+        d[i] = 0.0
+        heap.append((0.0, int(i)))
+    heapq.heapify(heap)
+    while heap:
+        di, i = heapq.heappop(heap)
+        if di > d[i]:
+            continue
+        for j, c in adj[i]:
+            nd = di + c
+            if nd < d[j]:
+                d[j] = nd
+                heapq.heappush(heap, (nd, j))
+    # A loose piece with no path to the core (a strip laid on a prong, a leaf
+    # card set against a twig) moves with what it sits on: the nearest reached
+    # vertex's thin path plus the straight distance to it. Giving such pieces
+    # full sway left strips on GSFungusStock04's still prongs swaying alone.
+    lost = ~np.isfinite(d)
+    if lost.any() and (~lost).any():
+        from mathutils.kdtree import KDTree
+        found = np.nonzero(~lost)[0]
+        kd = KDTree(len(found))
+        for k, i in enumerate(found):
+            kd.insert(V[i], k)
+        kd.balance()
+        for i in np.nonzero(lost)[0]:
+            _co, k, gap = kd.find(V[i])
+            d[i] = d[found[k]] + gap / H
+    return _smoothstep(np.where(np.isfinite(d), d, 1.0), *dist)
 
 
 # Steepest change allowed along an edge, per tree height: the painting itself

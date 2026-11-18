@@ -6,7 +6,7 @@ A comprehensive tutorial and helper system for creating Fallout 4 mods in Blende
 bl_info = {
     "name": "Mossy Industries blender addon",
     "author": "Mossy Industries",
-    "version": (5, 5, 2),
+    "version": (5, 5, 3),
     "blender": (2, 90, 0),  # Compatible with Blender 2.90+ through 5.x
     "location": "View3D > Sidebar > Fallout 4",
     "description": (
@@ -295,6 +295,8 @@ fo4_weather_interior     = _try_import("fo4_weather_interior")
 fo4_glow_effects         = _try_import("fo4_glow_effects")
 fo4_mesh_shaper          = _try_import("fo4_mesh_shaper")
 fo4_uv_kit               = _try_import("fo4_uv_kit")
+fo4_tree_tools           = _try_import("fo4_tree_tools")
+fo4_skin_builder         = _try_import("fo4_skin_builder")   # AI skin over a building (2026-11-17)
 fo4_texture_generator    = _try_import("fo4_texture_generator")
 
 
@@ -395,6 +397,8 @@ _PHASE2_MODULES = list(filter(_filter, [
     fo4_glow_effects,
     fo4_mesh_shaper,
     fo4_uv_kit,
+    fo4_tree_tools,
+    fo4_skin_builder,
     fo4_texture_generator,
     # Animation sub-systems — operators registered in Phase 2 so startup
     # is not delayed; all UI panels that reference them check registration
@@ -585,6 +589,18 @@ def register():
                 _name = getattr(_mod, "__name__", str(_mod))
                 print(f"⚠ Phase 2 register {_name}: {_e}")
         print("  Phase 2 complete — all features available.")
+
+        # Collision hulls laid out like vanilla for EVERY export, PyNifly's own
+        # File > Export included: PyNifly's packer writes too few planes, and a
+        # hull exported straight through PyNifly (GSFungusStock04, 2026-11-14)
+        # came out broken because the fix was only installed by the add-on's
+        # own export steps.
+        try:
+            _nrt_mod = _try_import("nif_roundtrip")
+            if _nrt_mod is not None and _nrt_mod.install_vanilla_hull_packer():
+                print("  Collision hulls: vanilla layout installed for all exports")
+        except Exception as _e:
+            print(f"⚠ collision hull packer: {_e}")
 
         # Register the AI helpers. Ones that returned None at startup are
         # re-imported first: those _try_import() calls run before Phase 1 adds

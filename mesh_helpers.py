@@ -1446,6 +1446,398 @@ class MeshHelpers:
         child.matrix_parent_inverse = _M.Identity(4)
         child.matrix_basis = _M.Identity(4)
 
+    class CollisionNotAdded(RuntimeError):
+        """Add Collision deliberately made nothing; the message says why."""
+
+    @staticmethod
+    def _existing_collision_inside(obj) -> list:
+        """Names of another model's collision that *obj* covers, [] when there is
+        none. Only the 'new skin over a building' case counts: inside *obj*'s
+        bounds (80%) there must be BOTH compound or mesh collision (a building:
+        many convex parts under a bhkCompound, or a _cm mesh shape) AND another
+        visible model. A plant's own earlier hulls are single convex pieces with
+        nothing else visible inside, so re-making a plant's collision is not
+        blocked (regression set, 2026-11-16: the first version of this check
+        stopped the bush, spore, mushroom and tree cases)."""
+        import numpy as np
+
+        def box(o):
+            pts = np.array([tuple(o.matrix_world @ __import__('mathutils').Vector(c)) for c in o.bound_box])
+            return pts.min(axis=0), pts.max(axis=0)
+        try:
+            olo, ohi = box(obj)
+        except Exception:
+            return []
+        pad = 0.02 * (ohi - olo)
+        olo, ohi = olo - pad, ohi + pad
+
+        def inside(o):
+            lo, hi = box(o)
+            vol = float(np.prod(np.maximum(hi - lo, 1e-9)))
+            ilo, ihi = np.maximum(lo, olo), np.minimum(hi, ohi)
+            return vol > 0 and float(np.prod(np.maximum(ihi - ilo, 0.0))) / vol >= 0.8
+
+        def is_coll(o):
+            n = o.name.lower()
+            return n.startswith(('bhk', 'ucx_')) or bool(o.get("fo4_collision"))
+
+        def compound_or_mesh(o):
+            n = o.name.lower()
+            p = o.parent.name.lower() if o.parent is not None else ""
+            return p.startswith('bhkcompound') or n.endswith('_cm') or '_cm.' in n
+
+        scene = list(bpy.context.scene.objects)
+        coll = [o.name for o in scene if o is not obj and o.type == 'MESH' and is_coll(o)
+                and compound_or_mesh(o) and inside(o)]
+        if not coll:
+            return []
+        other = [o for o in scene if o is not obj and o.type == 'MESH' and not is_coll(o)
+                 and o.parent is not obj and inside(o)]
+        return coll if other else []
+
+    @staticmethod
+    def _skin_over_building_pieces(obj, building_coll_names):
+        """Collision pieces for a new skin over a building that keeps its own
+        collision. Returns (list of world-space point lists, report, old
+        shells to remove). An empty list means: add nothing (report says why).
+
+        Measured and confirmed in game on GSShackMetalPrefabCompleteLg01
+        (2026-11-16): doorways come from the building's own solid collision
+        (gaps in its outline open at knee, waist and head height); the skin
+        gets hulls of about 110 game units only outside the building's
+        outline and never in a clear zone in front of a doorway; afterwards,
+        from just outside every doorway a person-sized path must lead away at
+        all three heights, or nothing is added. 149 hulls, within 3.5 units of
+        the skin (median); bigger pieces (160) left twice as many invisible
+        bumps over 20 units."""
+        import math
+        import numpy as np
+        from collections import deque
+        scene = list(bpy.context.scene.objects)
+        bset = set(building_coll_names)
+        bobjs = [o for o in scene if o.name in bset]
+        # the building's whole collision: every compound/mesh part, and its other single parts inside the skin
+        def tris(o):
+            V = np.array([tuple(o.matrix_world @ v.co) for v in o.data.vertices])
+            T = [(p.vertices[0], p.vertices[k], p.vertices[k + 1]) for p in o.data.polygons
+                 for k in range(1, len(p.vertices) - 1)]
+            return V, np.array(T, dtype=int).reshape(-1, 3)
+        parts = [tris(o) for o in bobjs]
+        SV = np.vstack([p[0] for p in parts])
+        ST = np.vstack([p[1] + sum(len(q[0]) for q in parts[:k]) for k, p in enumerate(parts)])
+        KV = np.array([tuple(obj.matrix_world @ v.co) for v in obj.data.vertices])
+        height = float(np.ptp(SV[:, 2])) or 1.0
+        u = 1.0 if height >= 20.0 else 1.0 / 69.99      # game units, or a metre-scale import
+        CELL, CAPSULE, CLOSE, APRON, CHUNK, MIN_PIECE = 4 * u, 18 * u, 72 * u, 140 * u, 110 * u, 35 * u
+        HEIGHTS = (40 * u, 90 * u, 150 * u)
+        lo = np.minimum(SV.min(0), KV.min(0)) - 200 * u
+        hi = np.maximum(SV.max(0), KV.max(0)) + 200 * u
+        floor = float(SV[:, 2].min())
+        nx, ny = int((hi[0] - lo[0]) / CELL) + 1, int((hi[1] - lo[1]) / CELL) + 1
+        if nx * ny > 4_000_000:
+            return [], "The building is too large for the doorway check (grid over 4 million cells).", []
+
+        def section(V, T, z):
+            g = np.zeros((nx, ny), bool)
+            for t in T:
+                p = V[t]
+                pts = []
+                for i in range(3):
+                    a_, b_ = p[i], p[(i + 1) % 3]
+                    if (a_[2] - z) * (b_[2] - z) < 0:
+                        s = (z - a_[2]) / (b_[2] - a_[2])
+                        pts.append(a_[:2] + (b_[:2] - a_[:2]) * s)
+                if len(pts) == 2:
+                    n = int(np.linalg.norm(pts[1] - pts[0]) / (CELL * 0.5)) + 1
+                    for s in np.linspace(0, 1, n):
+                        q = pts[0] + (pts[1] - pts[0]) * s
+                        i, j = int((q[0] - lo[0]) / CELL), int((q[1] - lo[1]) / CELL)
+                        if 0 <= i < nx and 0 <= j < ny:
+                            g[i, j] = True
+            return g
+
+        def dilate(g, r):
+            k = int(math.ceil(r / CELL))
+            out = g.copy()
+            ii, jj = np.nonzero(g)
+            for di in range(-k, k + 1):
+                for dj in range(-k, k + 1):
+                    if di * di + dj * dj <= k * k:
+                        out[np.clip(ii + di, 0, nx - 1), np.clip(jj + dj, 0, ny - 1)] = True
+            return out
+
+        def flood(free, seeds):
+            seen = np.zeros_like(free)
+            dq = deque()
+            for s in seeds:
+                if free[s] and not seen[s]:
+                    seen[s] = True
+                    dq.append(s)
+            while dq:
+                i, j = dq.popleft()
+                for a_, b_ in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                    if 0 <= a_ < nx and 0 <= b_ < ny and free[a_, b_] and not seen[a_, b_]:
+                        seen[a_, b_] = True
+                        dq.append((a_, b_))
+            return seen
+
+        border = ([(i, 0) for i in range(nx)] + [(i, ny - 1) for i in range(nx)] +
+                  [(0, j) for j in range(ny)] + [(nx - 1, j) for j in range(ny)])
+        walls = [section(SV, ST, floor + h) for h in HEIGHTS]
+        outside_closed = flood(~dilate(walls[1] | walls[0], CLOSE), border)
+        foot = ~outside_closed
+        band = foot & dilate(outside_closed, CLOSE + 12 * u) & ~dilate(outside_closed, CLOSE - 12 * u)
+        free_all = np.ones((nx, ny), bool)
+        for w in walls:
+            free_all &= ~dilate(w, CAPSULE)
+        door_cells = band & free_all
+        doors, taken = [], np.zeros((nx, ny), bool)
+        for s in zip(*np.nonzero(door_cells)):
+            if taken[s]:
+                continue
+            comp = flood(door_cells & ~taken, [s])
+            taken |= comp
+            idx = np.argwhere(comp)
+            if len(idx) * CELL * CELL >= (20 * u) ** 2:
+                doors.append(idx)
+        centre = np.argwhere(foot).mean(axis=0)
+        real_doors = []
+        for idx in doors:
+            c = idx.mean(axis=0)
+            od = c - centre
+            od = od / (np.linalg.norm(od) or 1.0)
+            inside_pt = tuple(np.clip((c - od * (60 * u / CELL)).astype(int), 0, [nx - 1, ny - 1]))
+            if all(any(flood(~dilate(w, CAPSULE), [inside_pt])[b] for b in border) for w in walls):
+                real_doors.append((idx, c, od))
+        if not real_doors:
+            return [], ("No doorway could be found in the building's collision (no gap in its outline open at "
+                        "knee, waist and head height)."), []
+        apron = np.zeros((nx, ny), bool)
+        for idx, _c, _od in real_doors:
+            g = np.zeros((nx, ny), bool)
+            g[idx[:, 0], idx[:, 1]] = True
+            apron |= dilate(g, APRON) & ~foot
+        keepout = dilate(foot, 8 * u)
+        ci = np.clip(((KV[:, 0] - lo[0]) / CELL).astype(int), 0, nx - 1)
+        cj = np.clip(((KV[:, 1] - lo[1]) / CELL).astype(int), 0, ny - 1)
+        need = ~keepout[ci, cj] & ~(apron[ci, cj] & (KV[:, 2] < floor + 260 * u))
+        pts = KV[need]
+        if not len(pts):
+            return [], "No part of the skin lies outside the building's walls; the building's collision covers it.", []
+        key = np.floor((pts - lo) / CHUNK).astype(int)
+        _, inv = np.unique(key, axis=0, return_inverse=True)
+        inv = inv.ravel()
+        cw = lo[:2] + centre * CELL
+        pieces = []
+        for g in range(inv.max() + 1):
+            P = pts[inv == g]
+            if len(P) < 8 or float(np.ptp(P, axis=0).max()) < MIN_PIECE:
+                continue
+            d = np.c_[cw[0] - P[:, 0], cw[1] - P[:, 1], np.zeros(len(P))]
+            d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
+            pieces.append(np.vstack([P, P + 12 * u * d]))   # a little thickness so a flat patch still blocks
+        # Added 2026-11-16 (Thornmaw skin on the same shack): a piece built only from points outside a door's apron
+        # can still reach into it when the points form an L round a corner (its convex outline cuts across).
+        # Only such pieces are split, at half then a quarter of the size; a bit that still reaches in is dropped.
+        # Pieces that stay out of every apron are untouched, so earlier skins get exactly the pieces they got before.
+        def _piece_cells(P):
+            from mathutils.geometry import convex_hull_2d
+            cells = []
+            for h in HEIGHTS:
+                z = floor + h
+                if not (P[:, 2].min() <= z <= P[:, 2].max()):
+                    continue
+                band_pts = P[np.abs(P[:, 2] - z) < 0.5 * CHUNK]
+                if len(band_pts) < 3:
+                    continue
+                ring = band_pts[convex_hull_2d([tuple(q[:2]) for q in band_pts])][:, :2]
+                i0, j0 = ((ring.min(0) - lo[:2]) / CELL).astype(int)
+                i1, j1 = ((ring.max(0) - lo[:2]) / CELL).astype(int) + 1
+                for i in range(max(i0, 0), min(i1, nx)):
+                    for j in range(max(j0, 0), min(j1, ny)):
+                        q = lo[:2] + (np.array([i, j]) + 0.5) * CELL
+                        if all((ring[(m + 1) % len(ring)][0] - ring[m][0]) * (q[1] - ring[m][1]) -
+                               (ring[(m + 1) % len(ring)][1] - ring[m][1]) * (q[0] - ring[m][0]) >= 0
+                               for m in range(len(ring))):
+                            cells.append((i, j))
+            return cells
+
+        def _reaches_apron(P):
+            return any(apron[i, j] for i, j in _piece_cells(P))
+
+        split_pieces, dropped_bits = 0, 0
+        if any(_reaches_apron(P) for P in pieces):
+            fixed = []
+            for P in pieces:
+                if not _reaches_apron(P):
+                    fixed.append(P)
+                    continue
+                split_pieces += 1
+                core = P[:len(P) // 2]                      # the skin points (the second half is the thickness)
+                todo = [(core, CHUNK / 2)]
+                while todo:
+                    Q, size = todo.pop()
+                    k2 = np.floor((Q - lo) / size).astype(int)
+                    _, inv2 = np.unique(k2, axis=0, return_inverse=True)
+                    inv2 = inv2.ravel()
+                    for g2 in range(inv2.max() + 1):
+                        R = Q[inv2 == g2]
+                        if len(R) < 4:
+                            continue
+                        d2 = np.c_[cw[0] - R[:, 0], cw[1] - R[:, 1], np.zeros(len(R))]
+                        d2 /= np.maximum(np.linalg.norm(d2, axis=1, keepdims=True), 1e-9)
+                        piece = np.vstack([R, R + 12 * u * d2])
+                        if not _reaches_apron(piece):
+                            fixed.append(piece)
+                        elif size > CHUNK / 4 + 1e-9:
+                            todo.append((R, size / 2))
+                        else:
+                            dropped_bits += 1
+            pieces = fixed
+        # check: from just outside each doorway a person gets away at every height, and no piece reaches its apron
+        hull_sections = [np.zeros((nx, ny), bool) for _ in HEIGHTS]
+        for P in pieces:
+            lo2, hi2 = P.min(0), P.max(0)
+            for k, h in enumerate(HEIGHTS):
+                z = floor + h
+                if lo2[2] <= z <= hi2[2]:
+                    band_pts = P[np.abs(P[:, 2] - z) < 0.5 * CHUNK]
+                    if len(band_pts) >= 3:
+                        # convex outline of the piece at this height, filled
+                        from mathutils.geometry import convex_hull_2d
+                        ring = band_pts[convex_hull_2d([tuple(q[:2]) for q in band_pts])][:, :2]
+                        i0, j0 = ((ring.min(0) - lo[:2]) / CELL).astype(int)
+                        i1, j1 = ((ring.max(0) - lo[:2]) / CELL).astype(int) + 1
+                        for i in range(max(i0, 0), min(i1, nx)):
+                            for j in range(max(j0, 0), min(j1, ny)):
+                                q = lo[:2] + (np.array([i, j]) + 0.5) * CELL
+                                inside = True
+                                for m in range(len(ring)):
+                                    a_, b_ = ring[m], ring[(m + 1) % len(ring)]
+                                    if (b_[0] - a_[0]) * (q[1] - a_[1]) - (b_[1] - a_[1]) * (q[0] - a_[0]) < 0:
+                                        inside = False
+                                        break
+                                if inside:
+                                    hull_sections[k][i, j] = True
+        for n_, (idx, c, od) in enumerate(real_doors):
+            out_pt = tuple(np.clip((c + od * (60 * u / CELL)).astype(int), 0, [nx - 1, ny - 1]))
+            g = np.zeros((nx, ny), bool)
+            g[idx[:, 0], idx[:, 1]] = True
+            my_apron = dilate(g, APRON) & ~foot
+            for k in range(len(HEIGHTS)):
+                blocked = walls[k] | hull_sections[k]
+                if not any(flood(~dilate(blocked, CAPSULE), [out_pt])[b] for b in border) or \
+                        (my_apron & hull_sections[k]).any():
+                    return [], (f"Doorway {n_ + 1} of {len(real_doors)} would be blocked by the skin's collision, "
+                                 "so nothing was added. Send the building to Claude to look at."), []
+        # earlier skin collision is replaced, not doubled: an old single hull round the whole skin (it sealed the
+        # doors) and old skin hulls outside the building's outline (an earlier run of this case). The building's
+        # own parts and its NavCut boxes sit inside the outline and are kept.
+        sv_lo, sv_hi = SV.min(0), SV.max(0)
+        old = []
+        for o in scene:
+            if o is obj or o.type != 'MESH' or o.name in bset:
+                continue
+            n = o.name.lower()
+            if not (n.startswith('bhk') or n.startswith('ucx_') or o.get("fo4_collision")):
+                continue
+            P = np.array([tuple(o.matrix_world @ c) for c in [__import__('mathutils').Vector(v) for v in o.bound_box]])
+            whole = (P.min(0) <= sv_lo + 0.05 * (sv_hi - sv_lo)).all() and (P.max(0) >= sv_hi - 0.05 * (sv_hi - sv_lo)).all()
+            cx, cy = P[:, :2].mean(axis=0)
+            i_, j_ = int((cx - lo[0]) / CELL), int((cy - lo[1]) / CELL)
+            outside = 0 <= i_ < nx and 0 <= j_ < ny and not foot[i_, j_]
+            if whole or outside:
+                old.append(o)
+        report = (f"Skin over a building: {len(pieces)} hulls on the skin outside the walls, the building's "
+                  f"own collision kept, {len(real_doors)} doorway(s) found and checked clear"
+                  + (f", {len(old)} earlier skin hull(s) replaced" if old else "")
+                  + (f", {split_pieces} hull(s) next to a doorway split smaller to keep it clear"
+                     + (f" ({dropped_bits} small bit(s) right at the doorway left without collision)" if dropped_bits else "")
+                     if split_pieces else "") + ".")
+        return [P.tolist() for P in pieces], report, old
+
+    @staticmethod
+    def _is_mushroom_like(obj) -> bool:
+        """A fungus/mushroom mesh, from its name, data name, source NIF or materials."""
+        words = ("fung", "mushroom", "shroom", "toadstool", "spore")
+        texts = [obj.name, getattr(obj.data, "name", "") or "", str(obj.get("fo4_source_nif") or "")]
+        for s in getattr(obj, "material_slots", []):
+            if s.material:
+                texts += [s.material.name, str(s.material.get("BSLSP_Shader_Name") or "")]
+        t = " ".join(texts).lower()
+        return any(w in t for w in words)
+
+    @staticmethod
+    def _raw_islands(cobj):
+        """Vertex positions of each separate (welded) piece of *cobj*'s mesh, pieces under 4 vertices dropped."""
+        bm = bmesh.new()
+        bm.from_mesh(cobj.data)
+        size = max(cobj.dimensions) if cobj.dimensions else 1.0
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=max(size * 1e-4, 1e-6))
+        bm.verts.ensure_lookup_table()
+        seen, out = set(), []
+        for v in bm.verts:
+            if v.index in seen or not v.link_edges:
+                continue
+            stack, comp = [v], []
+            seen.add(v.index)
+            while stack:
+                x = stack.pop()
+                comp.append(tuple(x.co))
+                for e in x.link_edges:
+                    o = e.other_vert(x)
+                    if o.index not in seen:
+                        seen.add(o.index)
+                        stack.append(o)
+            if len(comp) >= 4:
+                out.append(comp)
+        bm.free()
+        return out
+
+    @staticmethod
+    def _mushroom_split(pieces):
+        """Split each mushroom-shaped clump into a stem hull and a cap hull.
+
+        A clump is mushroom-shaped when, slicing it by height, the top is at
+        least 2.2x wider than the stem below it and the stem takes at least
+        a fifth of the height. The stem stops at 85% of the way to the cap:
+        the cap's underside dips below the cut and would flare the stem hull
+        into a cone that blocks the space under the cap again.
+        Returns (pieces, number of mushrooms split)."""
+        import numpy as np
+        out, n_split = [], 0
+        for pts in pieces:
+            P = np.asarray(pts, dtype=float)
+            if len(P) < 16:
+                out.append(pts)
+                continue
+            z0, z1 = P[:, 2].min(), P[:, 2].max()
+            h = z1 - z0
+            if h <= 0:
+                out.append(pts)
+                continue
+            nb = 20
+            ext = []
+            for k in range(nb):
+                m = (P[:, 2] >= z0 + h * k / nb) & (P[:, 2] <= z0 + h * (k + 1) / nb)
+                ext.append(float(np.ptp(P[m, :2], axis=0).max()) if m.sum() > 2 else 0.0)
+            ext = np.array(ext)
+            big = ext.max()
+            k = nb - 1
+            while k > 0 and ext[k] >= 0.4 * big:
+                k -= 1
+            stem_ext = ext[:k + 1][ext[:k + 1] > 0]
+            stem_w = float(stem_ext.max()) if len(stem_ext) else big
+            cut = z0 + h * (k + 1) / nb
+            stem = P[P[:, 2] <= z0 + 0.85 * (cut - z0)]
+            cap = P[P[:, 2] >= cut - 0.02 * h]
+            if k >= 3 and big >= 2.2 * stem_w and len(stem) >= 8 and len(cap) >= 8:
+                out += [stem.tolist(), cap.tolist()]
+                n_split += 1
+            else:
+                out.append(pts)
+        return out, n_split
+
     @staticmethod
     def _collision_piece_points(cobj, max_pieces: int = 32):
         """Split *cobj*'s mesh into separate plant/prop clumps for collision.
@@ -1518,6 +1910,29 @@ class MeshHelpers:
         groups = [np.vstack([groups[k] for k in idx]) for idx in members.values()]
         lo = np.array([g.min(0) for g in groups])
         hi = np.array([g.max(0) for g in groups])
+        # 1b) one hull per PLANT, not per leaf cluster. GSBush04 (2026-11-15):
+        #     a woody core plus 31 floating leaf clusters became 32 hulls, some
+        #     under 10 units. Vanilla (195 Landscape\Plants NIFs measured): no
+        #     plant has more than 4 collision bodies, almost all have 1, never on
+        #     the leaves; bushes get one simple hull round the core, smaller than
+        #     the foliage (deadshrubGS01: a 170-unit box in a 400-unit bush).
+        #       - foliage: a piece whose bottom is up in the crown of a taller
+        #         piece close by (higher than a quarter of that piece's height,
+        #         within half its height sideways) gets no hull;
+        #       - a side shoot (a grounded piece at most half as tall as a plant
+        #         whose footprint it overlaps) joins that plant's hull;
+        #       - every other grounded piece is its own plant, unless it is too
+        #         small to block anyone (under 48 units, or under a fifth of the
+        #         tallest plant): then no hull, like grass.
+        #     Separate stalks of similar height keep separate hulls, so a dense
+        #     cluster never becomes one wall again.
+        kept = MeshHelpers._plants_only(groups, cobj)
+        if kept is not None:
+            groups = kept
+            lo = np.array([g.min(0) for g in groups])
+            hi = np.array([g.max(0) for g in groups])
+            if len(groups) == 1:
+                return [groups[0].tolist()]
         # 2) cap the count: join the pair whose shared box grows the least
         while len(groups) > max_pieces:
             vol = np.prod(np.maximum(hi - lo, 1e-6), axis=1)
@@ -1537,6 +1952,121 @@ class MeshHelpers:
             return None
         groups.sort(key=lambda g: -float(np.prod(np.maximum(g.max(0) - g.min(0), 1e-6))))
         return [g.tolist() for g in groups]
+
+    @staticmethod
+    def _hull_volume(points):
+        """Volume of the convex hull of *points* (0 when degenerate)."""
+        bm = bmesh.new()
+        try:
+            for p in points:
+                bm.verts.new(p)
+            if len(bm.verts) < 4:
+                return 0.0
+            bmesh.ops.convex_hull(bm, input=bm.verts[:])
+            return abs(bm.calc_volume())
+        except Exception:
+            return 0.0
+        finally:
+            bm.free()
+
+    @staticmethod
+    def _split_arched_pieces(piece_points, max_total: int = 64):
+        """Added 2026-11-17 (GSMuckPool_L01 fungus trees: roots that lie on the ground and curl up at the end
+        got one hull each, a tall slanted wedge from the trunk out to the raised tip that blocks walking over
+        the root). A piece that lies mostly flat (long axis less than 60 degrees from level) and is long
+        (at least 3x its thickness) is cut in two across its long axis when the two halves' hulls together
+        are under 80% of the whole hull -- the sign of a curl or arch. Repeated on each half (at most three
+        times, so up to 8 parts per piece). Straight roots, upright stalks and compact pieces keep their one
+        hull. Returns (new point lists, number of pieces split)."""
+        import numpy as np
+        out, n_split = [], 0
+
+        def _split(P, depth):
+            nonlocal n_split
+            P = np.asarray(P, dtype=float)
+            if depth >= 3 or len(P) < 16:
+                return [P]
+            C = P - P.mean(0)
+            try:
+                _u, sv, vt = np.linalg.svd(C, full_matrices=False)
+            except Exception:
+                return [P]
+            ax = vt[0]
+            t = C @ ax
+            length = float(np.ptp(t))
+            thick = float(max(np.ptp(C @ vt[1]), 1e-9))
+            if depth == 0 and (abs(ax[2]) > 0.866 or length < 3.0 * thick):
+                return [P]
+            # deeper cuts: stop when the part is no longer than twice its thinnest extent (the tube itself)
+            if depth > 0 and length < 2.0 * float(np.ptp(C @ vt[2])):
+                return [P]
+            mid = float(np.median(t))
+            ov = 0.02 * length                      # halves overlap a little: no gap between hulls
+            A, B = P[t <= mid + ov], P[t >= mid - ov]
+            if len(A) < 8 or len(B) < 8:
+                return [P]
+            whole = MeshHelpers._hull_volume(P)
+            if whole <= 0 or (MeshHelpers._hull_volume(A) + MeshHelpers._hull_volume(B)) >= 0.8 * whole:
+                return [P]
+            if depth == 0:
+                n_split += 1
+            return _split(A, depth + 1) + _split(B, depth + 1)
+
+        for pts in piece_points:
+            parts = _split(pts, 0)
+            out.extend(p.tolist() if hasattr(p, 'tolist') else p for p in parts)
+        if len(out) > max_total:
+            return piece_points, 0
+        return out, n_split
+
+    @staticmethod
+    def _plants_only(groups, cobj=None):
+        """Point arrays of the pieces that should get a hull, or None when nothing is dropped or merged.
+        See the 1b) comment in _collision_piece_points."""
+        import numpy as np
+        groups = [np.asarray(g, dtype=float) for g in groups]
+        if len(groups) <= 1:
+            return None
+        lo = np.array([g.min(0) for g in groups])
+        hi = np.array([g.max(0) for g in groups])
+        ht = hi[:, 2] - lo[:, 2]
+
+        def _xy_gap(a, b):
+            d = np.maximum(0.0, np.maximum(lo[a, :2] - hi[b, :2], lo[b, :2] - hi[a, :2]))
+            return float(np.hypot(*d))
+
+        floating = set()
+        for i in range(len(groups)):
+            for j in range(len(groups)):
+                if i != j and ht[j] > ht[i] and lo[i, 2] > lo[j, 2] + 0.25 * ht[j] \
+                        and _xy_gap(i, j) <= 0.5 * ht[j]:
+                    floating.add(i)
+                    break
+        grounded = sorted((i for i in range(len(groups)) if i not in floating), key=lambda i: -ht[i])
+        if not grounded:
+            return None
+        # 48 game units; a model imported in metres (whole model under 20
+        # units tall) is ~70x smaller (1 m = 69.99 game units)
+        unit = 1.0 if float(hi[:, 2].max() - lo[:, 2].min()) >= 20.0 else 1.0 / 69.99
+        floor = max(48.0 * unit, 0.2 * float(ht[grounded[0]]))
+        plants, members = [], {}
+        for i in grounded:
+            host = None
+            for p in plants:
+                overlap = np.all(lo[i, :2] <= hi[p, :2]) and np.all(hi[i, :2] >= lo[p, :2])
+                if overlap and ht[i] <= 0.5 * ht[p]:
+                    host = p
+                    break
+            if host is not None:
+                members[host].append(i)
+            elif ht[i] >= floor:
+                plants.append(i)
+                members[i] = [i]
+        if not plants or (len(plants) == len(groups)):
+            return None
+        if cobj is not None:
+            cobj["fo4_collision_foliage_dropped"] = len(groups) - sum(len(m) for m in members.values())
+        return [np.vstack([groups[k] for k in members[p]]) for p in plants]
 
     @staticmethod
     def _is_tree_like(obj, collision_type=None):
@@ -1601,6 +2131,27 @@ class MeshHelpers:
         # skip types that shouldn't have collision
         if collision_type in ('NONE', 'GRASS', 'MUSHROOM'):
             return None
+
+        # A new skin dropped over a model that already has its own collision
+        # (a vanilla building: walls, door openings, NavCut boxes). One closed
+        # hull round the skin sealed every door of GSShackMetalPrefabCompleteLg01
+        # (2026-11-16). Leave the existing collision alone instead.
+        _inside = MeshHelpers._existing_collision_inside(obj)
+        _skin_pieces = None
+        if _inside:
+            # Skin over a building (own case, 2026-11-16, confirmed in game on
+            # GSShackMetalPrefabCompleteLg01): the building keeps its collision;
+            # the skin gets small hulls outside the walls, doorways kept clear.
+            _skin_pieces, _skin_report, _old_shells = MeshHelpers._skin_over_building_pieces(obj, _inside)
+            obj["fo4_collision_skin_report"] = _skin_report
+            if not _skin_pieces:
+                obj["fo4_collision_skipped"] = _skin_report
+                raise MeshHelpers.CollisionNotAdded(
+                    f"'{obj.name}' covers a building that has its own collision. {_skin_report} "
+                    "No collision was added, so no door can be sealed; the building's collision is kept "
+                    "(it is put back exactly on export).")
+            for _sh in _old_shells:                 # an old single hull round the whole skin seals the doors
+                bpy.data.objects.remove(_sh, do_unlink=True)
 
         # pick a default simplification if not specified
         if simplify_ratio is None:
@@ -1681,11 +2232,38 @@ class MeshHelpers:
         # object) gets one hull per clump, not one hull around all of them.
         # Each extra piece is its own UCX_<name>_NN child; the exporter gives
         # every piece its own collision node + physics system.
-        try:
-            piece_points = MeshHelpers._collision_piece_points(collision_obj)
-        except Exception as exc:
-            print(f"[FO4 Add-on] collision piece split skipped: {exc}")
-            piece_points = None
+        if _skin_pieces:
+            # points are world space; the collision copy keeps only its location
+            _loc = collision_obj.matrix_world.translation
+            piece_points = [[(p[0] - _loc.x, p[1] - _loc.y, p[2] - _loc.z) for p in pc] for pc in _skin_pieces]
+            obj["fo4_collision_pieces"] = len(piece_points)
+        else:
+            try:
+                piece_points = MeshHelpers._collision_piece_points(collision_obj)
+            except Exception as exc:
+                print(f"[FO4 Add-on] collision piece split skipped: {exc}")
+                piece_points = None
+        # Mushrooms: a hull per clump still fills the space under each cap, so
+        # a big mushroom gets one hull for its stem and one for its cap
+        # (GSFungs01, 2026-11-14: 12 mushrooms in one hull -> 24 hulls; the
+        # player walks between them and under the caps). Vanilla's big fungal
+        # trees use mesh collision for the same reason, which PyNifly cannot
+        # write safely (empty search tree crashes the Creation Kit).
+        if not _skin_pieces and MeshHelpers._is_mushroom_like(obj):
+            try:
+                # every separate piece on its own: the clump merge above joins mushrooms
+                # whose boxes overlap, and a merged group of stems cannot be split
+                base = MeshHelpers._raw_islands(collision_obj) or [[tuple(v.co) for v in collision_obj.data.vertices]]
+                # same plant rule as above: no hulls on caps' loose bits, foliage or tiny stalks
+                plants = MeshHelpers._plants_only(base, collision_obj)
+                if plants is not None:
+                    base = [p.tolist() for p in plants]
+                split, n_split = MeshHelpers._mushroom_split(base)
+                if n_split:
+                    piece_points = split
+                    obj["fo4_collision_mushrooms"] = n_split
+            except Exception as exc:
+                print(f"[FO4 Add-on] mushroom stem/cap split skipped: {exc}")
         # A tree that is one piece (trunk and leaves fused, typical of AI-made
         # trees) would get one hull over the whole canopy: an invisible wall
         # around the leaves. Vanilla trees collide with the woody parts only
@@ -1699,6 +2277,15 @@ class MeshHelpers:
             except Exception as exc:
                 print(f"[FO4 Add-on] tree core collision skipped: {exc}")
                 piece_points = None
+        # arching roots / curled pieces lying on the ground: shorter hulls along them (2026-11-17)
+        if piece_points and not _skin_pieces:
+            try:
+                _pp, _n_arch = MeshHelpers._split_arched_pieces(piece_points)
+                if _n_arch:
+                    piece_points = _pp
+                    obj["fo4_collision_arched_split"] = _n_arch
+            except Exception as exc:
+                print(f"[FO4 Add-on] arched piece split skipped: {exc}")
         hull_objs = [collision_obj]
         if piece_points:
             for k in range(1, 100):

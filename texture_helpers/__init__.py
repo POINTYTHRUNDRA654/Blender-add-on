@@ -316,39 +316,31 @@ class TextureHelpers:
 
     @staticmethod
     def _ensure_texture_in_data_folder(obj, texture_path):
-        """Copy *texture_path* into ``Data\\Textures\\<Category>\\<asset name>\\``
-        under the user's configured FO4 Data folder (the category subfolder
-        is derived from the object's ``fo4_mesh_type``), returning the
-        copied file's absolute path -- or the original path unchanged if no
-        Data folder is configured, the source is already inside one, or the
-        copy fails for any reason (never blocks the install over this).
+        """Copy *texture_path* into
+        ``Downloads\\FO4 Add-on Textures\\Textures\\<Category>\\<asset name>\\``
+        (the category subfolder is derived from the object's
+        ``fo4_mesh_type``), returning the copied file's absolute path -- or
+        the original path unchanged if the source already lives in a
+        ``Data\\Textures`` tree or the copy fails for any reason (never
+        blocks the install over this). The configured game Data folder is
+        never written to.
         """
-        try:
-            from . import preferences as _prefs_mod
-        except ImportError:
-            from .. import preferences as _prefs_mod
-
         norm_src = os.path.normpath(texture_path)
         if "\\data\\textures\\" in norm_src.lower() or "/data/textures/" in norm_src.lower():
             return texture_path  # already living in a Data\Textures tree
 
-        data_root = None
-        try:
-            p = _prefs_mod.get_preferences()
-            data_root = (getattr(p, "fo4_game_data_path", "") or "") if p else ""
-        except Exception:
-            pass
-        if not data_root:
-            try:
-                data_root = _prefs_mod.get_fo4_assets_path() or ""
-            except Exception:
-                data_root = ""
-        if not data_root:
-            return texture_path  # nothing configured -- best effort, unchanged
+        # Copies go to Downloads\FO4 Add-on Textures\Textures\<Category>\<asset>\,
+        # never into the configured game Data folder. That folder is the
+        # read-only reference copy of the game (an unpacked game folder);
+        # copying into it left add-on texture folders inside the vanilla files
+        # (Textures\Armor\geometry_0, Sphere, L2_gsfungusstock04_1 ...,
+        # moved out 2026-11-14). In Downloads they are easy to look at, copy
+        # into a mod and delete.
+        data_root = os.path.join(os.path.expanduser("~"), "Downloads", "FO4 Add-on Textures")
 
         asset_name = TextureHelpers._sanitize_folder_name(obj.name)
         category_folder = TextureHelpers._texture_category_folder(obj)
-        dest_dir = os.path.join(bpy.path.abspath(data_root), "Textures", category_folder, asset_name)
+        dest_dir = os.path.join(data_root, "Textures", category_folder, asset_name)
         dest_path = os.path.join(dest_dir, os.path.basename(texture_path))
 
         if os.path.normcase(os.path.normpath(dest_path)) == os.path.normcase(norm_src):

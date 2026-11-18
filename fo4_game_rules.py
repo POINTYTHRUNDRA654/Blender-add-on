@@ -257,11 +257,6 @@ def check_bgsm_textures(data, roots, label=""):
 
 # ── 3. Exported NIF vs its BGSM ──────────────────────────────────────────────
 
-_FLAG_PAIRS = (("TREE_ANIM", 2, "tree"), ("DOUBLE_SIDED", 2, "two_sided"), ("GLOW_MAP", 2, "glowmap"),
-               ("ENVIRONMENT_MAPPING", 1, "environment_mapping"), ("DECAL", 1, "decal"), ("HAIR", 1, "hair"),
-               ("SKIN_TINT", 1, "skin_tint"), ("GREYSCALETOPALETTE_COLOR", 1, "grayscale_to_palette_color"),
-               ("CAST_SHADOWS", 1, "cast_shadows"), ("ZBUFFER_WRITE", 2, "z_buffer_write"))
-
 
 def _pyn():
     try:
@@ -270,6 +265,108 @@ def _pyn():
         return pynifly, ShaderFlags1FO4, ShaderFlags2FO4
     except Exception:
         return None, None, None
+
+
+def _raw_shape_flags(nif_path):
+    """{shape name: (shader flags 1, shader flags 2, has vertex colours)} read
+    from the file's own bytes. PyNifly fills a shader's properties from its
+    BGSM when it finds one (GSFungusStock04, 2026-11-13: the file said
+    Tree_Anim on, PyNifly reported the BGSM's Tree off), so comparing PyNifly's
+    flags with the BGSM compared the material with itself and never found a
+    mismatch. Returns {} for anything that is not a FO4 (BS stream 130) NIF."""
+    try:
+        try:
+            from . import nif_roundtrip as _nrt
+        except ImportError:
+            import nif_roundtrip as _nrt
+        with open(nif_path, "rb") as fh:
+            data = fh.read()
+        o = data.index(b'\n') + 1
+        if struct.unpack_from('<I', data, o + 13)[0] != 130:
+            return {}
+        strings = _nrt._header_strings(data)
+        types, offsets, _sizes = _nrt._block_layout(data)
+    except Exception:
+        return {}
+    out = {}
+    for t, off in zip(types, offsets):
+        if t not in ("BSTriShape", "BSMeshLODTriShape", "BSSubIndexTriShape", "BSDynamicTriShape"):
+            continue
+        try:
+            name_i, n_extra = struct.unpack_from('<iI', data, off)
+            q = off + 8 + 4 * n_extra + 4 + 4 + 52 + 4 + 16     # NiAVObject + bounding sphere
+            _skin, shader, _alpha = struct.unpack_from('<iii', data, q)
+            vdesc = struct.unpack_from('<Q', data, q + 12)[0]
+            if not (0 <= shader < len(types)) or types[shader] != "BSLightingShaderProperty":
+                continue
+            s_off = offsets[shader]
+            s_extra = struct.unpack_from('<I', data, s_off + 8)[0]
+            f1, f2 = struct.unpack_from('<II', data, s_off + 16 + 4 * s_extra)
+            name = strings[name_i] if 0 <= name_i < len(strings) else ""
+            out[name] = (f1, f2, bool(((vdesc >> 44) & 0xFFF) & 0x20))
+        except struct.error:
+            continue
+    return out
+
+
+def _raw_structure_findings(nif_path):
+    """Node layout checks read from the file's bytes (FO4 only).
+
+    Scan of 17,153 vanilla meshes (Landscape, SetDressing, Architecture, all
+    DLC; 2026-11-13): BSXFlags on a node other than the root 0 times, a
+    BSLeafAnimNode (wind node) other than the root 0 times, collision on a
+    scaled child node once in 14,604 (a root). Billy's GSFungusStock04 had
+    BSXFlags and its main collision on an inner node under a new wind root
+    (walk-through collision in game) and GlowingSeaAshMound01, assembled from
+    several meshes, had 3 inner BSXFlags and 4 nested wind nodes (froze the
+    game; which of them did it is not proven)."""
+    out = []
+    try:
+        try:
+            from . import nif_roundtrip as _nrt
+        except ImportError:
+            import nif_roundtrip as _nrt
+        with open(nif_path, "rb") as fh:
+            data = fh.read()
+        o = data.index(b'\n') + 1
+        if struct.unpack_from('<I', data, o + 13)[0] != 130:
+            return out
+        strings = _nrt._header_strings(data)
+        types, offsets, _sizes = _nrt._block_layout(data)
+    except Exception:
+        return out
+    nodes = ("NiNode", "BSFadeNode", "BSLeafAnimNode", "BSOrderedNode", "BSMultiBoundNode")
+    inner_bsx, inner_leaf, root_bsx, any_coll = [], [], False, False
+    for i, (t, off) in enumerate(zip(types, offsets)):
+        if t not in nodes:
+            continue
+        try:
+            name_i, ne = struct.unpack_from('<iI', data, off)
+            extras = struct.unpack_from(f'<{ne}i', data, off + 8)
+            coll = struct.unpack_from('<i', data, off + 8 + 4 * ne + 8 + 52)[0]
+        except struct.error:
+            continue
+        name = strings[name_i] if 0 <= name_i < len(strings) else f"block {i}"
+        has_bsx = any(0 <= e < len(types) and types[e] == "BSXFlags" for e in extras)
+        any_coll = any_coll or coll >= 0
+        if i == 0:
+            root_bsx = has_bsx
+            continue
+        if has_bsx:
+            inner_bsx.append(name)
+        if t == "BSLeafAnimNode":
+            inner_leaf.append(name)
+    if inner_bsx:
+        out.append((WARN, f"BSXFlags on node(s) other than the root: {', '.join(inner_bsx[:4])}. The game reads "
+                    "BSXFlags from the root; no vanilla mesh (0 of 17,153) has it anywhere else. Seen with "
+                    "collision you can walk through and with a mesh that froze the game."))
+    if any_coll and not root_bsx:
+        out.append((WARN, "The file has collision but the root has no BSXFlags (every vanilla tree with "
+                    "collision has BSXFlags on its root), so the game may not use the collision."))
+    if inner_leaf:
+        out.append((WARN, f"Wind node (BSLeafAnimNode) below the root: {', '.join(inner_leaf[:4])}. No vanilla "
+                    "mesh (0 of 17,153) nests one; make the root the wind node and these plain NiNodes."))
+    return out
 
 
 def data_roots_for(path):
@@ -315,15 +412,19 @@ def check_nif(nif_path, read_bgsm=None):
     except Exception as exc:
         return [(ERROR, f"{os.path.basename(nif_path)} could not be opened as a NIF ({exc}).")]
     roots = data_roots_for(nif_path)
-    out, seen_mats = [], set()
+    raw = _raw_shape_flags(nif_path)
+    out, seen_mats = _raw_structure_findings(nif_path), set()
     for s in nif.shapes:
         sh = s.shader
         if sh is None:
             continue
         label = s.name
-        pr = sh.properties
-        f1, f2 = int(getattr(pr, "Shader_Flags_1", 0)), int(getattr(pr, "Shader_Flags_2", 0))
-        has_vc = bool(getattr(s.properties, "hasVertexColors", 0))
+        if label in raw:
+            f1, f2, has_vc = raw[label]
+        else:
+            pr = sh.properties
+            f1, f2 = int(getattr(pr, "Shader_Flags_1", 0)), int(getattr(pr, "Shader_Flags_2", 0))
+            has_vc = bool(getattr(s.properties, "hasVertexColors", 0))
         if sh.blockname == "BSLightingShaderProperty" and SF2 is not None and f2 & SF2.TREE_ANIM and not has_vc:
             out.append((WARN, f"{label}: wind (Tree_Anim) is on but the shape has no vertex colours, so "
                         "nothing tells the wind how far each vertex moves. 94% of vanilla wind shapes "
@@ -344,18 +445,43 @@ def check_nif(nif_path, read_bgsm=None):
                 bd = read_bgsm(fh.read())
         except Exception:
             continue
-        for flag, which, field in _FLAG_PAIRS:
-            enum = SF1 if which == 1 else SF2
-            bit = getattr(enum, flag, None) if enum is not None else None
-            if bit is None:
-                continue
-            in_nif = bool((f1 if which == 1 else f2) & bit)
-            in_bgsm = _on(bd, field)
-            if in_nif != in_bgsm:
-                n = _D.NIF_VS_BGSM.get(flag, {}).get("both")
-                out.append((WARN, f"{label}: {flag} is {'on' if in_nif else 'off'} in the NIF but "
-                            f"{field} is {'on' if in_bgsm else 'off'} in {os.path.basename(mpath)}. In vanilla "
-                            f"the two always agree{f' ({n} shapes, 0 differ)' if n else ''}."))
+        # With a BGSM the game uses the material's flags; the NIF's copy is a
+        # leftover that vanilla often lets drift (NIF_VS_BGSM, raw scan), so a
+        # difference is only reported where it shows a real conflict: the NIF
+        # was set up for wind and the material has Tree off.
+        if SF2 is not None and f2 & SF2.TREE_ANIM and not _on(bd, "tree"):
+            st = _D.NIF_VS_BGSM.get("TREE_ANIM", {})
+            out.append((WARN, f"{label}: the NIF has wind (Tree_Anim) on but {os.path.basename(mpath)} has Tree "
+                        f"off. The game uses the material, so this shape does not sway. Vanilla has this in "
+                        f"{st.get('nif_only', 2)} of {st.get('pairs', 1099964):,} shape/material pairs."))
+        # Vertex alpha is wind sway only when the material's Tree flag is on;
+        # otherwise the game multiplies it into the texture alpha, and with
+        # alpha test on every pixel under the cut disappears. Seen in game
+        # 2026-11-13: a fused one-piece tree with wind weights in vertex alpha
+        # and a Tree-off material lost its whole trunk (6,260 of 15,500
+        # vertices under the cut) while the canopy floated.
+        # Only where the NIF says wind: vanilla also cuts shapes away with
+        # vertex alpha on purpose (hairlines, Diamond City edge trims, cliff
+        # edges), which must not be reported. The Blender-side check catches
+        # a mesh with a Wind group and a Tree-off material before export.
+        # A shape with the NIF's Vertex_Alpha flag (SLSF1 bit 3) asks for
+        # vertex-alpha transparency on purpose: vanilla Thistle01.nif's
+        # harvested state (Thistle02Picked) hides 427 of 437 vertices that way.
+        if (has_vc and SF2 is not None and f2 & SF2.TREE_ANIM and not f1 & (1 << 3)
+                and not _on(bd, "tree") and _on(bd, "alpha_test")):
+            try:
+                cols = s.colors or []
+            except Exception:
+                cols = []
+            ref = int(getattr(bd, "alpha_test_ref", 128) or 0)
+            n_cut = sum(1 for c in cols if len(c) > 3 and c[3] < ref / 255.0)
+            if n_cut:
+                out.append((ERROR,
+                            f"{label}: {n_cut} of {len(cols)} vertices ({100.0 * n_cut / len(cols):.0f}%) have "
+                            f"vertex alpha (the wind sway) under the alpha-test cut ({ref}) and "
+                            f"{os.path.basename(mpath)} has Tree off, so the game reads that alpha as "
+                            "transparency: those parts are INVISIBLE in game. Give the shape a material with "
+                            "Tree on (its own _Wind.bgsm if the material is shared with other meshes)."))
         if mpath.lower() not in seen_mats:
             seen_mats.add(mpath.lower())
             mlabel = os.path.basename(mpath)

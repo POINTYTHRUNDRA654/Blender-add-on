@@ -496,6 +496,34 @@ def reduce_lod_shell(prev_obj, lod_name: str, target_tris: int) -> "tuple[object
                      f"(reduced from {prev_obj.name}'s shell)")
 
 
+def name_original_lod_materials(lod_objects, rel_dir: str, fallback: str) -> None:
+    """One LOD material per SOURCE material, shared by every LOD level and every
+    model using that material, like vanilla's ElmTrunksLOD / ElmBranchesLOD:
+    Materials\\LOD\\<source material's folder>\\<SourceName>LOD.bgsm, pointing at
+    the shrunk textures. Built from the source .bgsm (alpha test etc. kept);
+    is_lod export turns tree/glow off. Spaces are dropped from the name (a source
+    called 'GSBush06 .1.bgsm' gives 'GSBush06.1LOD.bgsm')."""
+    for lod_obj in lod_objects:
+        for _slot in lod_obj.material_slots:
+            _m = _slot.material
+            if _m is None or _m.get("fo4_lod_material"):
+                continue
+            _src = str(_m.get("BSLSP_Shader_Name") or "")
+            _pp = [p for p in re.split(r"[\\/]+", _src) if p]
+            if _src.lower().endswith(".bgsm") and len(_pp) >= 2 and _pp[0].lower() == "materials":
+                _mdir = "\\".join(_pp[1:-1])
+                _stem = os.path.splitext(_pp[-1])[0]
+            else:
+                _mdir = rel_dir
+                _stem = re.sub(r"[^A-Za-z0-9_]+", "_", _m.name.split(".")[0]) or fallback
+            _stem = re.sub(r"\s+", "", _stem)
+            if _stem.lower().endswith("_wind"):
+                _stem = _stem[:-5]
+            _m["BSLSP_Shader_Name"] = ("materials\\LOD\\" + (_mdir + "\\" if _mdir else "")
+                                       + _stem + "LOD.bgsm")
+            _m["fo4_lod_material"] = True
+
+
 def split_lod_by_material(lod_obj) -> list:
     """Split *lod_obj* into one object per used material (each keeping only
     its own slot), named <lod>_<material>, for a one-shape-per-texture NIF."""
@@ -1811,6 +1839,13 @@ class FO4_OT_GenerateLODs(Operator):
             ('BAKE', "One Baked Texture",
              "Bake the whole model onto one new texture per LOD level (fewer files; "
              "a texture that tiles many times gets squeezed and looks noisier)"),
+            ('TREE', "Tree: Trunk + Leaf Cards (like vanilla)",
+             "For trees with leaves, built like Bethesda's pre-war tree LODs: _LOD_0 and "
+             "_LOD_1 are the trunk plus leaf cards on the tree's OWN textures shrunk to "
+             "the LOD Texture Size (bark keeps its UVs, the cards are a selection of the "
+             "tree's real leaf cards), _LOD_2 a crossed billboard picture. A tree whose "
+             "leaves are part of its mesh (no leaf-card material) gets rendered cards "
+             "instead; run Tree Tools > Replace Leaves with Leaf Cards first"),
         ],
         default='ORIGINAL',
     )
@@ -1888,6 +1923,15 @@ class FO4_OT_GenerateLODs(Operator):
         if obj and obj.type == 'MESH':
             src_class = FO4_OT_GenerateLODs._detect_source_class(obj)
             self.detected_source_class = src_class
+            # A leafy tree gets vanilla's trunk + leaf cards LODs by default
+            # (decimating one shredded its leaves, GSFungusStock04 2026-11-13).
+            try:
+                from . import tree_lod as _tl
+                # not gated on the class: GSFungusStock04 detects as STATIC
+                if src_class not in _SKINNED_CLASSES and _tl.looks_like_tree(obj):
+                    self.lod_textures = 'TREE'
+            except Exception:
+                pass
 
             n_tris = sum(len(p.loop_indices) - 2 for p in obj.data.polygons)
             if self.merge_selected:
@@ -1972,6 +2016,11 @@ class FO4_OT_GenerateLODs(Operator):
         if self.lod_textures == 'ORIGINAL':
             layout.prop(self, "lod_tex_size")
             layout.label(text="Keeps each part's own UVs and textures (shape: Decimate)", icon='INFO')
+        elif self.lod_textures == 'TREE':
+            layout.label(text="_LOD_0/_LOD_1: trunk + leaf cards on the tree's own textures, shrunk",
+                         icon='INFO')
+            layout.label(text="_LOD_2: crossed billboard picture of the whole tree")
+            layout.prop(self, "lod_tex_size")
         else:
             layout.prop(self, "lod_method")
 
@@ -2183,6 +2232,23 @@ class FO4_OT_GenerateLODs(Operator):
                     "LOD decimation preview created but NIF export skipped. "
                     "Use PyNifly to generate skinned-mesh LODs with bone re-binding."
                 )
+
+            if self.lod_textures == 'TREE' and not is_skinned:
+                try:
+                    from . import tree_lod as _tl
+                    _made, _tsteps = _tl.generate_tree_lods(
+                        obj, base_name, [k for k, _r in lods_to_gen], mod_folder, _clean_subpath,
+                        export=bool(self.export_nifs and mod_folder), billboard=True,
+                        collection=lod_col, tex_size=int(self.lod_tex_size))
+                    steps.extend(_tsteps)
+                    total_lod_count += len(_made)
+                    if self.export_nifs and not mod_folder:
+                        steps.append("⚠ No Mod Output Folder: tree LODs built in the scene, not exported")
+                    steps.append("Tree LODs have no collision of their own; use the Collision button "
+                                 "on the full tree")
+                except Exception as e:
+                    self.report({'WARNING'}, f"Tree LOD failed for {obj.name}: {e}")
+                continue
 
             lod_objects = []
             last_shell = None
@@ -2442,30 +2508,7 @@ class FO4_OT_GenerateLODs(Operator):
                         max_size=int(self.lod_tex_size) if _original_mode else 0)
                     steps.append(tex_msg)
                 if _original_mode:
-                    # One LOD material per SOURCE material, shared by every LOD
-                    # level and every model using that material, like vanilla's
-                    # ElmTrunksLOD / ElmBranchesLOD: Materials\LOD\<source
-                    # material's folder>\<SourceName>LOD.bgsm, pointing at the
-                    # shrunk textures. Built from the source .bgsm (alpha test
-                    # etc. kept); is_lod export turns tree/glow off.
-                    for lod_obj in lod_objects:
-                        for _slot in lod_obj.material_slots:
-                            _m = _slot.material
-                            if _m is None or _m.get("fo4_lod_material"):
-                                continue
-                            _src = str(_m.get("BSLSP_Shader_Name") or "")
-                            _pp = [p for p in re.split(r"[\\/]+", _src) if p]
-                            if _src.lower().endswith(".bgsm") and len(_pp) >= 2 and _pp[0].lower() == "materials":
-                                _mdir = "\\".join(_pp[1:-1])
-                                _stem = os.path.splitext(_pp[-1])[0]
-                            else:
-                                _mdir = rel_dir
-                                _stem = re.sub(r"[^A-Za-z0-9_]+", "_", _m.name.split(".")[0]) or safe
-                            if _stem.lower().endswith("_wind"):
-                                _stem = _stem[:-5]
-                            _m["BSLSP_Shader_Name"] = ("materials\\LOD\\" + (_mdir + "\\" if _mdir else "")
-                                                       + _stem + "LOD.bgsm")
-                            _m["fo4_lod_material"] = True
+                    name_original_lod_materials(lod_objects, rel_dir, safe)
                 for lod_obj in (lod_objects if not _original_mode else []):
                     lod_key = lod_obj.get("fo4_lod_level", "LOD1")
                     base = f"{safe}LOD{int(lod_key[-1]) - 1}"

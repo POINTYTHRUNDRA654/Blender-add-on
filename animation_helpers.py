@@ -1073,10 +1073,26 @@ class AnimationHelpers:
                 par[a] = par[par[a]]
                 a = par[a]
             return a
+        adj = {}
+        edges = list(edges)
+        if AnimationHelpers.WIND_WELD_SEAMS and n:
+            # A NIF mesh is cut at every UV seam: vertices on the same spot are
+            # one surface, so a leaf cut by a seam stays one piece.
+            _P = _np.asarray(coords, dtype=float)
+            _tol = max(float(_np.ptp(_P, axis=0).max()) * 1e-5, 1e-7)
+            _key = _np.round(_P / _tol).astype(_np.int64)
+            _, _inv = _np.unique(_key, axis=0, return_inverse=True)
+            _first = {}
+            for i, g in enumerate(_inv.ravel()):
+                j = _first.setdefault(int(g), i)
+                if j != i:
+                    edges.append((j, i))
         for a, b in edges:
             ra, rb = find(a), find(b)
             if ra != rb:
                 par[ra] = rb
+            adj.setdefault(int(a), []).append(int(b))
+            adj.setdefault(int(b), []).append(int(a))
         islands = {}
         for i in range(n):
             islands.setdefault(find(i), []).append(i)
@@ -1084,14 +1100,35 @@ class AnimationHelpers:
         H = _np.asarray(height_w, dtype=float)
         RH = _np.asarray(raw_height if raw_height is not None else height_w, dtype=float)
         out = _np.zeros(n)
-        for ids in islands.values():
-            ids = _np.asarray(ids)
+        isl = [_np.asarray(ids) for ids in islands.values()]
+        # Pieces resting on other pieces (vanilla scan 2026-11-13, 207 tree and
+        # plant NIFs): a piece touching a lower piece starts at that piece's
+        # wind where they meet (88% within 25 of 255; only 5% restart at 0),
+        # and a compact piece on top -- a flower head, fruit, bulb -- moves as
+        # one value, the support's (77% one value, 88% equal to the support).
+        # Restarting every piece at 0 made GSBush07's stalk sections, cone and
+        # bulb shear apart and the bulb stretch (0..186 inside it).
+        supports = AnimationHelpers._piece_supports(P, RH, isl) if profile != 'slice' else {}
+        compact = []
+        for ids in isl:
+            if len(ids) < 4:
+                compact.append(False)
+                continue
+            ev = _np.sqrt(_np.maximum(_np.linalg.eigvalsh(_np.cov((P[ids] - P[ids].mean(axis=0)).T)), 0.0))
+            compact.append(bool(ev[-1] > 0 and ev[0] / ev[-1] > 0.35))
+        order = sorted(range(len(isl)), key=lambda k: float(RH[isl[k]].mean()))
+        for k in order:
+            ids = isl[k]
             pts = P[ids]
-            if anchor_low and float(RH[ids].max()) < 0.5:
+            s0, contact = 0.0, None
+            if supports.get(k):
+                best = AnimationHelpers._pick_support(supports[k], out, compact)
+                s0, contact = float(out[best[1]].mean()), best[2]
+            if anchor_low and float(RH[ids].max()) < 0.5 and s0 < 0.02:
                 out[ids] = 0.0                     # stays in the bottom half: anchored
                 continue
             if len(ids) < 3:
-                out[ids] = H[ids].mean() * max_weight
+                out[ids] = max(H[ids].mean() * max_weight, s0)
                 continue
             c = pts.mean(axis=0)
             cov = _np.cov((pts - c).T)
@@ -1099,8 +1136,14 @@ class AnimationHelpers:
             main = vecs[:, -1]
             ext = _np.sqrt(_np.maximum(vals, 0.0))
             flatness = ext[0] / ext[-1] if ext[-1] > 0 else 0.0
+            if contact is not None and not AnimationHelpers.STACK_CHAIN_LONG and not (
+                    flatness > 0.35 and AnimationHelpers.STACK_COMPACT_RIGID):
+                s0, contact = 0.0, None             # long piece: painted as before
+                if anchor_low and float(RH[ids].max()) < 0.5:
+                    out[ids] = 0.0
+                    continue
             reach = float(H[ids].max())            # how far up the plant it goes
-            reach *= max_weight
+            reach = max(reach * max_weight, s0)
             s = (pts - c) @ main
             if flatness < 0.05 and profile != 'slice':   # flat card: one value
                 out[ids] = reach
@@ -1113,19 +1156,187 @@ class AnimationHelpers:
                 coef, *_ = _np.linalg.lstsq(A, H[ids], rcond=None)
                 out[ids] = _np.clip(A @ coef, 0.0, 1.0) * max_weight
                 continue
+            if contact is not None and flatness > 0.35 and AnimationHelpers.STACK_COMPACT_RIGID:
+                # Compact piece on another (head, fruit, bulb, a cone holding
+                # a bulb): rides as one, or its rim and what sits on it part.
+                out[ids] = s0
+                continue
             lo, hi = s.min(), s.max()
             if hi - lo < 1e-9:
                 out[ids] = reach
                 continue
-            # Root = the end that sits lower on the plant.
-            lo_end = H[ids][s <= lo + 0.2 * (hi - lo)].mean()
-            hi_end = H[ids][s >= hi - 0.2 * (hi - lo)].mean()
             t = (s - lo) / (hi - lo)
-            if lo_end > hi_end:
-                t = 1.0 - t
+            if contact is not None:
+                # Root = the end where it rests on the piece below.
+                sc = float(((P[contact] - c) @ main).mean())
+                if abs(sc - lo) > abs(sc - hi):
+                    t = 1.0 - t
+            else:
+                # Root = the end that sits lower on the plant.
+                lo_end = H[ids][s <= lo + 0.2 * (hi - lo)].mean()
+                hi_end = H[ids][s >= hi - 0.2 * (hi - lo)].mean()
+                if lo_end > hi_end:
+                    t = 1.0 - t
+            # A curved piece (an antenna, a hooked stalk) measured along a
+            # straight axis gets different values on its inner and outer side,
+            # so it swells as it sways (GSBush02's antennas, 2026-11-15: 0.09-
+            # 0.18 across the stalk). Measure along the piece itself instead:
+            # distance over its surface from the root end.
+            # Only for pieces that really curve (path over the surface at least
+            # CURVED_RATIO x their straight length): on all pieces it moved the
+            # painting further from Bethesda's own on 13 of 23 vanilla shapes,
+            # mostly straight pine branches (2026-11-15).
+            if AnimationHelpers.WIND_ALONG_SURFACE and len(ids) >= 8:
+                root = ids[t <= 0.05] if (t <= 0.05).any() else ids[[int(_np.argmin(t))]]
+                g = AnimationHelpers._surface_distance(P, adj, ids, root)
+                if g is not None and float(g.max()) > AnimationHelpers.CURVED_RATIO * float(hi - lo):
+                    t = g / float(g.max())
             t = _np.clip(t, 0.0, 1.0) ** float(curve)
-            out[ids] = t * reach
+            out[ids] = s0 + t * (reach - s0)
+        # Small pieces cannot bend: a 9-unit stalk under a pollen stud painted
+        # 0 -> 0.51 inside itself stretches and squashes every gust, and the
+        # stud on it seems to grow and shrink (GSBush04, 2026-11-15); an
+        # antenna ball with its own 0 -> 0.49 ramp swells (GSBush02). Every
+        # piece under SMALL_PIECE of the plant's size rides as ONE value: the
+        # wind of the nearest bigger piece where it is attached (vanilla:
+        # compact pieces on a support carry one value, 77%, equal to the
+        # support's, 88%).
+        if AnimationHelpers.SMALL_PIECE_RIGID and len(isl) > 1:
+            plant = float(_np.ptp(P, axis=0).max()) or 1.0
+            ext_all = [float(_np.ptp(P[ids], axis=0).max()) for ids in isl]
+            small = [e < AnimationHelpers.SMALL_PIECE * plant for e in ext_all]
+            big_ids = _np.concatenate([isl[k] for k in range(len(isl)) if not small[k]]) \
+                if not all(small) else None
+            if big_ids is not None and len(big_ids):
+                BP = P[big_ids]
+                for k, ids in enumerate(isl):
+                    if not small[k]:
+                        continue
+                    d = _np.linalg.norm(BP[None, :, :] - P[ids][:, None, :], axis=2) if len(ids) * len(BP) < 4e6 \
+                        else None
+                    if d is None:
+                        c = P[ids].mean(axis=0)
+                        j = int(_np.argmin(_np.linalg.norm(BP - c, axis=1)))
+                    else:
+                        j = int(_np.unravel_index(_np.argmin(d), d.shape)[1])
+                    out[ids] = out[big_ids[j]]
         return out.tolist()
+
+    # Wind on small pieces and along curved pieces (2026-11-15; see the end of
+    # _wind_weights_per_piece).
+    SMALL_PIECE = 0.06
+    SMALL_PIECE_RIGID = True
+    WIND_ALONG_SURFACE = True
+    WIND_WELD_SEAMS = True
+    CURVED_RATIO = 1.3
+
+    @staticmethod
+    def _surface_distance(P, adj, ids, root):
+        """Distance over the mesh (edge lengths) from the *root* vertices to every vertex of the piece *ids*."""
+        import heapq
+        import numpy as _np
+        pos = {int(v): i for i, v in enumerate(ids)}
+        dist = _np.full(len(ids), _np.inf)
+        heap = []
+        for r in root:
+            dist[pos[int(r)]] = 0.0
+            heap.append((0.0, int(r)))
+        heapq.heapify(heap)
+        while heap:
+            d, v = heapq.heappop(heap)
+            if d > dist[pos[v]]:
+                continue
+            for w in adj.get(v, ()):
+                if w not in pos:
+                    continue
+                nd = d + float(_np.linalg.norm(P[v] - P[w]))
+                if nd < dist[pos[w]]:
+                    dist[pos[w]] = nd
+                    heapq.heappush(heap, (nd, w))
+        if not _np.isfinite(dist).all():
+            return None
+        return dist
+
+    # How close a piece's base must be to another piece to count as resting
+    # on it, as a share of the plant's height (vanilla stacked pieces: gap 0
+    # to 2%; GSBush07's stalk sections, cone and bulb 0.7-1.6%).
+    SUPPORT_GAP = 0.025
+    SUPPORT_PICK = 'contact'
+    STACK_COMPACT_RIGID = True
+    # Starting long pieces (leaves, branches) at their support's value instead
+    # of 0 moved the add-on's painting FURTHER from Bethesda's own values on
+    # 17 of 23 vanilla wind shapes (mean 67.5 -> 72.2 of 255, 2026-11-13), so
+    # only compact pieces follow their support; long pieces start at 0 as before.
+    STACK_CHAIN_LONG = False
+
+    @staticmethod
+    def _pick_support(cands, out, compact=None):
+        """Which of the pieces it touches a piece follows: a compact one first
+        (a bulb sits in its cup, not on the leaf beside it -- GSBush07's bulb
+        followed a ribbon leaf and parted from its cone by 60/255), then the
+        one it touches most ('contact', like the vanilla scan's nearest piece)
+        or the stillest ('still')."""
+        first = (lambda c: bool(compact[c[0]])) if compact is not None else (lambda c: False)
+        if AnimationHelpers.SUPPORT_PICK == 'still':
+            return max(cands, key=lambda c: (first(c), -float(out[c[1]].mean())))
+        return max(cands, key=lambda c: (first(c), len(c[2]), -float(out[c[1]].mean())))
+
+    @staticmethod
+    def _piece_supports(P, RH, islands, gap_frac=None):
+        """{piece: [(lower piece, its vertices at the contact, this piece's
+        vertices at the contact), ...]} for every piece whose base (lowest 10%
+        of its height) touches a piece whose middle sits lower. Pieces on the
+        ground (base in the bottom 5% of the plant) rest on nothing."""
+        import numpy as _np
+        if len(islands) < 2:
+            return {}
+        gap_frac = AnimationHelpers.SUPPORT_GAP if gap_frac is None else gap_frac
+        size = float(_np.ptp(P, axis=0).max()) or 1.0
+        hspan = float(_np.ptp(RH)) or 1.0
+        gap = gap_frac * size * hspan if hspan <= 1.0 else gap_frac * size
+        owner = _np.empty(len(P), dtype=int)
+        mid = _np.empty(len(islands))
+        for k, ids in enumerate(islands):
+            owner[ids] = k
+            mid[k] = RH[ids].mean()
+        try:
+            from mathutils.kdtree import KDTree
+            kd = KDTree(len(P))
+            for i, co in enumerate(P):
+                kd.insert(tuple(co), i)
+            kd.balance()
+
+            def near(co):
+                return [(d, i) for (_c, i, d) in kd.find_range(tuple(co), gap)]
+        except ImportError:                         # outside Blender (tests)
+            def near(co):
+                d = _np.linalg.norm(P - co, axis=1)
+                hit = _np.nonzero(d <= gap)[0]
+                return [(float(d[i]), int(i)) for i in hit]
+        out = {}
+        for k, ids in enumerate(islands):
+            rh = RH[ids]
+            if float(rh.min()) < 0.05:
+                continue                            # on the ground
+            base = ids[rh <= rh.min() + 0.1 * (float(_np.ptp(rh)) or 1.0)]
+            found = {}
+            for v in base:
+                best = None
+                for d, i in near(P[v]):
+                    j = int(owner[i])
+                    if j == k or mid[j] >= mid[k]:
+                        continue
+                    if best is None or d < best[0]:
+                        best = (d, i, j)
+                if best is not None:
+                    _d, i, j = best
+                    f = found.setdefault(j, ([], []))
+                    f[0].append(i)
+                    f[1].append(int(v))
+            if found:
+                out[k] = [(j, _np.asarray(sorted(set(a))), _np.asarray(sorted(set(b))))
+                          for j, (a, b) in found.items()]
+        return out
 
     @staticmethod
     def _fused_tree_wind(mesh_obj, coords, edges):

@@ -12911,6 +12911,23 @@ class FO4_OT_CheckAgainstGame(Operator):
         if wind_mat and not obj.data.color_attributes:
             findings.append((gr.WARN, f"{obj.name}: a wind (tree) material but the mesh has no vertex colours; "
                              "run Vegetation Wind so the game knows how far each vertex moves."))
+        # Wind weights in vertex alpha with a Tree-off material: the game reads
+        # that alpha as transparency and alpha-tests the low-sway parts away
+        # (GSFungusStock04, 2026-11-13: the whole trunk vanished in game).
+        if (not wind_mat and obj.vertex_groups.get("Wind") is not None and not obj.get("fo4_no_wind")
+                and animation_helpers is not None):
+            try:
+                _alphas = list(animation_helpers._read_wind_color_alpha_per_vertex(obj).values())
+            except Exception:
+                _alphas = None
+            if _alphas:
+                _low = sum(1 for a in _alphas if a < 0.5)
+                if _low:
+                    findings.append((gr.ERROR, f"{obj.name}: has a Wind group and {_low} of {len(_alphas)} "
+                                     "vertices have vertex alpha under 0.5, but its material has Tree off, so the "
+                                     "game reads that alpha as transparency and those parts will be INVISIBLE. "
+                                     "Run Vegetation Wind again (it turns Tree on), or use 'Vertex Colors, No "
+                                     "Wind' if the plant should not sway."))
         if obj.get("fo4_last_export_nif") and os.path.isfile(obj["fo4_last_export_nif"]):
             findings += gr.check_nif(obj["fo4_last_export_nif"], read_bgsm=bh.read_bgsm)
 

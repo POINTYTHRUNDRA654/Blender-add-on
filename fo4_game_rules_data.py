@@ -2429,23 +2429,22 @@ SHADER_TYPE = {'Default': {'flags': ['OWN_EMIT', 'ZBUFFER_TEST', 'SPECULAR', 'ZB
                'skinned': 0.95,
                'vcolors': 0.04}}
 
-# NIF shader flag vs its BGSM field: shapes where both are on / only one side (vanilla).
-NIF_VS_BGSM = {'ALPHA_TEST': {'bgsm_only': 28064, 'both': 43, 'nif_only': 67},
- 'ANISOTROPIC_LIGHTING': {'bgsm_only': 0, 'both': 382, 'nif_only': 0},
- 'CAST_SHADOWS': {'bgsm_only': 0, 'both': 88949, 'nif_only': 0},
- 'DECAL': {'bgsm_only': 0, 'both': 10109, 'nif_only': 0},
- 'DOUBLE_SIDED': {'bgsm_only': 0, 'both': 9942, 'nif_only': 0},
- 'DYNAMIC_DECAL': {'bgsm_only': 2688, 'both': 3845, 'nif_only': 2776},
- 'ENVIRONMENT_MAPPING': {'bgsm_only': 0, 'both': 33028, 'nif_only': 0},
- 'EXTERNAL_EMITTANCE': {'bgsm_only': 0, 'both': 173, 'nif_only': 0},
- 'EYE_ENVIRONMENT_MAPPING': {'bgsm_only': 0, 'both': 69, 'nif_only': 0},
- 'FACE': {'bgsm_only': 53, 'both': 146, 'nif_only': 3},
- 'GLOW_MAP': {'bgsm_only': 0, 'both': 1696, 'nif_only': 0},
- 'GREYSCALETOPALETTE_COLOR': {'bgsm_only': 0, 'both': 6546, 'nif_only': 0},
- 'HAIR': {'bgsm_only': 0, 'both': 379, 'nif_only': 0},
- 'MODEL_SPACE_NORMALS': {'bgsm_only': 0, 'both': 0, 'nif_only': 0},
- 'REFRACTION': {'bgsm_only': 0, 'both': 1, 'nif_only': 0},
- 'SKIN_TINT': {'bgsm_only': 0, 'both': 475, 'nif_only': 0},
- 'TESSELLATE': {'bgsm_only': 0, 'both': 0, 'nif_only': 0},
- 'TREE_ANIM': {'bgsm_only': 0, 'both': 1345, 'nif_only': 0},
- 'ZBUFFER_WRITE': {'bgsm_only': 0, 'both': 96359, 'nif_only': 0}}
+# NIF shader flag (read from the file's bytes) vs its BGSM field, every
+# BSLightingShaderProperty with a .bgsm in the 224,214 vanilla NIFs (2026-11-13
+# raw scan). 'pairs' = shader/material pairs checked, 'nif_only' = flag on in
+# the NIF and off in the BGSM, 'bgsm_only' = the reverse. The game uses the
+# BGSM, and vanilla lets the NIF copy drift for every flag. (The table that
+# was here said "0 differ" for all of them: it was measured through PyNifly,
+# which fills a shader's flags from its BGSM, so it compared the BGSM with
+# itself.)
+NIF_VS_BGSM = {
+ 'TREE_ANIM': {'pairs': 1099964, 'nif_only': 2, 'bgsm_only': 3416},
+ 'DOUBLE_SIDED': {'pairs': 1099964, 'nif_only': 193, 'bgsm_only': 1874},
+ 'GLOW_MAP': {'pairs': 1099964, 'nif_only': 33, 'bgsm_only': 1982},
+ 'ENVIRONMENT_MAPPING': {'pairs': 1099964, 'nif_only': 241, 'bgsm_only': 9051},
+ 'DECAL': {'pairs': 1099964, 'nif_only': 1122, 'bgsm_only': 4539},
+ 'HAIR': {'pairs': 1099964, 'nif_only': 8399, 'bgsm_only': 379},
+ 'SKIN_TINT': {'pairs': 1099964, 'nif_only': 0, 'bgsm_only': 41},
+ 'GREYSCALETOPALETTE_COLOR': {'pairs': 1099964, 'nif_only': 45, 'bgsm_only': 2581},
+ 'CAST_SHADOWS': {'pairs': 1099964, 'nif_only': 574, 'bgsm_only': 25839},
+ 'ZBUFFER_WRITE': {'pairs': 1099964, 'nif_only': 10, 'bgsm_only': 0}}

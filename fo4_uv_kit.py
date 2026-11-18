@@ -843,6 +843,12 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
                               description="Hard Surface: cut where neighbouring faces bend more "
                                           "than this (degrees)")
     keep_seams: bpy.props.BoolProperty(name="Keep Existing Seams", default=True)
+    weld_first: bpy.props.BoolProperty(
+        name="Weld Import Cuts First", default=True,
+        description="Join vertices that sit on the same spot and drop loose vertices before "
+                    "unwrapping. A mesh imported from a NIF is cut apart at every old UV seam "
+                    "(an AI tree: 15,500 vertices in about 2,600 pieces), so without this every "
+                    "unwrap keeps those cuts. Also ignores the old seams")
     stretch_limit: FloatProperty(name="Stretch Limit", default=0.25, min=0.05, max=2.0,
                                  description="Islands stretching more than this get extra seams")
     margin_px: IntProperty(name="Margin (px)", default=8, min=1, max=64,
@@ -878,6 +884,16 @@ class FO4_OT_UVKitAutoUnwrap(Operator):
         organic = self.style == 'ORGANIC'
         bm = bmesh.new()
         bm.from_mesh(obj.data)
+        if self.weld_first:
+            loose = [v for v in bm.verts if not v.link_faces]
+            if loose:
+                bmesh.ops.delete(bm, geom=loose, context='VERTS')
+            size = max(obj.dimensions) / max(max(obj.scale), 1e-9) if obj.dimensions else 1.0
+            n0 = len(bm.verts)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=max(size * 1e-4, 1e-6))   # NIF positions are half floats: copies can differ by a hair
+            notes.append(f"welded import cuts ({n0 + len(loose)} -> {len(bm.verts)} vertices)")
+            for e in bm.edges:
+                e.seam = False
         if not self.keep_seams:
             for e in bm.edges:
                 e.seam = False
@@ -1313,6 +1329,7 @@ class FO4_PT_UVKitPanel(_FO4SubPanel):
         row.operator("fo4.uvkit_auto_unwrap", text="Fewest Islands", icon='UV_ISLANDSEL').style = 'ORGANIC'
         box.operator("fo4.uvkit_drape", text="Drape (2 big islands)", icon='MOD_CLOTH').axis = 'AUTO'
         box.operator("fo4.rebake_from_source", text="Re-bake from Source (after new UVs)", icon='RENDER_STILL')
+        box.operator("fo4.project_tiling_texture", text="Project Tiling Texture (bark) onto UVs", icon='IMAGE_DATA')
 
         box = layout.box()
         box.label(text="Preview", icon='UV')

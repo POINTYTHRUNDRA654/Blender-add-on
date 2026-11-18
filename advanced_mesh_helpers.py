@@ -154,25 +154,39 @@ class AdvancedMeshHelpers:
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
-        
+
+        # In Edit Mode obj.data.vertices holds the selection from when Edit Mode
+        # was entered, not the live one: reading it reported every vertex as
+        # "loose" (2026-11-16: "removed 43100 loose vertices" on a skin with 0
+        # loose, the same number on every click). Read the live edit mesh.
+        import bmesh as _bm
+
+        def _live_selected():
+            bm = _bm.from_edit_mesh(obj.data)
+            return sum(1 for v in bm.verts if v.select)
+
+        def _live_vert_count():
+            return len(_bm.from_edit_mesh(obj.data).verts)
+
         # Remove doubles (operator renamed in Blender 2.91; old name removed in 5.0)
         # Use try/except because bpy.ops proxies make hasattr() unreliable -
         # it returns True for any attribute, even unregistered operators.
+        verts_before = _live_vert_count()
         try:
             result = bpy.ops.mesh.merge_by_distance(threshold=0.0001)
         except AttributeError:
             result = bpy.ops.mesh.remove_doubles(threshold=0.0001)
-        if 'FINISHED' in result:
-            repairs['doubles_removed'] = 1
-        
+        merged = verts_before - _live_vert_count()
+        if 'FINISHED' in result and merged > 0:
+            repairs['doubles_removed'] = merged
+
         # Select non-manifold geometry
         bpy.ops.mesh.select_all(action='DESELECT')
         bpy.ops.mesh.select_non_manifold()
         # select_non_manifold() populates the selection but doesn't report a
-        # count directly -- read it back from the mesh so "fixed" reflects
-        # whether there was actually anything non-manifold to fix, instead of
-        # always claiming 1 regardless of outcome.
-        had_non_manifold = any(v.select for v in obj.data.vertices)
+        # count directly -- read it back from the live edit mesh so "fixed"
+        # reflects whether there was actually anything non-manifold to fix.
+        had_non_manifold = _live_selected() > 0
         if had_non_manifold:
             # fill_holes only closes actual holes (open boundary loops); it
             # can leave other non-manifold cases (e.g. interior/loose faces,
@@ -181,13 +195,13 @@ class AdvancedMeshHelpers:
             bpy.ops.mesh.fill_holes(sides=4)
             bpy.ops.mesh.select_all(action='DESELECT')
             bpy.ops.mesh.select_non_manifold()
-            still_non_manifold = any(v.select for v in obj.data.vertices)
+            still_non_manifold = _live_selected() > 0
             repairs['non_manifold_fixed'] = 1 if not still_non_manifold else 0
 
         # Select loose geometry
         bpy.ops.mesh.select_all(action='DESELECT')
         bpy.ops.mesh.select_loose()
-        num_selected = len([v for v in obj.data.vertices if v.select])
+        num_selected = _live_selected()
         if num_selected > 0:
             bpy.ops.mesh.delete(type='VERT')
             repairs['loose_verts_removed'] = num_selected
@@ -217,7 +231,8 @@ class AdvancedMeshHelpers:
         message = "Mesh repaired: "
         repair_list = []
         if repairs['doubles_removed']:
-            repair_list.append("removed doubles")
+            repair_list.append(f"joined {repairs['doubles_removed']} overlapping vertices (texture seams; "
+                               "export splits them again, so the count goes back up on re-import)")
         if repairs['loose_verts_removed']:
             repair_list.append(f"removed {repairs['loose_verts_removed']} loose vertices")
         if repairs['non_manifold_fixed']:

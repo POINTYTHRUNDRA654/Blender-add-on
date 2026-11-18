@@ -1610,6 +1610,24 @@ class ExportHelpers:
         Tree off gets its own <name>_Wind.bgsm (see
         bgsm_helpers.ensure_wind_material). Returns the notes for the report."""
         notes = []
+        # Added 2026-11-17 (GSFungusTree10 came out all black in game): a mesh that had no vertex colours and
+        # was given wind only through a VERTEX_ALPHA attribute is written by PyNifly with vertex-colour RGB
+        # 0,0,0 -- and the game multiplies the texture by it. Such a mesh gets a white "Col" layer first.
+        # Meshes that already have any other colour layer are not touched.
+        for o in objs:
+            try:
+                if getattr(o, "type", "") != 'MESH':
+                    continue
+                cas = o.data.color_attributes
+                if cas.get("VERTEX_ALPHA") is not None and all(c.name == "VERTEX_ALPHA" for c in cas):
+                    col = cas.new("Col", 'FLOAT_COLOR', 'POINT')
+                    for d in col.data:
+                        d.color = (1.0, 1.0, 1.0, 1.0)
+                    n = f"{o.name}: wind only, no vertex colours -> white colour layer added (else black in game)"
+                    notes.append(n)
+                    print(f"[FO4Export] {n}")
+            except Exception as exc:
+                print(f"[FO4Export] could not check vertex colours of {getattr(o, 'name', o)}: {exc}")
         try:
             from . import bgsm_helpers as _bh_w
         except Exception:
@@ -2144,6 +2162,22 @@ class ExportHelpers:
                         _tp_summary = _nrt.summarize(_nrt.patch_texture_set_paths(filepath))
                         if _tp_summary:
                             _roundtrip_note += f"  [{_tp_summary}]"
+                        _sf_summary = _nrt.summarize(_nrt.patch_zero_shape_flags(filepath))
+                        if _sf_summary:
+                            _roundtrip_note += f"  [{_sf_summary}]"
+                        _hp_summary = _nrt.summarize(_nrt.patch_convex_hull_planes(filepath))
+                        if _hp_summary:
+                            _roundtrip_note += f"  [{_hp_summary}]"
+                        _sc_summary = _nrt.summarize(_nrt.patch_scaled_collision_nodes(filepath))
+                        if _sc_summary:
+                            _roundtrip_note += f"  [{_sc_summary}]"
+                        # shared collision of the original (a building's walls +
+                        # NavCut bodies in one system) goes back exactly
+                        _rs_src = obj.get("fo4_source_nif")
+                        if _rs_src and os.path.isfile(str(_rs_src)):
+                            _rs_summary = _nrt.summarize(_nrt.patch_restore_shared_collision(filepath, str(_rs_src)))
+                            if _rs_summary:
+                                _roundtrip_note += f"  [{_rs_summary}]"
                     except Exception as _eme:
                         print(f"[FO4Export] Emissive colour / texture path patch skipped: {_eme}")
 
@@ -2661,6 +2695,15 @@ class ExportHelpers:
             if obj.type == 'MESH' and not ExportHelpers._is_collision_mesh(obj)
             and not obj.get("fo4_reference")
         ]
+        # Added 2026-11-17 (GSFungusTree04: 2 collision bodies came back as 4, one of them altered). Collision
+        # PyNifly imported from the NIF carries only PyNifly's own marker (pynRigidBody), so it fell through to
+        # the visible meshes above: it was "prepared" like one (transforms, placeholder UVs, triangulation) and
+        # each such object then looked for "its" collision -- with exactly two in a file, each found the other,
+        # and both were attached again next to the copies PyNifly writes itself. They now stay selected and
+        # scaled (PyNifly still writes them), but are not prepared and not attached a second time.
+        native_coll = [obj for obj in meshes if obj.get("pynRigidBody") is not None]
+        if native_coll:
+            meshes = [obj for obj in meshes if obj not in native_coll]
 
         if not meshes:
             return False, "No exportable meshes found in the scene" if not objects else (
@@ -2715,6 +2758,7 @@ class ExportHelpers:
                 for obj in meshes:
                     _scale_objs.extend(ExportHelpers._find_collision_meshes(obj))
                     _scale_objs.extend(ExportHelpers._find_connect_points(obj))
+                _scale_objs.extend(c for c in native_coll if c not in _scale_objs)
                 _scale_session = _fs.GameUnitSession(bpy.context, _scale_objs, fo4_scale)
                 _scale_session.apply()
 
@@ -2744,6 +2788,8 @@ class ExportHelpers:
                 obj.select_set(True)
                 for cp in ExportHelpers._find_connect_points(obj):
                     cp.select_set(True)
+            for c in native_coll:          # PyNifly writes imported collision itself (see native_coll above)
+                c.select_set(True)
 
             # Set the first mesh as the active object so the exporter has a
             # valid context even when no object was explicitly activated.
@@ -2806,6 +2852,7 @@ class ExportHelpers:
                             _colls = {
                                 id(c): c for m in meshes
                                 for c in ExportHelpers._find_collision_meshes(m)
+                                if c not in native_coll   # already written by PyNifly (selected above)
                             }
                             if _colls:
                                 from . import nif_roundtrip as _nrt
@@ -2959,6 +3006,22 @@ class ExportHelpers:
                             _tp_summary = _nrt.summarize(_nrt.patch_texture_set_paths(filepath))
                             if _tp_summary:
                                 _leaf_note += f"  [{_tp_summary}]"
+                            _sf_summary = _nrt.summarize(_nrt.patch_zero_shape_flags(filepath))
+                            if _sf_summary:
+                                _leaf_note += f"  [{_sf_summary}]"
+                            _hp_summary = _nrt.summarize(_nrt.patch_convex_hull_planes(filepath))
+                            if _hp_summary:
+                                _leaf_note += f"  [{_hp_summary}]"
+                            _sc_summary = _nrt.summarize(_nrt.patch_scaled_collision_nodes(filepath))
+                            if _sc_summary:
+                                _leaf_note += f"  [{_sc_summary}]"
+                            # shared collision of the original NIF(s) these objects came from
+                            for _rs_src in sorted({str(o.get("fo4_source_nif")) for o in (objects or meshes)
+                                                   if o.get("fo4_source_nif")}):
+                                if os.path.isfile(_rs_src):
+                                    _rs_summary = _nrt.summarize(_nrt.patch_restore_shared_collision(filepath, _rs_src))
+                                    if _rs_summary:
+                                        _leaf_note += f"  [{_rs_summary}]"
                         except Exception as _eme:
                             print(f"[FO4Export] Emissive colour / texture path patch skipped: {_eme}")
                         _staged_note =("  [new textures: " + "; ".join(_stage_notes) + "]") if _stage_notes else ""

@@ -134,6 +134,7 @@ def available() -> bool:
 
 
 def _load(path):
+    install_vanilla_hull_packer()     # every collision this module packs gets vanilla hulls
     return _pynifly.NifFile(str(path))
 
 
@@ -729,6 +730,459 @@ def _nif_texture_path(p: str) -> str:
     if q.lower().endswith(".dds") and not q.lower().startswith("textures\\"):
         q = "Textures\\" + q
     return q
+
+
+VANILLA_SHAPE_FLAGS = 14   # SELECTIVE_UPDATE | _TRANSFORMS | _CONTROLLER
+
+
+def patch_zero_shape_flags(exported_path) -> dict:
+    """Give shapes exported with NiAVObject flags 0 the vanilla value 14.
+
+    PyNifly writes a shape's flags only when the Blender object carries
+    ``pynNodeFlags`` (an imported mesh); a mesh made in Blender gets 0
+    (checked 2026-11-13 with createShapeFromData). Billy found 0 on a new
+    tree in NifSkope. No vanilla tree or plant shape has 0: of 817, 511 use
+    14 and 304 use 4110 (0x100E). Same flags field offset as the shape
+    parser in _patch_wind_shader_flags_bytes; FO4 (BS stream 130) only."""
+    report = {"restored": [], "could_not_restore": []}
+    try:
+        with open(exported_path, "rb") as fh:
+            data = fh.read()
+        o = data.index(b'\n') + 1
+        if struct.unpack_from('<I', data, o + 13)[0] != 130:
+            return report
+        types, offsets, _sizes = _block_layout(data)
+        buf = bytearray(data)
+        n = 0
+        for t, off in zip(types, offsets):
+            if t not in ("BSTriShape", "BSMeshLODTriShape", "BSSubIndexTriShape", "BSDynamicTriShape"):
+                continue
+            q = off + 8 + 4 * struct.unpack_from('<I', buf, off + 4)[0] + 4
+            if struct.unpack_from('<I', buf, q)[0] == 0:
+                struct.pack_into('<I', buf, q, VANILLA_SHAPE_FLAGS)
+                n += 1
+        if n:
+            with open(exported_path, "wb") as fh:
+                fh.write(bytes(buf))
+            report["restored"].append(f"shape flags 0 -> {VANILLA_SHAPE_FLAGS} ({n} shape(s), as vanilla)")
+    except Exception as exc:
+        report["could_not_restore"].append(f"shape flags ({exc})")
+    return report
+
+
+def _havok_material_fields(blob: bytes):
+    """[(class, offset in blob, value)] of every Havok material field (see
+    _patch_havok_material for where vanilla keeps it)."""
+    mp = blob.find(_bau.HAVOK_MAGIC)
+    b = blob[mp:]
+    hdrs = _bau.parse_section_headers(b)
+    dh = hdrs["__data__"]
+    out = []
+    for rel, cls in _bau.parse_virtual_fixups(b, dh, hdrs["__classnames__"].abs_start):
+        field = 0x34 if cls == "hknpBSMaterialProperties" else 0x18 if cls in _HAVOK_SHAPES_WITH_MATERIAL else None
+        if field is not None:
+            p = mp + dh.abs_start + rel + field
+            out.append((cls, p, struct.unpack_from('<I', blob, p)[0]))
+    return out
+
+
+# ── Convex hulls laid out like Bethesda's ────────────────────────────────────
+# PyNifly's packer (bhk_autopack._build_convex_polytope_shape, still so in
+# PyNifly 30.2.0) writes the plane array's size as the VERTEX count, while it
+# writes one plane per face. A hull from Blender is all triangles, so it has
+# about twice as many faces as vertices: GSFungusStock04's trunk hull had 126
+# faces and 65 planes, and Havok only knew half of its sides. In game Billy
+# was stopped from the front and walked through the tree from the sides and
+# back (2026-11-13). All 1,195 vanilla convex hulls (Landscape, Rubble,
+# Buildings) follow one layout: vertex count a multiple of 4 (the last vertex
+# repeated), plane count = face count rounded up to 4, planes right after the
+# vertices, faces right after the planes and stored to that rounded count,
+# shape flags 0x0143. _vanilla_convex_polytope_shape writes exactly that and
+# replaces PyNifly's builder while this add-on is loaded.
+_HULL_FLAGS = 0x0143
+
+
+def _vanilla_convex_polytope_shape(verts, faces):
+    import math
+    from io_scene_nifly.pyn import bhk_autopack as _bap
+    nv0, nf = len(verts), len(faces)
+    assert 0 < nv0 <= 255 and nf > 0, "convex hull: 1-255 vertices"
+    pad_v = (-nv0) % 4
+    V = list(verts) + [verts[-1]] * pad_v
+    w_idx = list(range(nv0)) + [nv0 - 1] * pad_v
+    planes = [_bap._face_plane(verts, f) for f in faces]
+    npl = (nf + 3) // 4 * 4
+    planes += [planes[-1]] * (npl - nf)                  # repeat a real plane: never a false contact
+    # per face: smallest half angle to a neighbouring face (byte, pi/2 = 255;
+    # matches vanilla exactly on 55% of 1,946 faces, PyNifly writes 0)
+    edge_faces = {}
+    for k, f in enumerate(faces):
+        for j in range(len(f)):
+            edge_faces.setdefault(tuple(sorted((f[j], f[(j + 1) % len(f)]))), []).append(k)
+    half = []
+    for k, f in enumerate(faces):
+        best = math.pi / 2
+        for j in range(len(f)):
+            for o in edge_faces[tuple(sorted((f[j], f[(j + 1) % len(f)])))]:
+                if o != k:
+                    c = sum(planes[k][i] * planes[o][i] for i in range(3))
+                    best = min(best, math.acos(max(-1.0, min(1.0, c))) / 2)
+        half.append(int(round(min(255.0, best * 255.0 / (math.pi / 2)))))
+    fvi, entries = [], []
+    for k, f in enumerate(faces):
+        entries.append(struct.pack('<HBB', len(fvi), len(f), half[k]))
+        fvi.extend(f)
+    entries += [bytes(4)] * (npl - nf)
+    nvp = len(V)
+    planes_abs = 0x50 + 16 * nvp
+    faces_abs = planes_abs + 16 * npl
+    fvi_abs = faces_abs + 4 * npl
+    hdr = bytearray(_bap._CONVEX_HDR)
+    struct.pack_into('<H', hdr, 0x10, _HULL_FLAGS)
+    out = bytearray(hdr)
+    out += struct.pack('<HH', nvp, 0x20) + bytes(12)
+    out += struct.pack('<HHHHHH', npl, planes_abs - 0x40, nf, faces_abs - 0x44, len(fvi), fvi_abs - 0x48) + bytes(4)
+    for (x, y, z), wi in zip(V, w_idx):
+        out += struct.pack('<fffI', x, y, z, 0x3F000000 | wi)
+    for p in planes:
+        out += struct.pack('<4f', *p)
+    out += b''.join(entries) + bytes(fvi)
+    if len(out) % 8:
+        out += bytes(8 - len(out) % 8)
+    return bytes(out)
+
+
+_vanilla_convex_polytope_shape._fo4_vanilla = True
+
+
+def install_vanilla_hull_packer() -> bool:
+    """Make PyNifly's Havok packer write convex hulls the vanilla way."""
+    try:
+        from io_scene_nifly.pyn import bhk_autopack as _bap
+    except Exception:
+        return False
+    if not getattr(_bap._build_convex_polytope_shape, "_fo4_vanilla", False):
+        _bap._build_convex_polytope_shape = _vanilla_convex_polytope_shape
+    return True
+
+
+def _hull_counts_bad(blob: bytes) -> bool:
+    """True when a packfile holds a convex hull whose plane count is not the
+    face count rounded up to 4 (the PyNifly packer fault)."""
+    mp = blob.find(_bau.HAVOK_MAGIC)
+    b = blob[mp:]
+    hdrs = _bau.parse_section_headers(b)
+    ds = hdrs["__data__"].abs_start
+    for rel, cls in _bau.parse_virtual_fixups(b, hdrs["__data__"], hdrs["__classnames__"].abs_start):
+        if cls != "hknpConvexPolytopeShape":
+            continue
+        s = ds + rel
+        nv = struct.unpack_from('<H', b, s + 0x30)[0]
+        npl = struct.unpack_from('<H', b, s + 0x40)[0]
+        nf = struct.unpack_from('<H', b, s + 0x44)[0]
+        if npl != (nf + 3) // 4 * 4 or nv % 4:
+            return True
+    return False
+
+
+def patch_convex_hull_planes(exported_path) -> dict:
+    """Rebuild every convex-hull collision that PyNifly's packer wrote with too
+    few planes (see _vanilla_convex_polytope_shape). Same points, faces,
+    convex radius, body position and Havok material; vanilla hulls are left
+    alone. FO4 (BS stream 130), single convex hulls only."""
+    report = {"restored": [], "could_not_restore": []}
+    if _bau is None or not install_vanilla_hull_packer():
+        return report
+    try:
+        with open(exported_path, "rb") as fh:
+            data = fh.read()
+        o = data.index(b'\n') + 1
+        if struct.unpack_from('<I', data, o + 13)[0] != 130:
+            return report
+        from io_scene_nifly.pyn.bhk_autopack import pack_shapes
+        types, offsets, sizes = _block_layout(data)
+        replace = {}
+        for i, t in enumerate(types):
+            if t != 'bhkPhysicsSystem':
+                continue
+            pb = data[offsets[i]:offsets[i] + sizes[i]]
+            blob = pb[4:4 + struct.unpack_from('<I', pb, 0)[0]]
+            try:
+                if not _hull_counts_bad(blob):
+                    continue
+                shapes = _bau.parse_bytes(blob)
+            except Exception:
+                continue
+            if not shapes or any(s.shape_type != 'polytope' for s in shapes):
+                report["could_not_restore"].append("convex hull with too few planes inside a compound (left as is)")
+                continue
+            nb = bytearray(pack_shapes(shapes))
+            old_m, new_m = _havok_material_fields(blob), _havok_material_fields(bytes(nb))
+            if [c for c, _p, _v in old_m] == [c for c, _p, _v in new_m]:
+                for (_c, _p, v), (_c2, pn, _v2) in zip(old_m, new_m):
+                    struct.pack_into('<I', nb, pn, v)
+            if _hull_counts_bad(bytes(nb)):
+                report["could_not_restore"].append("convex hull planes (rebuilt hull still wrong; left as is)")
+                continue
+            replace[i] = struct.pack('<I', len(nb)) + bytes(nb)
+        if not replace:
+            return report
+        tt = _nif_block_type_table(data)
+        size_tab = tt["block_type_index_end"]
+        out = bytearray(data[:offsets[0]])
+        for i in range(len(types)):
+            blk = replace.get(i, data[offsets[i]:offsets[i] + sizes[i]])
+            struct.pack_into('<I', out, size_tab + 4 * i, len(blk))
+            out += blk
+        out += data[offsets[-1] + sizes[-1]:]
+        with open(exported_path, "wb") as fh:
+            fh.write(bytes(out))
+        report["restored"].append(f"collision hull planes rebuilt like vanilla ({len(replace)} hull(s); "
+                                  "PyNifly's packer wrote half of them missing)")
+    except Exception as exc:
+        report["could_not_restore"].append(f"convex hull planes ({exc})")
+    return report
+
+
+def patch_scaled_collision_nodes(exported_path) -> dict:
+    """Bake a child node's scale into the convex hull of the collision it
+    carries and set the node's scale to 1.
+
+    Billy's GSFungusStock04 (2026-11-13) had its four hulls on nodes scaled
+    7.4: right in Blender, but in game he walked through the tree from the
+    sides and back. Of 14,604 vanilla collision nodes only one has a scale
+    other than 1, and it is a root (TreeElmFreePreWar01Green, 1.2): Bethesda
+    never relies on a child node's scale for collision. Baking it gives the
+    same shape whether or not the engine would have applied the scale. Convex
+    radius and Havok material are kept. FO4 (BS stream 130), convex hulls only."""
+    report = {"restored": [], "could_not_restore": []}
+    if _bau is None:
+        return report
+    try:
+        with open(exported_path, "rb") as fh:
+            data = fh.read()
+        o = data.index(b'\n') + 1
+        if struct.unpack_from('<I', data, o + 13)[0] != 130:
+            return report
+        install_vanilla_hull_packer()
+        from io_scene_nifly.pyn.bhk_autopack import pack_shapes
+        import dataclasses
+        types, offsets, sizes = _block_layout(data)
+        buf = bytearray(data)
+        replace, done = {}, []
+        for i, (t, off) in enumerate(zip(types, offsets)):
+            if i == 0 or t not in ("NiNode", "BSFadeNode", "BSLeafAnimNode", "BSOrderedNode", "BSMultiBoundNode"):
+                continue
+            q = off + 8 + 4 * struct.unpack_from('<I', buf, off + 4)[0] + 4 + 4
+            sc_pos = q + 12 + 36
+            sc = struct.unpack_from('<f', buf, sc_pos)[0]
+            coll = struct.unpack_from('<i', buf, sc_pos + 4)[0]
+            if abs(sc - 1.0) < 1e-4 or not (0 <= coll < len(types)) or types[coll] != 'bhkNPCollisionObject':
+                continue
+            phys = struct.unpack_from('<i', buf, offsets[coll] + 6)[0]
+            if not (0 <= phys < len(types)) or types[phys] != 'bhkPhysicsSystem':
+                continue
+            pb = bytes(buf[offsets[phys]:offsets[phys] + sizes[phys]])
+            blob = pb[4:4 + struct.unpack_from('<I', pb, 0)[0]]
+            shapes = _bau.parse_bytes(blob)
+            if not shapes or any(s.shape_type != 'polytope' for s in shapes):
+                report["could_not_restore"].append(
+                    f"collision on a node scaled {sc:.3f} (not a convex hull; scale left on the node)")
+                continue
+            # node scale multiplies the body's position as well as its points
+            new = [dataclasses.replace(
+                s, verts=[tuple(c * sc for c in v) for v in s.verts],
+                transform=(dataclasses.replace(s.transform, position=tuple(c * sc for c in s.transform.position))
+                           if s.transform is not None else None)) for s in shapes]
+            nb = bytearray(pack_shapes(new))
+            old_m, new_m = _havok_material_fields(blob), _havok_material_fields(bytes(nb))
+            if [c for c, _p, _v in old_m] == [c for c, _p, _v in new_m]:
+                for (_c, _p, v), (_c2, pn, _v2) in zip(old_m, new_m):
+                    struct.pack_into('<I', nb, pn, v)
+            replace[phys] = struct.pack('<I', len(nb)) + bytes(nb)
+            struct.pack_into('<f', buf, sc_pos, 1.0)
+            done.append(sc)
+        if not replace:
+            return report
+        tt = _nif_block_type_table(bytes(buf))
+        size_tab = tt["block_type_index_end"]
+        out = bytearray(buf[:offsets[0]])
+        for i in range(len(types)):
+            blk = replace.get(i, bytes(buf[offsets[i]:offsets[i] + sizes[i]]))
+            struct.pack_into('<I', out, size_tab + 4 * i, len(blk))
+            out += blk
+        out += buf[offsets[-1] + sizes[-1]:]
+        with open(exported_path, "wb") as fh:
+            fh.write(bytes(out))
+        report["restored"].append(
+            f"collision node scale baked into the hull ({len(done)} piece(s), scale "
+            f"{', '.join(f'{s:.3f}' for s in sorted(set(round(x, 3) for x in done)))} -> 1, as vanilla)")
+    except Exception as exc:
+        report["could_not_restore"].append(f"scaled collision nodes ({exc})")
+    return report
+
+
+def patch_restore_shared_collision(exported_path, original_path) -> dict:
+    """Put back collision that several nodes share in the original NIF, exactly.
+
+    A vanilla building keeps its walls AND its navmesh-cut boxes in ONE physics
+    system: the building node uses body 0, each c_NavCut* node body 1, 2, ...
+    (ShackMetalPrefabCompleteLg01: 6 bodies, one system). Re-exporting through
+    PyNifly splits every NavCut body out into a physics system of its own
+    (measured 2026-11-16: 1 system -> 6, on a building that was only imported
+    and exported again), and a skin dropped over a building came back with its
+    doors blocked. When the original's shared system and the exported one for
+    the same node are the same size (the collision was not edited), the
+    original bytes go back, every node points at its original body again and
+    the split-out copies are removed. Anything that does not match exactly, or
+    a block type the editor does not know, leaves the file as it was and says
+    why. Only shared systems are touched; ordinary one-node collision is not."""
+    report = {"restored": [], "could_not_restore": []}
+    try:
+        try:
+            from . import nif_blocks as _nb
+        except ImportError:
+            import nif_blocks as _nb
+        with open(original_path, "rb") as fh:
+            src = _nb.Nif(fh.read())
+        with open(exported_path, "rb") as fh:
+            dst = _nb.Nif(fh.read())
+        if src.bsver != 130 or dst.bsver != 130:
+            return report
+
+        def colls(n):
+            """node name -> (collision object, physics system, body index)"""
+            out = {}
+            for i, (t, d) in enumerate(n.blocks):
+                if t not in _nb.NODE_TYPES:
+                    continue
+                c = n.node(i)['coll']
+                if c < 0 or n.blocks[c][0] != 'bhkNPCollisionObject':
+                    continue
+                cd = n.blocks[c][1]
+                p = struct.unpack_from('<i', cd, 6)[0]
+                if 0 <= p < len(n.blocks) and n.blocks[p][0] == 'bhkPhysicsSystem':
+                    out.setdefault(n.name(i), (c, p, struct.unpack_from('<I', cd, 10)[0]))
+            return out
+        sc, dc = colls(src), colls(dst)
+        users = {}
+        for name, (_c, p, body) in sc.items():
+            users.setdefault(p, []).append((name, body))
+        shared = {p: u for p, u in users.items() if len(u) > 1}
+        if not shared:
+            return report
+        kill, restored = set(), []
+        for p, u in shared.items():
+            names = [nm for nm, _b in u]
+            if any(nm not in dc for nm in names):
+                report["could_not_restore"].append(
+                    "shared collision: a node of the original is missing in the export (" +
+                    ", ".join(nm for nm in names if nm not in dc) + "); left as exported")
+                continue
+            main = [nm for nm, b in u if b == 0]
+            if len(main) != 1:
+                continue
+            m_c, m_p, _ = dc[main[0]]
+            if len(dst.blocks[m_p][1]) != len(src.blocks[p][1]):
+                report["could_not_restore"].append(
+                    f"shared collision of '{main[0]}' was edited (size changed); left as exported")
+                continue
+            dst.blocks[m_p][1] = bytearray(src.blocks[p][1])
+            for nm, body in u:
+                c, cp, _b = dc[nm]
+                if cp != m_p:
+                    kill.add(cp)
+                struct.pack_into('<i', dst.blocks[c][1], 6, m_p)
+                struct.pack_into('<I', dst.blocks[c][1], 10, body)
+            restored.append(f"'{main[0]}' + {len(u) - 1} body(ies)")
+        if not restored:
+            return report
+        # Added 2026-11-16 (ShackMetalPrefabCompleteSm02): two NavCut nodes share one name (both 'c_NavCut01',
+        # bodies 1 and 2), and only one survives import/export, so body 2 of the restored system had no node.
+        # Each body of a restored system that no node points at gets its original node (and collision object)
+        # copied back under the same parent. When every body has its node, as in every earlier case, nothing here
+        # runs.
+        readded = []
+        for p, u in shared.items():
+            main = [nm for nm, b in u if b == 0]
+            if len(main) != 1 or main[0] not in dc:
+                continue
+            m_p = dc[main[0]][1]
+            if dst.blocks[m_p][1] != src.blocks[p][1]:
+                continue
+            # every original node on this system: (node, collision object, name, transform, body)
+            src_users = []
+            for i, (t, d) in enumerate(src.blocks):
+                if t not in _nb.NODE_TYPES:
+                    continue
+                c = src.node(i)['coll']
+                if c < 0 or src.blocks[c][0] != 'bhkNPCollisionObject':
+                    continue
+                cd = src.blocks[c][1]
+                if struct.unpack_from('<i', cd, 6)[0] == p:
+                    src_users.append((i, c, src.name(i), src.node(i)['xf'], struct.unpack_from('<I', cd, 10)[0]))
+            src_names = [s[2] for s in src_users]
+            if len(set(src_names)) == len(src_names):
+                continue                         # names all different: the restore above wired them already
+            # Same name twice: the restore above matched by name only, so a surviving node may hold the other
+            # one's body. Match by name AND position, and re-wire each surviving node to its own body.
+            used = set()
+            for j, (t, d) in enumerate(dst.blocks):
+                if t not in _nb.NODE_TYPES:
+                    continue
+                c = dst.node(j)['coll']
+                if c < 0 or dst.blocks[c][0] != 'bhkNPCollisionObject':
+                    continue
+                if struct.unpack_from('<i', dst.blocks[c][1], 6)[0] != m_p:
+                    continue
+                hit = [s for s in src_users if s[2] == dst.name(j) and s[3] == dst.node(j)['xf'] and s[4] not in used]
+                if hit:
+                    struct.pack_into('<I', dst.blocks[c][1], 10, hit[0][4])
+                    used.add(hit[0][4])
+                else:
+                    used.add(struct.unpack_from('<I', dst.blocks[c][1], 10)[0])
+            for i, c, _nm, _xf, body in src_users:
+                if body in used:
+                    continue
+                if src.node(i)['kids']:
+                    continue                     # only childless nodes (NavCut boxes) are copied
+                par = [j for j, (tt, dd) in enumerate(src.blocks) if tt in _nb.NODE_TYPES and i in src.node(j)['kids']]
+                if len(par) != 1:
+                    continue
+                pname = src.name(par[0])
+                dpar = [j for j, (tt, dd) in enumerate(dst.blocks) if tt in _nb.NODE_TYPES and dst.name(j) == pname]
+                if not dpar and par[0] in src.roots:
+                    dpar = [r for r in dst.roots if dst.blocks[r][0] in _nb.NODE_TYPES]
+                if len(dpar) != 1:
+                    continue
+                mp = dst.append_from(src, [i, c])
+                ni, ci = mp[i], mp[c]
+                f = dst.node(ni); f['coll'] = ci; f['extras'] = []; dst.set_node(ni, f)
+                struct.pack_into('<i', dst.blocks[ci][1], 0, ni)
+                struct.pack_into('<i', dst.blocks[ci][1], 6, m_p)
+                struct.pack_into('<I', dst.blocks[ci][1], 10, body)
+                g = dst.node(dpar[0]); g['kids'] = g['kids'] + [ni]; dst.set_node(dpar[0], g)
+                used.add(body)
+                readded.append(f"'{src.name(i)}' (body {body})")
+        if readded:
+            restored.append("missing node(s) put back: " + ", ".join(readded))
+        # a split-out copy may only go when nothing else uses it
+        still = set()
+        for i, (t, d) in enumerate(dst.blocks):
+            if t == 'bhkNPCollisionObject':
+                still.add(struct.unpack_from('<i', d, 6)[0])
+        kill = [k for k in kill if k not in still]
+        dst.delete(kill)
+        with open(exported_path, "wb") as fh:
+            fh.write(dst.to_bytes())
+        report["restored"].append(
+            "original shared collision put back exactly (" + "; ".join(restored) +
+            f"; {len(kill)} split-out physics system(s) removed, as in the original)")
+    except ValueError as exc:
+        report["could_not_restore"].append(f"shared collision not restored, file left as exported ({exc})")
+    except Exception as exc:
+        report["could_not_restore"].append(f"shared collision not restored ({exc})")
+    return report
 
 
 def patch_texture_set_paths(exported_path) -> dict:
