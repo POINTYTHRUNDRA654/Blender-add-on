@@ -6,7 +6,7 @@ A comprehensive tutorial and helper system for creating Fallout 4 mods in Blende
 bl_info = {
     "name": "Mossy Industries blender addon",
     "author": "Mossy Industries",
-    "version": (5, 5, 3),
+    "version": (5, 5, 4),
     "blender": (2, 90, 0),  # Compatible with Blender 2.90+ through 5.x
     "location": "View3D > Sidebar > Fallout 4",
     "description": (
@@ -297,6 +297,7 @@ fo4_mesh_shaper          = _try_import("fo4_mesh_shaper")
 fo4_uv_kit               = _try_import("fo4_uv_kit")
 fo4_tree_tools           = _try_import("fo4_tree_tools")
 fo4_skin_builder         = _try_import("fo4_skin_builder")   # AI skin over a building (2026-11-17)
+fo4_game_ready           = _try_import("fo4_game_ready")     # vanilla-style game-ready mesh from AI models (2026-11-19)
 fo4_texture_generator    = _try_import("fo4_texture_generator")
 
 
@@ -399,6 +400,7 @@ _PHASE2_MODULES = list(filter(_filter, [
     fo4_uv_kit,
     fo4_tree_tools,
     fo4_skin_builder,
+    fo4_game_ready,
     fo4_texture_generator,
     # Animation sub-systems — operators registered in Phase 2 so startup
     # is not delayed; all UI panels that reference them check registration

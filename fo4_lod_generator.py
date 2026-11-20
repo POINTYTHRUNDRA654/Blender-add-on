@@ -114,7 +114,8 @@ _SHELL_TEX_SIZE = {"LOD1": 1024, "LOD2": 512, "LOD3": 256}
 
 # ── LOD helpers ───────────────────────────────────────────────────────────────
 
-def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object, str]":
+def generate_lod_mesh(source_obj, ratio: float, lod_name: str,
+                      min_tris_by_slot: dict = None) -> "tuple[object, str]":
     """
     Create a decimated copy of *source_obj* as a new object.
 
@@ -174,7 +175,7 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
     # LOD3 (2026-11-11).
     _per_material_done = False
     try:
-        _per_material_done = _decimate_per_material(new_obj, ratio)
+        _per_material_done = _decimate_per_material(new_obj, ratio, min_tris_by_slot)
     except Exception as _pme:
         print(f"[FO4 Add-on] per-material LOD decimate skipped for '{new_obj.name}': {_pme}")
     if not _per_material_done:
@@ -222,7 +223,16 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str) -> "tuple[object,
     return new_obj, msg
 
 
-def _decimate_per_material(obj, ratio: float) -> bool:
+# Smallest triangle count per TREE part per LOD level (added 2026-11-18). The whole-model caps
+# (_LOD_MAX_TRIS) shared out over two fungal trees and their ground gave tree 03 132 triangles at
+# _LOD_1 and its whole bottom half was gone. Measured on that tree (front + side outline match
+# with the source): 132 -> 39% (bottom half 32%), 250 -> 64%, 600 -> 71% (75%), 1300 -> 81% (85%).
+_TREE_MIN_TRIS = {"LOD1": 1300, "LOD2": 600, "LOD3": 300}
+# the ground under such trees, shared over its pieces by area (measured, see the operator)
+_GROUND_MIN_TRIS = {"LOD1": 1200, "LOD2": 700, "LOD3": 450}
+
+
+def _decimate_per_material(obj, ratio: float, min_tris_by_slot: dict = None) -> bool:
     """Decimate *obj* one material at a time and join it back.
 
     Each material gets a share of the whole budget (ratio x all triangles)
@@ -243,6 +253,12 @@ def _decimate_per_material(obj, ratio: float) -> bool:
     total_a = sum(s[1] for s in stats.values()) or 1.0
     target_total = max(12.0, ratio * total_t)
 
+    # Each face remembers its original slot: separating and joining reorder the slots, so a
+    # piece's slot index cannot be used to find its source material afterwards (the tree floor
+    # first landed on a mud piece, 2026-11-18).
+    if min_tris_by_slot:
+        _attr = me.attributes.get("fo4_src_slot") or me.attributes.new("fo4_src_slot", 'INT', 'FACE')
+        _attr.data.foreach_set("value", [p.material_index for p in me.polygons])
     bpy.ops.object.select_all(action='DESELECT')
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
@@ -261,6 +277,12 @@ def _decimate_per_material(obj, ratio: float) -> bool:
         a = sum(p.area for p in part.data.polygons)
         share = 0.5 * (a / total_a) + 0.5 * (t / total_t)
         want = min(t, max(min(t, 12), int(round(target_total * share))))
+        # tree parts keep at least their floor (see _TREE_MIN_TRIS); everything else as before
+        if min_tris_by_slot:
+            _a = part.data.attributes.get("fo4_src_slot")
+            _src_slot = _a.data[0].value if (_a is not None and len(_a.data)) else None
+            if _src_slot in min_tris_by_slot:
+                want = min(t, max(want, int(min_tris_by_slot[_src_slot])))
         r = want / t
         if r >= 0.999:
             continue
@@ -282,6 +304,9 @@ def _decimate_per_material(obj, ratio: float) -> bool:
     bpy.context.view_layer.objects.active = obj
     if len(parts) > 1:
         bpy.ops.object.join()
+    _a = obj.data.attributes.get("fo4_src_slot")
+    if _a is not None:
+        obj.data.attributes.remove(_a)
     return True
 
 
@@ -576,6 +601,89 @@ def split_lod_by_material(lod_obj) -> list:
         head.name = f"{base}_{tag}"
         out.append(head)
     return out
+
+
+def _tree_material_indices(src_obj) -> dict:
+    """{slot index: material} of *src_obj*'s slots whose .bgsm lives under a Trees folder
+    (Materials\\Landscape\\Trees\\GSFungusTree02.bgsm) -- the tree parts of a model."""
+    out = {}
+    for i, slot in enumerate(src_obj.material_slots):
+        m = slot.material
+        if m is None:
+            continue
+        path = str(m.get("BSLSP_Shader_Name") or m.get("fo4_bgsm_path") or "").replace("/", "\\").lower()
+        if "\\trees\\" in path:
+            out[i] = m
+    return out
+
+
+def far_tree_billboards(src_obj, tree_slots: dict, safe: str, rel_dir: str, textures_root: str,
+                        mod_folder: str, tile: int = 256) -> "tuple[list, list]":
+    """One crossed billboard per tree part of *src_obj* for the farthest LOD of a model in
+    Original Textures mode (added 2026-11-18, GSMuckPool_L01: two fungal trees and their
+    ground. Billy: near levels 3D on the real textures, the far level a plane per tree like
+    vanilla, the ground kept as low 3D). Each tree is rendered alone from its own faces
+    (front and side views, Tree mode's renderer) onto two crossed cards that stand on its
+    base. Writes <safe>_<tree>BillboardLOD_d/_n/_s.dds and its .bgsm under ...\\LOD\\<rel_dir>.
+    Returns (billboard objects, notes)."""
+    import tempfile as _tf
+    import numpy as _np
+    from . import tree_lod as _tl
+    made, notes = [], []
+    tex_dir = os.path.join(textures_root, "LOD", *[p for p in rel_dir.split("\\") if p])
+    mat_dir_rel = "materials\\LOD\\" + (rel_dir + "\\" if rel_dir else "")
+    tmp = _tf.mkdtemp(prefix="fo4farbb_")
+    mw = src_obj.matrix_world
+    me = src_obj.data
+    for mi, mat in tree_slots.items():
+        faces = [p.index for p in me.polygons if p.material_index == mi]
+        if not faces:
+            continue
+        vids = sorted({v for f in faces for v in me.polygons[f].vertices})
+        V = _np.array([tuple(mw @ me.vertices[v].co) for v in vids], float)
+        tree_tag = re.sub(r"[^A-Za-z0-9_]+", "_", os.path.splitext(os.path.basename(
+            str(mat.get("BSLSP_Shader_Name") or mat.name)))[0])
+        base = f"{safe}_{tree_tag}BillboardLOD"
+        frames = _tl.billboard_frames(V)
+        # stand the cards on the tree's base: a tall tree's square card already spans base to
+        # top; a wider-than-tall one would reach below the ground (Tree mode's billboard of the
+        # whole pool did: 932 units under it), so lift the centre to keep the bottom at the base
+        z0 = float(V[:, 2].min())
+        fixed = []
+        for centre, u, v, n, size, j in frames:
+            c = centre.copy()
+            c[2] = max(c[2], z0 + size / 2.0)
+            fixed.append((c, u, v, n, size, j))
+        tiles = _tl.render_views(src_obj, {0: faces, 1: faces}, fixed, tile, base)
+        atlas, where, asize = _tl.build_atlas([("BB", tiles)], tile)
+        bb = _tl.build_card_mesh(f"{safe}_LOD3_{tree_tag}_Billboard", fixed, "BB", where, tile, asize)
+        png = os.path.join(tmp, f"{base}_d.png")
+        _tl._save_png(atlas, png)
+        dds = os.path.join(tex_dir, f"{base}_d.dds")
+        ok, msg = _tl._to_dds(png, dds, compression_format='bc3')
+        paths = {"Diffuse": dds if ok else png}
+        if not ok:
+            notes.append(f"⚠ {base}_d: DDS conversion failed ({msg}); FO4 cannot load the PNG")
+        flat, fnotes = _tl.write_flat_maps(tex_dir, base, tmp)
+        paths.update(flat)
+        notes.extend(fnotes)
+        bgsm = mat_dir_rel + base + ".bgsm"
+        bmat = _tl.alpha_material(base, bgsm, paths, _tl.BILLBOARD_ALPHA_REF)
+        bb.data.materials.clear()
+        bb.data.materials.append(bmat)
+        if mod_folder:
+            _tl.write_bgsm(bmat, mod_folder, bgsm, alpha_ref=_tl.BILLBOARD_ALPHA_REF, two_sided=True)
+        bb["fo4_lod_level"] = "LOD3"
+        bb["fo4_lod_source"] = src_obj.name
+        bb["fo4_billboard"] = True
+        bb["fo4_no_wind"] = True
+        bb["PYN_GAME"] = "FO4"
+        for k in ("fo4_unit_scale", "fo4_scale_applied"):
+            if k in src_obj:
+                bb[k] = src_obj[k]
+        made.append(bb)
+        notes.append(f"{tree_tag}: crossed billboard (front + side), 4 triangles, {asize}x{asize} texture")
+    return made, notes
 
 
 def _reuv_for_bake(lod_obj) -> None:
@@ -1818,6 +1926,24 @@ class FO4_OT_GenerateLODs(Operator):
         ),
         default=False,
     )
+    tree_shape_lods: BoolProperty(
+        name="Near LODs: Tree Shapes",
+        description=(
+            "Original Textures mode, trees standing on other parts: _LOD_0 and _LOD_1 rebuild each "
+            "tree like vanilla's tree LODs -- clean tapered limbs (wood baked from the tree) plus "
+            "cards with pictures of its thin branches -- instead of a reduced copy of the tree, "
+            "which shreds thin branches. The ground and other parts are unchanged"),
+        default=True,
+    )
+    far_tree_billboards: BoolProperty(
+        name="Far LOD: Trees as Planes",
+        description=(
+            "Original Textures mode, trees standing on other parts (tree materials under a Trees "
+            "folder plus ground or other materials): the farthest LOD (_LOD_2) shows each tree as a "
+            "crossed plane like vanilla's tree LODs, while the ground and other parts stay low 3D on "
+            "their own textures. A model that is only trees, or has no trees, is not affected"),
+        default=True,
+    )
     billboard_tex_size: EnumProperty(
         name="Billboard Texture",
         items=[
@@ -1930,6 +2056,20 @@ class FO4_OT_GenerateLODs(Operator):
                 # not gated on the class: GSFungusStock04 detects as STATIC
                 if src_class not in _SKINNED_CLASSES and _tl.looks_like_tree(obj):
                     self.lod_textures = 'TREE'
+                # Added 2026-11-18 (GSMuckPool_L01 merged: mud, water, bushes and two fungus trees). A merged
+                # model is only a tree when every selected piece is one; the active piece alone (here a tree)
+                # sent the whole pool down the tree path, which has no leaf cards to use there and so bakes a
+                # trunk texture instead of keeping the parts' own textures. Single-object runs are unchanged.
+                # Blender remembers an operator's last settings: after one tree run every later LOD (even the
+                # muck pool's water surface, 2026-11-18) opened on Tree. A non-tree starts on Original again;
+                # Tree can still be picked in the dialog.
+                elif self.lod_textures == 'TREE' and not _tl.looks_like_tree(obj):
+                    self.lod_textures = 'ORIGINAL'
+                if self.merge_selected and self.lod_textures == 'TREE':
+                    _pieces = [o for o in context.selected_objects if o.type == 'MESH'
+                               and not o.name.upper().startswith(('UCX_', 'BHK'))]
+                    if any(not _tl.looks_like_tree(o) for o in _pieces):
+                        self.lod_textures = 'ORIGINAL'
             except Exception:
                 pass
 
@@ -2016,6 +2156,8 @@ class FO4_OT_GenerateLODs(Operator):
         if self.lod_textures == 'ORIGINAL':
             layout.prop(self, "lod_tex_size")
             layout.label(text="Keeps each part's own UVs and textures (shape: Decimate)", icon='INFO')
+            layout.prop(self, "tree_shape_lods")
+            layout.prop(self, "far_tree_billboards")
         elif self.lod_textures == 'TREE':
             layout.label(text="_LOD_0/_LOD_1: trunk + leaf cards on the tree's own textures, shrunk",
                          icon='INFO')
@@ -2293,7 +2435,27 @@ class FO4_OT_GenerateLODs(Operator):
                             lod_obj["fo4_lod_shell"] = True
                             last_shell = lod_obj
                     if lod_obj is None:
-                        lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name)
+                        # tree parts of a many-material model keep a minimum (2026-11-18, see
+                        # _TREE_MIN_TRIS); nothing changes for models without tree materials
+                        _floors = None
+                        if _original_mode and lod_key in _TREE_MIN_TRIS:
+                            _tslots = _tree_material_indices(obj)
+                            if _tslots:
+                                _floors = {i: _TREE_MIN_TRIS[lod_key] for i in _tslots}
+                                # ...and the ground they stand on (2026-11-18: GSMuckPool_L01's
+                                # mud at the dialog's budget covered 95% at _LOD_1 and 79% at
+                                # _LOD_2 -- white holes). Its floor is shared by area.
+                                _gslots = [i for i, s in enumerate(obj.material_slots)
+                                           if s.material is not None and i not in _tslots]
+                                if _gslots and lod_key in _GROUND_MIN_TRIS:
+                                    _ga = {i: 0.0 for i in _gslots}
+                                    for _poly in obj.data.polygons:
+                                        if _poly.material_index in _ga:
+                                            _ga[_poly.material_index] += _poly.area
+                                    _gt = sum(_ga.values()) or 1.0
+                                    for i in _gslots:
+                                        _floors[i] = int(round(_GROUND_MIN_TRIS[lod_key] * _ga[i] / _gt))
+                        lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name, _floors)
                     # Move to LOD collection
                     for c in list(lod_obj.users_collection):
                         c.objects.unlink(lod_obj)
@@ -2535,6 +2697,7 @@ class FO4_OT_GenerateLODs(Operator):
             # Skinned meshes are excluded: the Decimate modifier strips the skin
             # bind and the resulting NIF would be broken.  Use PyNifly for skinned LODs.
             if self.export_nifs and mod_folder and lod_objects and not is_skinned:
+                _shape_cache = {}        # tree-shape LOD parts, built once for both near levels
                 try:
                     from . import export_helpers
                     for lod_obj in lod_objects:
@@ -2581,7 +2744,86 @@ class FO4_OT_GenerateLODs(Operator):
                         bpy.ops.object.select_all(action='DESELECT')
                         lod_obj.select_set(True)
 
-                        if _original_mode and len([s for s in lod_obj.material_slots if s.material]) > 1:
+                        _far_trees = (_tree_material_indices(obj)
+                                      if (_original_mode and lod_key == 'LOD3' and self.far_tree_billboards)
+                                      else {})
+                        # Only for trees standing on other parts (the ground): a model that is ALL tree
+                        # keeps the 3D _LOD_2 it always had in this mode (rule 2026-11-16: add, never
+                        # change what earlier cases get).
+                        if _far_trees and len(_far_trees) >= len([s for s in obj.material_slots if s.material]):
+                            _far_trees = {}
+                        # Added 2026-11-18 (Billy, GSMuckPool_L01: "ours doesn't look like a tree
+                        # mesh"): near levels of trees standing on other parts get clean tapered
+                        # limbs + branch-picture cards like vanilla's tree LODs instead of a
+                        # decimated tree (tree_lod_skeleton). Same gate as the far planes.
+                        _shape_trees = {}
+                        if (_original_mode and lod_key in ('LOD1', 'LOD2') and self.tree_shape_lods):
+                            _shape_trees = _tree_material_indices(obj)
+                            if _shape_trees and len(_shape_trees) >= len([s for s in obj.material_slots if s.material]):
+                                _shape_trees = {}
+                        if _shape_trees:
+                            if _shape_cache.get("parts") is None:
+                                from . import tree_lod_skeleton as _tls
+                                _keys = [k for k in ('LOD1', 'LOD2')
+                                         if any(o.get("fo4_lod_level") == k for o in lod_objects)]
+                                _shape_cache["parts"], _sn = _tls.build_tree_shape_lods(
+                                    obj, _shape_trees, _keys, safe, rel_dir, textures_root, mod_folder)
+                                steps.extend(_sn)
+                            _parts = split_lod_by_material(lod_obj) if len(
+                                [s for s in lod_obj.material_slots if s.material]) > 1 else [lod_obj]
+                            _keep = []
+                            for _p in _parts:
+                                _pm = _p.material_slots[0].material if _p.material_slots else None
+                                if _pm and "\\trees\\" in str(_pm.get("BSLSP_Shader_Name") or "").replace("/", "\\").lower():
+                                    bpy.data.objects.remove(_p, do_unlink=True)
+                                else:
+                                    _keep.append(_p)
+                            _shape_objs = _shape_cache["parts"].get(lod_key, [])
+                            for _b in _shape_objs:
+                                for _c in list(_b.users_collection):
+                                    _c.objects.unlink(_b)
+                                lod_col.objects.link(_b)
+                            result = export_helpers.ExportHelpers.export_scene_as_single_nif(
+                                context.scene, nif_path, objects=_keep + _shape_objs)
+                            _cards = [o for o in _shape_objs if o.name.endswith("_Branches")]
+                            if (result[0] if isinstance(result, tuple) else False) and _cards:
+                                from . import tree_lod as _tl_fin2
+                                steps.extend(_tl_fin2.finish_lod_nif(
+                                    nif_path, {o.name: _tl_fin2.CANOPY_ALPHA_REF for o in _cards}))
+                        elif _far_trees:
+                            # Added 2026-11-18 (GSMuckPool_L01): the farthest level of a model with
+                            # tree parts gets one crossed billboard per tree; the other parts (the
+                            # ground) stay decimated 3D on their own textures, in the same NIF.
+                            _parts = split_lod_by_material(lod_obj) if len(
+                                [s for s in lod_obj.material_slots if s.material]) > 1 else [lod_obj]
+                            _tree_bgsms = {str(m.get("BSLSP_Shader_Name") or m.name).lower()
+                                           for m in _far_trees.values()}
+                            _keep = []
+                            for _p in _parts:
+                                _pm = _p.material_slots[0].material if _p.material_slots else None
+                                _src_name = str(_pm.get("fo4_lod_source_bgsm") or "") if _pm else ""
+                                _is_tree = bool(_pm) and (
+                                    _src_name.lower() in _tree_bgsms
+                                    or "\\trees\\" in str(_pm.get("BSLSP_Shader_Name") or "").replace("/", "\\").lower())
+                                if _is_tree:
+                                    bpy.data.objects.remove(_p, do_unlink=True)
+                                else:
+                                    _keep.append(_p)
+                            _bbs, _bb_notes = far_tree_billboards(
+                                obj, _far_trees, safe, rel_dir, textures_root, mod_folder)
+                            steps.extend(_bb_notes)
+                            for _b in _bbs:
+                                for _c in list(_b.users_collection):
+                                    _c.objects.unlink(_b)
+                                lod_col.objects.link(_b)
+                            _parts = _keep + _bbs
+                            result = export_helpers.ExportHelpers.export_scene_as_single_nif(
+                                context.scene, nif_path, objects=_parts)
+                            if (result[0] if isinstance(result, tuple) else False) and _bbs:
+                                from . import tree_lod as _tl_fin
+                                steps.extend(_tl_fin.finish_lod_nif(
+                                    nif_path, {_b.name: _tl_fin.BILLBOARD_ALPHA_REF for _b in _bbs}))
+                        elif _original_mode and len([s for s in lod_obj.material_slots if s.material]) > 1:
                             # One shape per texture in ONE NIF, like a vanilla
                             # tree LOD (trunk shape + branches shape). PyNifly
                             # writes an object with several material slots as a

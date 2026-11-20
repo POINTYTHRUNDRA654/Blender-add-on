@@ -100,6 +100,10 @@ class FO4_PT_VegetationPanel(_FO4SubPanel):
         row.enabled = bool(selected_meshes)
         row.scale_y = 1.3
         row.operator("fo4.retopo_and_bake", text="Retopologize & Bake", icon='MOD_REMESH')
+        row = box.row()
+        row.enabled = bool(selected_meshes)
+        row.scale_y = 1.3
+        row.operator("fo4.build_game_ready", text="Build Game-Ready (Vanilla Style)", icon='CHECKMARK')
 
         # Create vegetation
         box = layout.box()

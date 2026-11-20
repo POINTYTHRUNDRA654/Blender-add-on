@@ -115,14 +115,16 @@ def _scale_collision_radius(o, f):
         _set_push_group(m, group)
 
 
-def _scale_world(context, objects, factor, *, copy_data=False):
+def _scale_world(context, objects, factor, *, copy_data=False, flatten_empty_scale=False):
     """Scale *objects* by *factor* around the world origin, baking the scale
     into mesh/armature data so every object ends with scale (1,1,1) (empties
     keep their own scale and only move).
 
     With ``copy_data`` the mesh/armature data is swapped for a private copy
     before it is changed (used by export so the originals can be put back).
-    Returns {obj: original data} for the swapped objects.
+    With ``flatten_empty_scale`` (export only) empties are set to world scale 1
+    as well; see the note in the loop. Returns {obj: original data} for the
+    swapped objects.
     """
     k = float(factor)
     grow = Matrix.Diagonal((k, k, k, 1.0))
@@ -164,6 +166,14 @@ def _scale_world(context, objects, factor, *, copy_data=False):
                 f = (sca.x + sca.y + sca.z) / 3.0
                 for pb in o.pose.bones:
                     pb.location = pb.location * f
+            o.matrix_world = Matrix.LocRotScale(loc, rot, (1.0, 1.0, 1.0))
+        elif flatten_empty_scale and o.type == 'EMPTY':
+            # Added 2026-11-18 (GSMuckPool_L01: GSBush02 pieces, GlowPlant and grass under empties scaled
+            # 1.3-2 came out 1/1.5-1/2 size, sunk into the ground). PyNifly writes an empty's position and
+            # rotation but not its scale (measured: an empty scaled 2 is written as a NiNode scale 1.0, with or
+            # without this add-on). The meshes below already get their full world scale baked into their data
+            # just above, so the empty is set to world scale 1 and nothing depends on the scale PyNifly drops.
+            # Empties at scale 1 are unchanged by this branch.
             o.matrix_world = Matrix.LocRotScale(loc, rot, (1.0, 1.0, 1.0))
         else:
             o.matrix_world = Matrix.LocRotScale(loc, rot, original[o].to_scale())
@@ -282,7 +292,8 @@ class GameUnitSession:
                 [pb.location.copy() for pb in o.pose.bones] if (o.type == 'ARMATURE' and o.pose) else None,
                 _radius_state(o) if o.type == 'MESH' else None,
             )
-        self._swapped = _scale_world(self.context, self.objects, self.factor, copy_data=True)
+        self._swapped = _scale_world(self.context, self.objects, self.factor, copy_data=True,
+                                     flatten_empty_scale=True)
         self._applied = True
 
     def restore(self):

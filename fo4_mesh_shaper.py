@@ -1184,6 +1184,7 @@ class FO4_PT_MeshShaperPanel(_FO4SubPanel):
         box = layout.box()
         box.label(text="Retopology", icon='MOD_REMESH')
         box.operator("fo4.retopo_and_bake", text="Retopologize & Bake (automatic)", icon='AUTO')
+        box.operator("fo4.build_game_ready", text="Build Game-Ready (Vanilla Style)", icon='CHECKMARK')
         box.operator("fo4.rebake_from_source", text="Re-bake from Source", icon='RENDER_STILL')
         if _retopoflow_installed():
             # RetopoFlow (Orange Turbine / CG Cookie, GPL-3.0) is a separate
