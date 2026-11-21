@@ -96,7 +96,33 @@ FALLBACK_TOOLS_ROOT = ADDON_ROOT / "tools"
 # environment configuration (PYTHONNOUSERSITE, read-only system site-packages,
 # Blender isolated mode, etc.).  _refresh_import_paths() adds this directory
 # to sys.path on every startup so the packages are always importable.
-_PIP_LIB_DIR = ADDON_ROOT / "lib"
+_LEGACY_PIP_LIB_DIR = ADDON_ROOT / "lib"
+
+
+def _user_lib_root() -> Path:
+    """Where pip packages live (added 2026-11-20 for Blender 5.3).
+
+    Installed as an extension, the add-on's own folder is checked by Blender's
+    extension policy every time it lists warnings (not only during register()),
+    so ADDON_ROOT/lib on sys.path shows "Policy violation with sys.path: .\\lib"
+    in Blender 5.3 even when added after start-up.  Blender gives each extension
+    a per-user data folder outside its own folder for exactly this
+    (bpy.utils.extension_path_user); it is not checked, and it also survives
+    installing a new version of the add-on, which replaces ADDON_ROOT and with
+    it every package in ADDON_ROOT/lib.  Legacy (non-extension) installs keep
+    ADDON_ROOT/lib, which Blender does not check.
+    """
+    pkg = __package__ or ""
+    if pkg.startswith("bl_ext."):
+        try:
+            import bpy as _bpy
+            return Path(_bpy.utils.extension_path_user(pkg, path="lib", create=True))
+        except Exception:
+            pass
+    return _LEGACY_PIP_LIB_DIR
+
+
+_PIP_LIB_DIR = _user_lib_root()
 
 # Separate target directory for heavy ML packages (scipy, open3d) that have
 # many compiled submodules.  Blender 5's extension policy checker scans every
@@ -105,7 +131,29 @@ _PIP_LIB_DIR = ADDON_ROOT / "lib"
 # (which is added to sys.path at startup) prevents those violations.
 # _ensure_ml_on_path() adds this directory lazily, only when ML functionality
 # is actually invoked (e.g. RigNet BBW skinning).
-_ML_LIB_DIR = ADDON_ROOT / "lib" / "ml"
+_ML_LIB_DIR = _PIP_LIB_DIR / "ml"
+
+
+def _migrate_legacy_lib() -> None:
+    """Move packages from the old ADDON_ROOT/lib into the per-user lib folder.
+
+    Runs once (when the folders differ and the old one exists).  Nothing is
+    deleted: each entry is moved only if the new folder does not have it yet;
+    the leftovers stay where they were.
+    """
+    if _PIP_LIB_DIR == _LEGACY_PIP_LIB_DIR or not _LEGACY_PIP_LIB_DIR.is_dir():
+        return
+    import shutil
+    try:
+        _PIP_LIB_DIR.mkdir(parents=True, exist_ok=True)
+        for entry in list(_LEGACY_PIP_LIB_DIR.iterdir()):
+            dest = _PIP_LIB_DIR / entry.name
+            if not dest.exists():
+                shutil.move(str(entry), str(dest))
+        if not any(_LEGACY_PIP_LIB_DIR.iterdir()):
+            _LEGACY_PIP_LIB_DIR.rmdir()
+    except Exception as exc:  # never block start-up over this
+        print(f"[tool_installers] could not move old lib folder: {exc}")
 
 # The parent of the addon folder.  When the addon lives at e.g.
 #   D:\Blender addon\blender_game_tools\
@@ -234,6 +282,7 @@ def _refresh_import_paths(*, _add_lib: bool = True) -> None:
     # Skipped when _add_lib=False (called from register()) to avoid the
     # Blender 5 "Policy violation with sys.path: .\lib" warning.
     if _add_lib:
+        _migrate_legacy_lib()
         _lib = str(_PIP_LIB_DIR)
         if _PIP_LIB_DIR.exists() and _lib not in sys.path:
             sys.path.append(_lib)
@@ -241,6 +290,10 @@ def _refresh_import_paths(*, _add_lib: bool = True) -> None:
 
     # Fallback: also add user site-packages for packages installed in sessions
     # before the --target fix was introduced (backward compat).
+    # Known side effect (2026-11-20): the user site is shared with every other Python
+    # tool on the PC. Installed in the SAME session after this add-on, UVgami picked up
+    # an older numba from it and its unwrapper failed ("No module named 'qdldl'"). After a
+    # Blender restart the extension wheel folder comes first and UVgami works (tested).
     try:
         import site as _site
         user_site = _site.getusersitepackages()

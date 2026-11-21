@@ -466,7 +466,11 @@ def generate_mesh_from_image(image_path, output_path=None, resolution=256, targe
         # location.
         out_file = os.path.join(output_path, "output.glb")
         import pathlib as _pl
-        _addon_lib = str(_pl.Path(__file__).parent / "lib")
+        try:   # pip packages folder (per-user folder since 2026-11-20, see tool_installers._user_lib_root)
+            from .tool_installers import _PIP_LIB_DIR as _pip_lib
+            _addon_lib = str(_pip_lib)
+        except Exception:
+            _addon_lib = str(_pl.Path(__file__).parent / "lib")
         _dll_fix = (
             # Only add DLL directories from CUDA-capable torch installs.
             # D:\PyTorch and similar CPU-only installs have torch_cpu.dll but no

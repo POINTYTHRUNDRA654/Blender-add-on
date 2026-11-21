@@ -381,14 +381,28 @@ def _apply_pytorch_path(path: str) -> None:
     """Apply the PyTorch path to sys.path and environment variables."""
     global _pytorch_path
 
+    # 2026-11-20: never add a folder built for another Python version (see python_path_guard.py).
+    if path:
+        try:
+            from .python_path_guard import path_is_compatible
+            ok, why = path_is_compatible(path)
+        except Exception:
+            ok, why = True, ""
+        if not ok:
+            print(f"[Mossy Link] ⚠️ {why}")
+            return False
+
     # Add to sys.path if not already there
     if path and path not in sys.path:
         sys.path.insert(0, path)
         print(f"[Mossy Link] Added {path} to sys.path")
 
-    # Set PYTHONPATH environment variable so subprocesses (Blender operators, etc.) can find torch
+    # PYTHONPATH is no longer set for the whole Blender process (2026-11-20): only programs Blender
+    # starts can see it (Blender operators run in-process and use sys.path above), nothing in this
+    # add-on reads it (its helper scripts set their own paths), and other extensions' tools inherited
+    # it -- UVgami's unwrapper crashed on the wrong NumPy. Set MOSSY_EXPORT_PYTHONPATH=1 to restore.
     current_pythonpath = os.environ.get("PYTHONPATH", "")
-    if path:
+    if path and os.environ.get("MOSSY_EXPORT_PYTHONPATH") == "1":
         paths = [p for p in current_pythonpath.split(os.pathsep) if p]  # Remove empty strings
         if path not in paths:
             paths.insert(0, path)

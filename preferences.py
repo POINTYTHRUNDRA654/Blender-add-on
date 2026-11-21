@@ -180,7 +180,14 @@ def load_api_keys() -> None:
     effective_pytorch = prefs.pytorch_path.strip()
     if effective_pytorch:
         import sys as _sys
-        if os.path.isdir(effective_pytorch) and effective_pytorch not in _sys.path:
+        try:   # 2026-11-20: skip folders built for another Python version (python_path_guard.py)
+            from .python_path_guard import path_is_compatible as _compat
+            _ok, _why = _compat(effective_pytorch)
+        except Exception:
+            _ok, _why = True, ""
+        if not _ok:
+            print(f"⚠ {_why}")
+        elif os.path.isdir(effective_pytorch) and effective_pytorch not in _sys.path:
             _sys.path.insert(0, effective_pytorch)
             print(f"✓ Mossy PyTorch path added to sys.path: {effective_pytorch}")
 
@@ -578,6 +585,15 @@ def restore_extra_python_paths() -> list[str]:
     # status, even if mossy_link.register() ran too early for get_preferences()
     # to return a non-None value (RECURRING BUG #13 scenario).
     mossy_pt = bpy.path.abspath(getattr(prefs, "pytorch_path", "")).strip()
+    if mossy_pt:   # 2026-11-20: skip folders built for another Python version (python_path_guard.py)
+        try:
+            from .python_path_guard import path_is_compatible as _compat
+            _ok, _why = _compat(mossy_pt)
+        except Exception:
+            _ok, _why = True, ""
+        if not _ok:
+            print(f"⚠ {_why}")
+            mossy_pt = ""
     if mossy_pt and os.path.isdir(mossy_pt) and mossy_pt not in _sys.path:
         _sys.path.insert(0, mossy_pt)
         added.append(mossy_pt)
