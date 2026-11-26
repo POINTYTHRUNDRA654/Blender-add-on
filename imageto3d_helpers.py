@@ -3367,6 +3367,14 @@ See NVIDIA_RESOURCES.md for all AI tools.
 # FO4-Ready Image-to-Mesh Pipeline
 # ---------------------------------------------------------------------------
 
+def _meshlab_ready() -> bool:
+    try:
+        from . import tool_installers as _ti_ml
+        return _ti_ml.pymeshlab_available()
+    except Exception:
+        return False
+
+
 def fo4_post_process(obj, target_polys: int = 10000, name: str = "") -> tuple:
     """Post-process a generated mesh to meet Fallout 4 requirements.
 
@@ -3401,6 +3409,7 @@ def fo4_post_process(obj, target_polys: int = 10000, name: str = "") -> tuple:
         bpy.ops.object.modifier_apply(modifier=tri_mod.name)
 
         # 4. Smart UV unwrap if no UV map
+        _had_uv = bool(obj.data.uv_layers)       # the generator's own UVs carry its baked texture
         if not obj.data.uv_layers:
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
@@ -3415,7 +3424,40 @@ def fo4_post_process(obj, target_polys: int = 10000, name: str = "") -> tuple:
         fo4_limit  = 65535
         effective_target = min(target_polys or fo4_limit, fo4_limit)
 
-        if poly_count > effective_target:
+        if poly_count > effective_target and _had_uv:
+            # 2026-11-23: a mesh that came with its own UVs (Hunyuan3D-Paint and other textured
+            # generators) keeps them. Quadriflow below rebuilds the surface and drops every UV map
+            # (tested: a 2,048-face sphere came out of it with no UV layer), so the baked texture no
+            # longer fit. MeshLab's texture-aware simplifier when installed, else Decimate.
+            # Blender's Decimate, not MeshLab's texture-aware simplify: on a real Hunyuan3D-painted porcini
+            # (8,000 -> 3,000, 2026-11-23, rendered side by side) MeshLab tore holes in the caps and broke
+            # the texture across seams with every setting tried (incl. boundary/UV weights); Decimate kept
+            # the caps whole and the texture lined up.
+            _done = False
+            if not _done:
+                dec = obj.modifiers.new(name="Decimate_FO4", type='DECIMATE')
+                dec.ratio = max(0.01, effective_target / max(poly_count, 1))
+                dec.use_collapse_triangulate = True
+                bpy.ops.object.modifier_apply(modifier=dec.name)
+        elif poly_count > effective_target and _meshlab_ready():
+            # 2026-11-23 (real Hunyuan3D shape): MeshLab's topology-keeping simplify instead of
+            # Quadriflow (stopped at 5,646 of 3,000 faces without an error) + Decimate (412
+            # non-manifold and 402 open edges on a clean mesh; Blender crashed on 1.2M faces).
+            # The temporary UVs from step 4 go first so the shape-only path runs, then UVs again.
+            for _uvl in list(obj.data.uv_layers):
+                obj.data.uv_layers.remove(_uvl)
+            from .fo4_lod_generator import _meshlab_simplify
+            if not _meshlab_simplify(obj, effective_target):
+                dec = obj.modifiers.new(name="Decimate_FO4", type='DECIMATE')
+                dec.ratio = max(0.0005, effective_target / max(poly_count, 1))
+                dec.use_collapse_triangulate = True
+                bpy.ops.object.modifier_apply(modifier=dec.name)
+            if not obj.data.uv_layers:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=0.02)
+                bpy.ops.object.mode_set(mode='OBJECT')
+        elif poly_count > effective_target:
             ratio = max(0.01, effective_target / max(poly_count, 1))
             try:
                 bpy.ops.object.quadriflow_remesh(
@@ -3431,6 +3473,22 @@ def fo4_post_process(obj, target_polys: int = 10000, name: str = "") -> tuple:
                 dec = obj.modifiers.new(name="Decimate_FO4", type='DECIMATE')
                 dec.ratio = ratio
                 bpy.ops.object.modifier_apply(modifier=dec.name)
+            # 2026-11-23 (real Hunyuan3D shape, 1,166,312 triangles): Quadriflow returned without an
+            # error and without remeshing, so "FO4 ready" went out at 1,150,618 triangles -- 18x the
+            # 65,535 per-shape limit. Check the result; still over target -> Decimate.
+            _now = len(obj.data.polygons)
+            if _now > effective_target:
+                print(f"[FO4 post-process] Quadriflow left {_now:,} faces (target {effective_target:,}); Decimate instead")
+                dec = obj.modifiers.new(name="Decimate_FO4", type='DECIMATE')
+                dec.ratio = max(0.0005, effective_target / max(_now, 1))
+                dec.use_collapse_triangulate = True
+                bpy.ops.object.modifier_apply(modifier=dec.name)
+            # Quadriflow drops the UV map it was given (2026-11-23): unwrap the new surface again
+            if not obj.data.uv_layers:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=0.02)
+                bpy.ops.object.mode_set(mode='OBJECT')
 
         # 7. Rename with FO4 convention
         if name:

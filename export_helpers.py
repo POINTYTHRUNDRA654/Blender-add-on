@@ -2181,6 +2181,33 @@ class ExportHelpers:
                     except Exception as _eme:
                         print(f"[FO4Export] Emissive colour / texture path patch skipped: {_eme}")
 
+                    # 2026-11-23 (Billy's muck pools): runs LAST, after the round-trip restore that kept an
+                    # old BSXFlags 0. Collision without the Havok bit -> 130; BSXFlags / wind nodes left on
+                    # inner nodes by merging -> moved to the root. No-op for every other file.
+                    try:
+                        from .merged_structure_fix import fix_merged_structure as _fms
+                        _ms_report = _fms(filepath)
+                        if _ms_report["changed"]:
+                            _roundtrip_note += "  [structure: " + "; ".join(_ms_report["changed"][:3]) + \
+                                ("; ..." if len(_ms_report["changed"]) > 3 else "") + "]"
+                        for _msw in _ms_report["warnings"]:
+                            _roundtrip_note += f"  [{_msw}]"
+                    except Exception as _mse:
+                        print(f"[FO4Export] Merged-structure fix skipped: {_mse}")
+
+                    # 2026-11-23: shader animations of the source NIF back on (see the combined export).
+                    try:
+                        from .shader_controller_restore import restore_shader_controllers as _rsc
+                        _sc_src = obj.get("fo4_source_nif")
+                        if _sc_src and os.path.isfile(str(_sc_src)) and \
+                                os.path.normcase(os.path.abspath(str(_sc_src))) != \
+                                os.path.normcase(os.path.abspath(filepath)):
+                            _sc_rep = _rsc(filepath, str(_sc_src))
+                            if _sc_rep["changed"]:
+                                _roundtrip_note += "  [shader animation: " + "; ".join(_sc_rep["changed"][:3]) + "]"
+                    except Exception as _sce:
+                        print(f"[FO4Export] Shader animation restore skipped: {_sce}")
+
                     try:
                         ExportHelpers._write_kit_credits(obj, filepath)
                     except Exception as _cre:
@@ -2876,6 +2903,35 @@ class ExportHelpers:
                                 _coll_note += f"  [{_bsx_summary}]"
                         except Exception as _bxe:
                             print(f"[FO4Export] BSXFlags patch skipped: {_bxe}")
+                        # 2026-11-23: same last-step structure fix as the single-object export.
+                        try:
+                            from .merged_structure_fix import fix_merged_structure as _fms
+                            _ms_report = _fms(filepath)
+                            if _ms_report["changed"]:
+                                _coll_note += "  [structure: " + "; ".join(_ms_report["changed"][:3]) + "]"
+                        except Exception as _mse:
+                            print(f"[FO4Export] Merged-structure fix skipped: {_mse}")
+                        # 2026-11-23 (GSMuckPool_S01 lost its water animation): shader controllers of the
+                        # imported NIF(s) go back onto the shapes of the same name (shader_controller_restore).
+                        # Runs after BSXFlags so the Animated bit it sets stays. No-op without a source NIF
+                        # or without shader animation in it.
+                        try:
+                            from .shader_controller_restore import restore_shader_controllers as _rsc
+                            _srcs = []
+                            for _m in meshes:
+                                _sp = _m.get("fo4_source_nif")
+                                if _sp and os.path.isfile(str(_sp)) and str(_sp) not in _srcs \
+                                        and os.path.normcase(os.path.abspath(str(_sp))) != \
+                                        os.path.normcase(os.path.abspath(filepath)):
+                                    _srcs.append(str(_sp))
+                            for _sp in _srcs:
+                                _sc_rep = _rsc(filepath, _sp)
+                                if _sc_rep["changed"]:
+                                    _coll_note += "  [shader animation: " + "; ".join(_sc_rep["changed"][:3]) + "]"
+                                for _scw in _sc_rep["warnings"][:3]:
+                                    _coll_note += f"  [{_scw}]"
+                        except Exception as _sce:
+                            print(f"[FO4Export] Shader animation restore skipped: {_sce}")
                         _bgsm_note = ""
                         try:
                             # export_scene_as_single_nif (this combine path) used to

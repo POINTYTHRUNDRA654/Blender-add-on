@@ -1612,7 +1612,29 @@ _scene_watcher_active: bool = False
 
 
 def push_blender_context(obj=None) -> bool:
-    """POST the current Blender scene state to the Mossy Bridge.
+    """POST the current Blender scene state to the Mossy Bridge (main thread: it reads Blender data)."""
+    payload = _build_blender_context(obj)
+    return _post_blender_context(payload) if payload is not None else False
+
+
+def _post_blender_context(payload: bytes) -> bool:
+    """Send a payload built by _build_blender_context. Touches no Blender data, so it is safe on a
+    background thread (added 2026-11-23, see _depsgraph_handler)."""
+    try:
+        req = _url_request.Request(
+            f"http://localhost:{_BRIDGE_PORT}/blender_context",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _url_request.urlopen(req, timeout=0.5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _build_blender_context(obj=None):
+    """The scene state for the Mossy Bridge as JSON bytes, or None. Reads Blender data: main thread only.
 
     Sends to ``POST http://localhost:21337/blender_context``.  Mossy uses
     this to keep its UI, AI prompts, and tool suggestions in sync with
@@ -1626,7 +1648,7 @@ def push_blender_context(obj=None) -> bool:
         if obj is None:
             obj = _bpy.context.active_object
     except Exception:
-        return False
+        return None
 
     ctx: dict = {
         "source":    "blender_addon",
@@ -1667,18 +1689,7 @@ def push_blender_context(obj=None) -> bool:
         ctx["object_name"] = None
         ctx["object_type"] = None
 
-    payload = json.dumps(ctx).encode("utf-8")
-    try:
-        req = _url_request.Request(
-            f"http://localhost:{_BRIDGE_PORT}/blender_context",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _url_request.urlopen(req, timeout=0.5) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+    return json.dumps(ctx).encode("utf-8")
 
 
 def _auto_validate_and_advise(obj) -> None:
@@ -1707,15 +1718,22 @@ def _auto_validate_and_advise(obj) -> None:
     _last_validation_time = now
     _last_validated_vert_count = vert_count
 
-    # Capture what we need from the main thread before handing off.
+    # 2026-11-23: validate_mesh reads every polygon, so it runs here on the main thread. It used to
+    # run on this background thread while the main thread could be changing the same mesh -- Blender
+    # crashed (EXCEPTION_ACCESS_VIOLATION in rna_MeshPoly_vertices_get_length, mossy_link
+    # _bg_validate) during the add-on regression run on a 1.17M-triangle mesh. Only the AI question
+    # (network, no Blender data) stays on a thread.
     obj_name = obj.name
+    try:
+        from . import mesh_helpers as _mh
+        ok, issues = _mh.MeshHelpers.validate_mesh(obj)
+    except Exception as exc:
+        print(f"[Mossy Link] Auto-validate error: {exc}")
+        return
+    _last_ai_advice[obj_name + "_issues"] = issues if not ok else []
 
     def _bg_validate():
         try:
-            from . import mesh_helpers as _mh
-            ok, issues = _mh.MeshHelpers.validate_mesh(obj)
-            _last_ai_advice[obj_name + "_issues"] = issues if not ok else []
-
             if not ok and _bridge_online:
                 # Build a concise query describing the actual issues
                 issue_list = "; ".join(issues[:5])
@@ -1760,18 +1778,25 @@ def _depsgraph_handler(scene, depsgraph) -> None:
     except Exception:
         return
 
-    # Push context on a background thread so HTTP never blocks main thread.
+    # 2026-11-23: Blender data is read HERE, on the main thread (context + validation); only the HTTP
+    # post runs on a background thread. Reading meshes from that thread crashed Blender (see
+    # _auto_validate_and_advise).
+    try:
+        payload = _build_blender_context(obj)
+    except Exception:
+        payload = None
+    try:
+        _auto_validate_and_advise(obj)
+    except ReferenceError:
+        pass
+    except Exception:
+        pass
+    if payload is None:
+        return
+
     def _bg_push():
         try:
-            push_blender_context(obj)
-        except ReferenceError:
-            return  # object was deleted between handler fire and thread start
-        except Exception:
-            pass
-        try:
-            _auto_validate_and_advise(obj)
-        except ReferenceError:
-            pass  # object deleted mid-flight
+            _post_blender_context(payload)
         except Exception:
             pass
 

@@ -217,6 +217,10 @@ class FO4_OT_BuildGameReady(bpy.types.Operator):
     texture_size: EnumProperty(name="Texture size", default='CATEGORY',
                                items=[('CATEGORY', "As vanilla for this kind", ""), ('1024', "1024", ""),
                                       ('2048', "2048", ""), ('4096', "4096", "")])
+    unwrap_with: EnumProperty(name="Unwrap with", default='UVREADY',
+                              items=[('UVREADY', "UVReady if installed (more texture detail)",
+                                      "Uses the UVReady extension when it is installed; otherwise the UV & Texture Kit"),
+                                     ('UVKIT', "UV & Texture Kit", "The add-on's own unwrap")])
     convert_to_dds: BoolProperty(name="Convert to DDS", default=True,
                                  description="Also write DDS files when NVTT or texconv is available")
 
@@ -237,6 +241,7 @@ class FO4_OT_BuildGameReady(bpy.types.Operator):
             lay.prop(self, "custom_tris")
         lay.prop(self, "texture_size")
         lay.prop(self, "skin_detail")
+        lay.prop(self, "unwrap_with")
         lay.prop(self, "convert_to_dds")
         lay.label(text="Your selected model is kept (hidden). Ctrl+Z undoes everything.", icon='LOOP_BACK')
 
@@ -252,7 +257,19 @@ class FO4_OT_BuildGameReady(bpy.types.Operator):
         c = [p50, (p50 + p90) // 2, p90, int(p90 * 1.5), int(p90 * 2.5)]
         return sorted(set(max(p10, x) for x in c)), True
 
-    def _unwrap(self, context, lo, style):
+    def _unwrap(self, context, lo, style, res=2048):
+        # Added case (2026-11-25): UVReady when installed and chosen; it uses more of the texture (68.7% vs 57.5% on
+        # the Game-Ready mushroom). Any refusal leaves the UVs untouched and the UV Kit path below runs as before.
+        if self.unwrap_with == 'UVREADY':
+            try:
+                from . import uvready_bridge
+                ok, msg = uvready_bridge.try_unwrap(context, lo, tex_size=res, margin_px=8,
+                                                    hard_surface=(style == 'HARD_SURFACE'))
+                if ok:
+                    return msg
+                print(f"[FO4 Game-Ready] {msg}; using UV & Texture Kit")
+            except Exception as e:
+                print(f"[FO4 Game-Ready] UVReady not used ({e}); using UV & Texture Kit")
         bpy.ops.object.select_all(action='DESELECT')
         lo.select_set(True)
         context.view_layer.objects.active = lo
@@ -438,8 +455,8 @@ class FO4_OT_BuildGameReady(bpy.types.Operator):
             lo.data.name = lo.name
             for p in lo.data.polygons:
                 p.use_smooth = True
-            unwrap = self._unwrap(context, lo, style)
             res = tex if self.texture_size == 'CATEGORY' else int(self.texture_size)
+            unwrap = self._unwrap(context, lo, style, res)
             imgs = self._bake(context, lo, src, size, res)
             saved = self._save_maps(lo, imgs)
             # done: originals hidden (kept), bake source removed

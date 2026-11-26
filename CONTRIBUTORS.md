@@ -71,6 +71,7 @@ install button, or works with it when you already have it.
 | Project | Author | Licence |
 |---|---|---|
 | [MeshLab](https://github.com/cnr-isti-vclab/meshlab) / [PyMeshLab](https://github.com/cnr-isti-vclab/PyMeshLab) | Visual Computing Lab, ISTI-CNR | GNU GPL v3 |
+| UVReady (Blender extension, optional; used by Build Game-Ready when installed, not included) | Mendbox Studio | GNU GPL v3 or later |
 | [trimesh](https://github.com/mikedh/trimesh) | Michael Dawson-Haggerty | MIT |
 | [libigl](https://github.com/libigl/libigl) / [Python bindings](https://github.com/libigl/libigl-python-bindings) | libigl team | See repository |
 | [BBW](https://github.com/azer89/BBW) | azer89 (also [shanmukhabharat](https://github.com/shanmukhabharat/BBW)) | No licence stated |

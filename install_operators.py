@@ -679,6 +679,30 @@ class FO4_OT_InstallWhisper(Operator):
         return {'FINISHED'}
 
 
+class FO4_OT_InstallMeshLabSimplifier(Operator):
+    """Install MeshLab's mesh simplifier (PyMeshLab, GPL-3.0, about 53 MB). Recommended: the LOD
+    generator uses it automatically and keeps far more of a model's shape at low triangle counts"""
+    bl_idname = "fo4.install_meshlab_simplifier"
+    bl_label = "Install MeshLab Simplifier (recommended for LODs)"
+
+    def execute(self, context):
+        import threading
+        from . import tool_installers
+
+        def _run():
+            ok, msg = tool_installers.install_pymeshlab()
+            level = 'INFO' if ok else 'ERROR'
+            print("MESHLAB SIMPLIFIER INSTALL", msg)
+
+            def _notify():
+                notification_system.FO4_NotificationSystem.notify(msg, level)
+            bpy.app.timers.register(_notify, first_interval=0.0)
+
+        threading.Thread(target=_run, daemon=True).start()
+        self.report({'INFO'}, "MeshLab simplifier download started (about 53 MB). Check the console for progress.")
+        return {'FINISHED'}
+
+
 class FO4_OT_InstallHavok2FBX(Operator):
     """Open browser to download Havok2FBX and prepare tools folder."""
     bl_idname = "fo4.install_havok2fbx"
@@ -1579,6 +1603,7 @@ classes = (
     FO4_OT_InstallNVTT,
     FO4_OT_InstallTexconv,
     FO4_OT_InstallWhisper,
+    FO4_OT_InstallMeshLabSimplifier,
     FO4_OT_InstallHavok2FBX,
     FO4_OT_InstallCKCmd,
     FO4_OT_InstallNiftools,

@@ -223,6 +223,185 @@ def generate_lod_mesh(source_obj, ratio: float, lod_name: str,
     return new_obj, msg
 
 
+# Per LOD level for generate_lod_parts: (triangle budget shared by size, smallest kept piece as a
+# fraction of the model's size). Chosen on GSMuckPool_M01 2026-11-23 by rendering the result against
+# the full model: these keep every cap, stalk, cup and vine where it is; a true 1,500 for the whole
+# pool (one decimate per object) shredded the AI-made fungi and lost the stalks.
+_PARTS_LEVELS = {"LOD1": (1500, 0.04), "LOD2": (600, 0.06), "LOD3": (250, 0.10)}
+
+
+def generate_lod_parts(source_obj, lod_key: str, lod_name: str, min_part_tris: int = 12) -> "tuple[object, str]":
+    """Vanilla-style LOD: every loose piece of *source_obj* keeps its real shape and place, simplified
+    to its share of the level's budget (by size: bounding-box diagonal squared); pieces smaller than
+    the level's size limit are dropped, like vanilla drops small detail.
+
+    Added 2026-11-23 (Billy, GSMuckPool_M01: "these don't look as good as Fallout 4", reference
+    TreeBlasted03_LOD_0 -- the real trunk and limbs, simplified, in their real places). Decimating a
+    whole material shattered small pieces (hence the tree/ground floors, 13,808 triangles at _LOD_0)
+    and the tree-shape rebuild made blob caps, stretched limbs and floating cards. Each kept piece
+    keeps at least *min_part_tris*, so the totals land above the budget on many-piece AI models
+    (M01: ~4,700 / ~1,900). Same contract as generate_lod_mesh: a new linked object with the
+    source's material slots and UVs."""
+    import bmesh as _bm
+    import numpy as np
+    budget, min_frac = _PARTS_LEVELS.get(lod_key, (1500, 0.04))
+    new_obj, _msg = generate_lod_mesh(source_obj, 1.0, lod_name)       # plain copy, slots/indices kept
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = new_obj
+    new_obj.select_set(True)
+    before = set(bpy.data.objects)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.separate(type='LOOSE')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    pieces = [new_obj] + [o for o in bpy.data.objects if o not in before]
+    diag = {}
+    allP = []
+    for o in pieces:
+        P = np.array([tuple(o.matrix_world @ v.co) for v in o.data.vertices]) if len(o.data.vertices) else np.zeros((1, 3))
+        diag[o.name] = float(np.linalg.norm(np.ptp(P, axis=0)))
+        allP.append(P)
+    model = float(np.linalg.norm(np.ptp(np.vstack(allP), axis=0))) or 1.0
+    keep = [o for o in pieces if diag[o.name] >= min_frac * model]
+    if not keep:
+        keep = [max(pieces, key=lambda o: diag[o.name])]
+    if new_obj not in keep:                    # the object that carries the name must survive
+        keep[0], new_obj_keep = new_obj, keep[0]
+        # swap the mesh data so new_obj holds a kept piece
+        new_obj.data, new_obj_keep.data = new_obj_keep.data, new_obj.data
+        diag[new_obj.name] = diag[new_obj_keep.name]
+    for o in pieces:
+        if o not in keep:
+            m_ = o.data
+            bpy.data.objects.remove(o, do_unlink=True)
+            if m_.users == 0:
+                bpy.data.meshes.remove(m_)
+    W = sum(diag[o.name] ** 2 for o in keep) or 1.0
+    try:
+        from . import tool_installers as _ti_ml
+        _use_ml = _ti_ml.pymeshlab_available()
+    except Exception:
+        _use_ml = False
+    n_ml = 0
+    for o in keep:
+        n = sum(len(p.vertices) - 2 for p in o.data.polygons)
+        target = max(min_part_tris, int(round(budget * diag[o.name] ** 2 / W)))
+        if n > target and _use_ml and _meshlab_simplify(o, target):
+            n_ml += 1
+            continue
+        if n > target:
+            m = o.modifiers.new("FO4_LOD_Part", 'DECIMATE')
+            m.decimate_type = 'COLLAPSE'
+            m.ratio = max(0.001, target / n)
+            m.use_collapse_triangulate = True
+            bpy.context.view_layer.objects.active = o
+            try:
+                bpy.ops.object.modifier_apply(modifier=m.name)
+            except Exception as exc:
+                o.modifiers.remove(m)
+                print(f"[FO4 LOD] piece decimate skipped on {o.name}: {exc}")
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in keep:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = new_obj
+    if len(keep) > 1:
+        bpy.ops.object.join()
+    new_obj.name = lod_name
+    bm = _bm.new(); bm.from_mesh(new_obj.data)
+    loose = [v for v in bm.verts if not v.link_faces]
+    if loose:
+        _bm.ops.delete(bm, geom=loose, context='VERTS')
+        bm.to_mesh(new_obj.data)
+    bm.free()
+    new_obj.data.update()
+    n_tris = sum(len(p.loop_indices) - 2 for p in new_obj.data.polygons)
+    return new_obj, (f"LOD '{lod_name}': {n_tris} triangles, {len(keep)} of {len(pieces)} pieces kept, "
+                     f"each simplified in place (real shapes, like vanilla LODs)"
+                     + (f"; MeshLab simplifier on {n_ml}" if n_ml else "; Blender's simplifier"
+                        + ("" if _use_ml else " (MeshLab not installed)")))
+
+
+def _meshlab_simplify(obj, target: int) -> bool:
+    """Simplify *obj* to *target* triangles with MeshLab's texture-aware quadric edge collapse
+    (PyMeshLab; Cignoni et al., "MeshLab: an Open-Source Mesh Processing Tool", 2008). Keeps the
+    UVs. Only for a piece on ONE material (a loose piece nearly always is); returns False -- and
+    leaves the mesh untouched -- whenever it cannot, so the caller uses Blender's Decimate.
+    Added 2026-11-23: on GSMuckPool_M01 at 120 triangles Blender's collapse flattened every mushroom
+    into a lump with no stalk, MeshLab kept cap and stalk."""
+    try:
+        import numpy as np
+        import bmesh as _bm
+        import pymeshlab
+        me = obj.data
+        mats = {p.material_index for p in me.polygons}
+        if len(mats) != 1 or not len(me.polygons):
+            return False
+        mi = mats.pop()
+        smooth = sum(1 for p in me.polygons if p.use_smooth) * 2 >= len(me.polygons)
+        bm = _bm.new(); bm.from_mesh(me)
+        _bm.ops.triangulate(bm, faces=bm.faces[:])
+        uv = bm.loops.layers.uv.active
+        V = np.array([tuple(v.co) for v in bm.verts], dtype=np.float64)
+        bm.verts.index_update()
+        F = np.array([[l.vert.index for l in f.loops] for f in bm.faces], dtype=np.int32)
+        Wuv = (np.array([tuple(l[uv].uv) for f in bm.faces for l in f.loops], dtype=np.float64)
+               if uv is not None else None)
+        uv_name = me.uv_layers.active.name if me.uv_layers.active else "UVMap"
+        bm.free()
+        ms = pymeshlab.MeshSet()
+        if Wuv is not None:
+            # Through a temporary OBJ: a pymeshlab.Mesh built from arrays leaves every face's texture
+            # index unset and the filter refuses it ("some faces without texture"); OBJ loading sets it.
+            import os as _os
+            import tempfile as _tf
+            fd, tmp = _tf.mkstemp(suffix=".obj")
+            _os.close(fd)
+            try:
+                with open(tmp, "w", encoding="ascii") as fh:
+                    fh.write("".join(f"v {a:.6f} {b:.6f} {c:.6f}\n" for a, b, c in V))
+                    fh.write("".join(f"vt {u:.6f} {w:.6f}\n" for u, w in Wuv))
+                    fh.write("".join(f"f {F[k,0]+1}/{3*k+1} {F[k,1]+1}/{3*k+2} {F[k,2]+1}/{3*k+3}\n"
+                                     for k in range(len(F))))
+                ms.load_new_mesh(tmp)
+            finally:
+                try:
+                    _os.remove(tmp)
+                except OSError:
+                    pass
+            ms.meshing_decimation_quadric_edge_collapse_with_texture(
+                targetfacenum=int(target), qualitythr=0.5, preserveboundary=False,
+                optimalplacement=True, preservenormal=True, planarquadric=True)
+        else:
+            ms.add_mesh(pymeshlab.Mesh(vertex_matrix=V, face_matrix=F))
+            # preservetopology + a repair pass: on a real Hunyuan3D shape (2026-11-23) the plain
+            # collapse left 217-407 non-manifold edges, this way 0
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=int(target), qualitythr=0.5, preserveboundary=False,
+                optimalplacement=True, preservenormal=True, planarquadric=True,
+                preservetopology=True, autoclean=True)
+            ms.meshing_repair_non_manifold_edges()
+            ms.meshing_repair_non_manifold_vertices()
+            ms.meshing_remove_unreferenced_vertices()
+        m = ms.current_mesh()
+        Vn = m.vertex_matrix(); Fn = m.face_matrix()
+        if not len(Fn):
+            return False
+        Wn = m.wedge_tex_coord_matrix() if Wuv is not None else None
+        me.clear_geometry()
+        me.from_pydata(Vn.tolist(), [], Fn.tolist())
+        me.update()
+        if Wn is not None and len(Wn) == 3 * len(Fn):
+            layer = me.uv_layers.get(uv_name) or me.uv_layers.new(name=uv_name)
+            layer.data.foreach_set("uv", Wn.astype(np.float32).ravel())
+        me.polygons.foreach_set("material_index", [mi] * len(me.polygons))
+        me.polygons.foreach_set("use_smooth", [smooth] * len(me.polygons))
+        me.update()
+        return True
+    except Exception as exc:
+        print(f"[FO4 LOD] MeshLab simplifier skipped on {getattr(obj, 'name', obj)}: {exc}")
+        return False
+
+
 # Smallest triangle count per TREE part per LOD level (added 2026-11-18). The whole-model caps
 # (_LOD_MAX_TRIS) shared out over two fungal trees and their ground gave tree 03 132 triangles at
 # _LOD_1 and its whole bottom half was gone. Measured on that tree (front + side outline match
@@ -444,6 +623,7 @@ def generate_lod_shell(source_obj, lod_name: str, target_tris: int,
     bpy.ops.mesh.quads_convert_to_tris()
     bpy.ops.uv.smart_project(angle_limit=_math.radians(66), island_margin=0.003)
     bpy.ops.object.mode_set(mode='OBJECT')
+    _uvready_after(new_obj)
     for poly in new_obj.data.polygons:
         poly.use_smooth = True
 
@@ -514,6 +694,7 @@ def reduce_lod_shell(prev_obj, lod_name: str, target_tris: int) -> "tuple[object
     bpy.ops.mesh.quads_convert_to_tris()
     bpy.ops.uv.smart_project(angle_limit=_math.radians(66), island_margin=0.003)
     bpy.ops.object.mode_set(mode='OBJECT')
+    _uvready_after(new_obj)
     for poly in new_obj.data.polygons:
         poly.use_smooth = True
     n_tris = len(new_obj.data.polygons)
@@ -626,6 +807,20 @@ def far_tree_billboards(src_obj, tree_slots: dict, safe: str, rel_dir: str, text
     (front and side views, Tree mode's renderer) onto two crossed cards that stand on its
     base. Writes <safe>_<tree>BillboardLOD_d/_n/_s.dds and its .bgsm under ...\\LOD\\<rel_dir>.
     Returns (billboard objects, notes)."""
+    groups = {}
+    for mi, mat in tree_slots.items():
+        faces = [p.index for p in src_obj.data.polygons if p.material_index == mi]
+        tag = re.sub(r"[^A-Za-z0-9_]+", "_", os.path.splitext(os.path.basename(
+            str(mat.get("BSLSP_Shader_Name") or mat.name)))[0])
+        groups[tag] = faces
+    return billboards_for_face_groups(src_obj, groups, safe, rel_dir, textures_root, mod_folder, tile)
+
+
+def billboards_for_face_groups(src_obj, groups: dict, safe: str, rel_dir: str, textures_root: str,
+                               mod_folder: str, tile: int = 256) -> "tuple[list, list]":
+    """One crossed billboard (front + side picture, 4 triangles) per {tag: face indices} group of
+    *src_obj*, standing on the group's base (shared by far_tree_billboards and the standing-object
+    billboards of 2026-11-23). Returns (billboard objects, notes)."""
     import tempfile as _tf
     import numpy as _np
     from . import tree_lod as _tl
@@ -635,14 +830,11 @@ def far_tree_billboards(src_obj, tree_slots: dict, safe: str, rel_dir: str, text
     tmp = _tf.mkdtemp(prefix="fo4farbb_")
     mw = src_obj.matrix_world
     me = src_obj.data
-    for mi, mat in tree_slots.items():
-        faces = [p.index for p in me.polygons if p.material_index == mi]
+    for tree_tag, faces in groups.items():
         if not faces:
             continue
         vids = sorted({v for f in faces for v in me.polygons[f].vertices})
         V = _np.array([tuple(mw @ me.vertices[v].co) for v in vids], float)
-        tree_tag = re.sub(r"[^A-Za-z0-9_]+", "_", os.path.splitext(os.path.basename(
-            str(mat.get("BSLSP_Shader_Name") or mat.name)))[0])
         base = f"{safe}_{tree_tag}BillboardLOD"
         frames = _tl.billboard_frames(V)
         # stand the cards on the tree's base: a tall tree's square card already spans base to
@@ -686,6 +878,96 @@ def far_tree_billboards(src_obj, tree_slots: dict, safe: str, rel_dir: str, text
     return made, notes
 
 
+def standing_clusters(src_obj, min_frac: float = 0.06) -> list:
+    """Face groups of *src_obj* that stand up: each mushroom cluster, cup, vine or tree (added
+    2026-11-23 for the far LOD, Billy: "LOD_2 was supposed to be a billboard"). Loose islands are
+    joined when their boxes touch (1% of the model size); islands wider than half the model (the
+    ground) never join. A group stands when it is at least half as tall as it is wide and at least
+    *min_frac* of the model's size; flat groups (ground, water, flat leaves) are not returned."""
+    import numpy as _np
+    me = src_obj.data
+    mw = src_obj.matrix_world
+    n = len(me.vertices)
+    if not n or not len(me.polygons):
+        return []
+    par = list(range(n))
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    for ed in me.edges:
+        a, b = find(ed.vertices[0]), find(ed.vertices[1])
+        if a != b:
+            par[a] = b
+    co = _np.array([tuple(mw @ v.co) for v in me.vertices])
+    isl = {}
+    for p in me.polygons:
+        isl.setdefault(find(p.vertices[0]), []).append(p.index)
+    keys = list(isl)
+    lo = []; hi = []
+    for k in keys:
+        vids = {v for f in isl[k] for v in me.polygons[f].vertices}
+        P = co[list(vids)]
+        lo.append(P.min(axis=0)); hi.append(P.max(axis=0))
+    lo = _np.array(lo); hi = _np.array(hi)
+    mlo, mhi = co.min(axis=0), co.max(axis=0)
+    model = float(_np.linalg.norm(mhi - mlo)) or 1.0
+    mxy = float(max(mhi[0] - mlo[0], mhi[1] - mlo[1])) or 1.0
+    ground = [i for i in range(len(keys)) if max(hi[i][0] - lo[i][0], hi[i][1] - lo[i][1]) > 0.5 * mxy]
+    rest = [i for i in range(len(keys)) if i not in set(ground)]
+    gap = 0.01 * model
+    gp = {i: i for i in rest}
+
+    def gfind(x):
+        while gp[x] != x:
+            gp[x] = gp[gp[x]]
+            x = gp[x]
+        return x
+    R = _np.array(rest)
+    for i in rest:
+        touch = _np.all((lo[R] <= hi[i] + gap) & (hi[R] >= lo[i] - gap), axis=1)
+        for j in R[touch]:
+            j = int(j)
+            if j > i:
+                a, b = gfind(i), gfind(j)
+                if a != b:
+                    gp[a] = b
+    grp = {}
+    for i in rest:
+        grp.setdefault(gfind(i), []).append(i)
+    out = []
+    for members in grp.values():
+        glo = lo[members].min(axis=0); ghi = hi[members].max(axis=0)
+        h = float(ghi[2] - glo[2]); w = float(max(ghi[0] - glo[0], ghi[1] - glo[1]))
+        if h >= 0.5 * w and h >= min_frac * model:
+            out.append(sorted(f for i in members for f in isl[keys[i]]))
+    out.sort(key=len, reverse=True)
+    return out
+
+
+# Added case 2026-11-25: when the UVReady extension is installed (and the LOD dialog's option is on), the baked LOD
+# meshes get UVReady UVs AFTER the Smart UV Project above -- 68.7% of the texture used instead of Smart UV's 29.6%
+# on the Game-Ready mushroom = about 2.3x the texture detail on the same small LOD texture. If UVReady is missing or
+# refuses, the Smart UV result stays exactly as before.
+_USE_UVREADY = True
+
+
+def _uvready_after(lod_obj, tex_size: int = 1024) -> None:
+    if not _USE_UVREADY:
+        return
+    try:
+        from . import uvready_bridge
+        ok, msg = uvready_bridge.try_unwrap(bpy.context, lod_obj, tex_size=tex_size, margin_px=4)
+        if ok:
+            lod_obj["fo4_lod_uv"] = "UVReady"
+        elif uvready_bridge.available():
+            print(f"[FO4 LOD] {lod_obj.name}: {msg}; kept Smart UV Project")
+    except Exception as e:
+        print(f"[FO4 LOD] {lod_obj.name}: UVReady not used ({e}); kept Smart UV Project")
+
+
 def _reuv_for_bake(lod_obj) -> None:
     """Fresh, non-overlapping UVs on a decimated LOD so several source
     materials can be baked onto one texture (the source's own UVs overlap
@@ -698,6 +980,7 @@ def _reuv_for_bake(lod_obj) -> None:
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.uv.smart_project(angle_limit=_math.radians(66), island_margin=0.003)
     bpy.ops.object.mode_set(mode='OBJECT')
+    _uvready_after(lod_obj)
 
 
 def _lod_source_meshes(objs) -> list:
@@ -1932,7 +2215,18 @@ class FO4_OT_GenerateLODs(Operator):
             "Original Textures mode, trees standing on other parts: _LOD_0 and _LOD_1 rebuild each "
             "tree like vanilla's tree LODs -- clean tapered limbs (wood baked from the tree) plus "
             "cards with pictures of its thin branches -- instead of a reduced copy of the tree, "
-            "which shreds thin branches. The ground and other parts are unchanged"),
+            "which shreds thin branches. The ground and other parts are unchanged. Off by default "
+            "since 2026-11-23: on Billy's fungal pieces (GSMuckPool_M01, mushroom caps, cup fungi, "
+            "vines) it turned caps into blobs, ran limbs 1,369 units across the pool between separate "
+            "fungi and left branch cards floating; the reduced real mesh keeps their shape"),
+        default=False,
+    )
+    bake_uvready: BoolProperty(
+        name="Baked LODs: UVReady UVs (if installed)",
+        description=(
+            "Baked-texture LODs: unwrap the LOD mesh with the UVReady extension when it is installed. It uses "
+            "about 2.3x more of the small LOD texture than Smart UV Project (68.7% vs 29.6% measured), so the "
+            "baked LOD keeps more detail. Off, or UVReady missing: Smart UV Project as before"),
         default=True,
     )
     far_tree_billboards: BoolProperty(
@@ -1941,7 +2235,19 @@ class FO4_OT_GenerateLODs(Operator):
             "Original Textures mode, trees standing on other parts (tree materials under a Trees "
             "folder plus ground or other materials): the farthest LOD (_LOD_2) shows each tree as a "
             "crossed plane like vanilla's tree LODs, while the ground and other parts stay low 3D on "
-            "their own textures. A model that is only trees, or has no trees, is not affected"),
+            "their own textures. A model that is only trees, or has no trees, is not affected. Off by "
+            "default since 2026-11-23: one plane per tree MATERIAL, and on GSMuckPool_M01 a tree "
+            "material is spread over many separate fungi, so each plane became a wall over the whole "
+            "pool; the far level now keeps the real pieces, simplified"),
+        default=False,
+    )
+    far_billboards: BoolProperty(
+        name="Far LOD: Billboards (like vanilla trees)",
+        description=(
+            "Original Textures mode: the farthest LOD (_LOD_2) shows every standing object (a mushroom "
+            "cluster, a cup fungus, a vine, a tree) as a crossed billboard picture standing on its own "
+            "base, like vanilla's far tree LODs; the ground, water and flat parts stay low 3D. Added "
+            "2026-11-23 (Billy). Not used with the two tree options above"),
         default=True,
     )
     billboard_tex_size: EnumProperty(
@@ -2158,6 +2464,7 @@ class FO4_OT_GenerateLODs(Operator):
             layout.label(text="Keeps each part's own UVs and textures (shape: Decimate)", icon='INFO')
             layout.prop(self, "tree_shape_lods")
             layout.prop(self, "far_tree_billboards")
+            layout.prop(self, "far_billboards")
         elif self.lod_textures == 'TREE':
             layout.label(text="_LOD_0/_LOD_1: trunk + leaf cards on the tree's own textures, shrunk",
                          icon='INFO')
@@ -2165,6 +2472,7 @@ class FO4_OT_GenerateLODs(Operator):
             layout.prop(self, "lod_tex_size")
         else:
             layout.prop(self, "lod_method")
+            layout.prop(self, "bake_uvready")
 
         # ── LOD ratios ────────────────────────────────────────────────────────
         row = layout.row()
@@ -2225,6 +2533,19 @@ class FO4_OT_GenerateLODs(Operator):
                 box.label(text=f"Material: {mat.name}", icon='MATERIAL')
                 box.label(text="LOD NIFs get their own downscaled, shared LOD texture(s).")
 
+        # ── Simplifier (2026-11-23) ───────────────────────────────────────────
+        try:
+            from . import tool_installers as _ti_ml
+            _ml_ok = _ti_ml.pymeshlab_available()
+        except Exception:
+            _ml_ok = False
+        box = layout.box()
+        if _ml_ok:
+            box.label(text="Simplifier: MeshLab (keeps shapes at low triangle counts)", icon='CHECKMARK')
+        else:
+            box.label(text="Simplifier: Blender's. Recommended: MeshLab keeps far more shape", icon='INFO')
+            box.operator("fo4.install_meshlab_simplifier", icon='IMPORT')
+
         # ── Export options ────────────────────────────────────────────────────
         layout.prop(self, "export_nifs")
         if self.export_nifs and src not in _SKINNED_CLASSES:
@@ -2238,6 +2559,8 @@ class FO4_OT_GenerateLODs(Operator):
         # collision generated for EVERY piece. This used to only ever look
         # at context.active_object, silently skipping every other selected
         # mesh in the same multi-mesh selection.
+        global _USE_UVREADY
+        _USE_UVREADY = bool(self.bake_uvready)
         targets = [o for o in context.selected_objects if o.type == 'MESH']
         if not targets:
             active = context.active_object
@@ -2393,6 +2716,7 @@ class FO4_OT_GenerateLODs(Operator):
                 continue
 
             lod_objects = []
+            _bb_groups = {}          # level -> standing face groups shown as billboards (2026-11-23)
             last_shell = None
             # Original-textures mode (default): the LOD keeps the source's UVs
             # and materials so each part shows its own original texture,
@@ -2455,7 +2779,44 @@ class FO4_OT_GenerateLODs(Operator):
                                     _gt = sum(_ga.values()) or 1.0
                                     for i in _gslots:
                                         _floors[i] = int(round(_GROUND_MIN_TRIS[lod_key] * _ga[i] / _gt))
-                        lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name, _floors)
+                        if _original_mode and not self.tree_shape_lods:
+                            # 2026-11-23: real pieces simplified to the level's budget (generate_lod_parts);
+                            # replaces the whole-material decimate + tree/ground floors here (Billy's OK:
+                            # that way was wrong, 13,808 triangles on GSMuckPool_M01). The tree-shape
+                            # option keeps the old path it was built around.
+                            _bb_src = obj
+                            if (lod_key == 'LOD3' and self.far_billboards and not self.far_tree_billboards):
+                                # 2026-11-23: standing objects become billboards at the far level; the
+                                # 3D part of this level is built from the rest (ground, water, flat bits)
+                                _stand = standing_clusters(obj)
+                                if _stand:
+                                    _bb_groups[lod_key] = _stand
+                                    _gone = {f for g in _stand for f in g}
+                                    _bb_src = obj.copy(); _bb_src.data = obj.data.copy()
+                                    bpy.context.scene.collection.objects.link(_bb_src)
+                                    import bmesh as _bmx
+                                    _bmb = _bmx.new(); _bmb.from_mesh(_bb_src.data); _bmb.faces.ensure_lookup_table()
+                                    _bmx.ops.delete(_bmb, geom=[_bmb.faces[i] for i in _gone], context='FACES')
+                                    _bmx.ops.delete(_bmb, geom=[v for v in _bmb.verts if not v.link_faces], context='VERTS')
+                                    _bmb.to_mesh(_bb_src.data); _bmb.free()
+                            if _bb_src is not obj and not len(_bb_src.data.polygons):
+                                lod_obj, msg = None, "nothing flat left"
+                            else:
+                                lod_obj, msg = generate_lod_parts(_bb_src, lod_key, lod_name)
+                            if _bb_src is not obj:
+                                _m_ = _bb_src.data
+                                bpy.data.objects.remove(_bb_src, do_unlink=True)
+                                if _m_.users == 0:
+                                    bpy.data.meshes.remove(_m_)
+                            if lod_obj is None:
+                                # everything stands: an empty carrier, the billboards fill the NIF
+                                _em = bpy.data.meshes.new(lod_name)
+                                lod_obj = bpy.data.objects.new(lod_name, _em)
+                                bpy.context.collection.objects.link(lod_obj)
+                                for _s in obj.material_slots:
+                                    _em.materials.append(_s.material)
+                        else:
+                            lod_obj, msg = generate_lod_mesh(obj, ratio, lod_name, _floors)
                     # Move to LOD collection
                     for c in list(lod_obj.users_collection):
                         c.objects.unlink(lod_obj)
@@ -2823,6 +3184,29 @@ class FO4_OT_GenerateLODs(Operator):
                                 from . import tree_lod as _tl_fin
                                 steps.extend(_tl_fin.finish_lod_nif(
                                     nif_path, {_b.name: _tl_fin.BILLBOARD_ALPHA_REF for _b in _bbs}))
+                        elif _bb_groups.get(lod_key):
+                            # 2026-11-23: low 3D of the flat parts + one crossed billboard per standing
+                            # object (standing_clusters), standing on its own base, in one NIF
+                            _parts = []
+                            if len(lod_obj.data.polygons):
+                                _parts = split_lod_by_material(lod_obj) if len(
+                                    [s for s in lod_obj.material_slots if s.material]) > 1 else [lod_obj]
+                            _grp = {f"Stand{_i + 1:02d}": _g for _i, _g in enumerate(_bb_groups[lod_key])}
+                            _bbs, _bb_notes = billboards_for_face_groups(
+                                obj, _grp, safe, rel_dir, textures_root, mod_folder)
+                            steps.extend(_bb_notes)
+                            for _b in _bbs:
+                                for _c in list(_b.users_collection):
+                                    _c.objects.unlink(_b)
+                                lod_col.objects.link(_b)
+                            result = export_helpers.ExportHelpers.export_scene_as_single_nif(
+                                context.scene, nif_path, objects=_parts + _bbs)
+                            if (result[0] if isinstance(result, tuple) else False) and _bbs:
+                                from . import tree_lod as _tl_fin3
+                                steps.extend(_tl_fin3.finish_lod_nif(
+                                    nif_path, {_b.name: _tl_fin3.BILLBOARD_ALPHA_REF for _b in _bbs}))
+                            steps.append(f"{lod_key}: {len(_bbs)} standing object(s) as billboards, "
+                                         f"flat parts low 3D")
                         elif _original_mode and len([s for s in lod_obj.material_slots if s.material]) > 1:
                             # One shape per texture in ONE NIF, like a vanilla
                             # tree LOD (trunk shape + branches shape). PyNifly

@@ -4064,6 +4064,31 @@ def _pynifly_node_group(name):
     return bpy.data.node_groups.get(name)
 
 
+def _flat_wind_alpha(obj, tol=0.01):
+    """True when a mesh's colour layers carry no wind: the VERTEX_ALPHA layer (PyNifly's alpha, stored as
+    grey) or, without one, every colour layer's alpha is the same value on all vertices, and no 'Wind'
+    vertex group exists. Any doubt (unreadable data) returns False so the old keep-the-colours path runs."""
+    try:
+        import numpy as _np
+        if obj.vertex_groups.get("Wind") is not None:
+            return False
+        cas = obj.data.color_attributes
+        va = cas.get("VERTEX_ALPHA")
+        layers = [(va, 0)] if va is not None else [(c, 3) for c in cas]
+        for c, ch in layers:
+            n = len(c.data)
+            if not n:
+                continue
+            arr = _np.empty(n * 4, _np.float32)
+            c.data.foreach_get("color", arr)
+            vals = arr.reshape(-1, 4)[:, ch]
+            if float(vals.max() - vals.min()) > tol:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _leaf_card_keep_material(mat, threshold, texture_path):
     """Add alpha cutout + two-sided to *mat* without removing anything.
 
@@ -4382,6 +4407,17 @@ class FO4_OT_SetupLeafCard(Operator):
         # A mesh loaded from a NIF with vertex colours already carries its wind
         # (vertex colour alpha); a new Wind group would replace it on export.
         from_nif = any(m.get("BSLSP_Shader_Name") for m in existing)
+        # Added 2026-11-23 (GSMuckPool S01/MoundFull03: 68 leaf cards exported with no wind): cards
+        # re-imported from an earlier export carry colour layers whose alpha is 1.0 on every vertex --
+        # there is no wind in them to keep, so they get wind weights like a mesh with no colours.
+        # Meshes whose alpha really varies are still kept as before.
+        if from_nif and obj.data.color_attributes and _flat_wind_alpha(obj):
+            steps.append("Wind: the mesh's vertex colours had no wind (alpha the same everywhere), "
+                         "so wind weights were added")
+            from_nif = False
+            _flat_alpha_case = True
+        else:
+            _flat_alpha_case = False
         if from_nif and obj.data.color_attributes:
             steps.append("Wind: kept the mesh's own vertex colours")
         else:
@@ -4391,6 +4427,19 @@ class FO4_OT_SetupLeafCard(Operator):
                     obj, group_name="Wind", axis=self.wind_axis, invert=False
                 )
                 steps.append("Wind weights: " + ("applied ✓" if ok else msg))
+                if ok and _flat_alpha_case:
+                    # These meshes already have PyNifly's colour layers, and PyNifly exports the
+                    # VERTEX_ALPHA layer, not the Wind group -- write the weights there too.
+                    ok2, msg2 = _ah.AnimationHelpers.apply_wind_vertex_colors(obj, group_name="Wind")
+                    steps.append("Wind written to the vertex alpha" if ok2 else f"Wind alpha not written: {msg2}")
+                    # The game reads vertex alpha as sway only with Tree on; with Tree off it is
+                    # transparency and the card bases vanish (GSMuckPoolMoundFull03Leaf01.bgsm is
+                    # Tree off). Same mark as Apply Vegetation Wind: export then gives a Tree-off
+                    # material its own <name>_Wind.bgsm (bgsm_helpers.ensure_wind_material).
+                    if ok2:
+                        for _slot in obj.material_slots:
+                            if _slot.material is not None:
+                                _slot.material["fo4_bgsm_tree"] = True
             except Exception as exc:
                 steps.append(f"Wind weights skipped ({exc})")
 

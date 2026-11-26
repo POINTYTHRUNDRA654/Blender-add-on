@@ -716,6 +716,34 @@ def install_whisper() -> tuple[bool, str]:
     return _pip_install(["openai-whisper"])
 
 
+def pymeshlab_available() -> bool:
+    """True when PyMeshLab (MeshLab's simplifier, GPL-3.0) can be imported. It lives in the ML lib
+    folder (its Qt/Embree DLLs at the top level would trip Blender's extension policy in lib/)."""
+    try:
+        _ensure_ml_on_path()
+        import pymeshlab  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def install_pymeshlab() -> tuple[bool, str]:
+    """Install PyMeshLab (about 53 MB download) for the LOD generator (added 2026-11-23).
+
+    Why: at vanilla-like LOD triangle counts Blender's Decimate collapses AI-made fungi into flat
+    lumps with no stalks; MeshLab's texture-aware quadric simplification keeps cap + stalk at
+    ~20 triangles a mushroom and keeps the UVs (tested on GSMuckPool_M01, 5,760 -> 120 triangles).
+    Downloaded from PyPI on request, never bundled: the add-on zips stay small and each Blender
+    gets the build for its own Python (cp310-cp314 wheels exist for 2025.7)."""
+    _ensure_ml_lib_dir()
+    ok, msg = _pip_install(["pymeshlab"], target_dir=_ML_LIB_DIR)
+    if not ok:
+        return False, msg
+    if not pymeshlab_available():
+        return False, "PyMeshLab was downloaded but does not load in this Blender (see the console)"
+    return True, "MeshLab simplifier installed: LODs now use it automatically"
+
+
 def install_python_requirements(include_optional: bool = False) -> tuple[bool, str]:
     """Install Python dependencies required by the add-on.
 

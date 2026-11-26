@@ -421,6 +421,27 @@ def tube_mesh(nodes, limb_chains, sides=6, min_radius=0.0, tol_frac=0.5, max_lim
         r = np.mean([nodes[i]["r"] for i in ch])
         L = sum(float(np.linalg.norm(nodes[ch[k + 1]]["c"] - nodes[ch[k]]["c"])) for k in range(len(ch) - 1))
         return r * L
+    # 2026-11-23 (GSMuckPool_M01: limb tubes 824 and 1,369 units long across the pool, the source's
+    # longest edge 212): two separate fungi share a material, the bridge that lets the geodesic walk
+    # reach the second one became a limb segment. A chain is cut wherever two consecutive nodes are
+    # far further apart than slices ever are (6x the median node spacing), so no tube spans a gap.
+    _seg = [float(np.linalg.norm(nodes[ch[k + 1]]["c"] - nodes[ch[k]]["c"]))
+            for ch in limb_chains for k in range(len(ch) - 1)]
+    if _seg:
+        _lim = 6.0 * float(np.median(_seg))
+        _cut = []
+        for ch in limb_chains:
+            part = [ch[0]]
+            for k in range(len(ch) - 1):
+                if float(np.linalg.norm(nodes[ch[k + 1]]["c"] - nodes[ch[k]]["c"])) > _lim:
+                    if len(part) >= 2:
+                        _cut.append(part)
+                    part = [ch[k + 1]]
+                else:
+                    part.append(ch[k + 1])
+            if len(part) >= 2:
+                _cut.append(part)
+        limb_chains = _cut
     order = sorted(limb_chains, key=weight, reverse=True)
     order = [ch for ch in order if np.mean([nodes[i]["r"] for i in ch]) >= min_radius]
     if max_limbs:

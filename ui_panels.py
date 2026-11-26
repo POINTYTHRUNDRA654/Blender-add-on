@@ -4559,6 +4559,16 @@ class FO4_PT_SetupPanel(_FO4SubPanel):
         tools_col.operator("fo4.install_nvtt",      text="Install NVTT (nvcompress)",                   icon='IMPORT')
         tools_col.operator("fo4.install_texconv",   text="Install texconv",                             icon='IMPORT')
         tools_col.operator("fo4.install_whisper",   text="Install Whisper CLI",                         icon='IMPORT')
+        try:
+            from . import tool_installers as _ti_ml
+            _ml_ok = _ti_ml.pymeshlab_available()
+        except Exception:
+            _ml_ok = False
+        if _ml_ok:
+            tools_col.label(text="MeshLab simplifier installed (used for LODs)", icon='CHECKMARK')
+        else:
+            tools_col.operator("fo4.install_meshlab_simplifier",
+                               text="Install MeshLab Simplifier (recommended for LODs)", icon='IMPORT')
         tools_col.operator("fo4.install_havok2fbx", text="Get Havok2FBX",                              icon='IMPORT')
         tools_col.operator("fo4.install_ckcmd",     text="Install ck-cmd (FBX→HKX)",                   icon='IMPORT')
         if bpy.app.version < (4, 1, 0):

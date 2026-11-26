@@ -366,6 +366,21 @@ def _raw_structure_findings(nif_path):
     if inner_leaf:
         out.append((WARN, f"Wind node (BSLeafAnimNode) below the root: {', '.join(inner_leaf[:4])}. No vanilla "
                     "mesh (0 of 17,153) nests one; make the root the wind node and these plain NiNodes."))
+    # 2026-11-23: root BSXFlags present but without the Havok bit while the file has collision (Billy's
+    # muck pools had 0). Every one of 1,799 vanilla Landscape files with collision has the bit (130/138/162...).
+    if any_coll and root_bsx:
+        try:
+            r_off = offsets[0]
+            r_name, r_ne = struct.unpack_from('<iI', data, r_off)
+            for e in struct.unpack_from(f'<{r_ne}i', data, r_off + 8):
+                if 0 <= e < len(types) and types[e] == "BSXFlags":
+                    v = struct.unpack_from('<I', data, offsets[e] + 4)[0]
+                    if not v & 2:
+                        out.append((WARN, f"The file has collision but the root's BSXFlags is {v}, without the Havok "
+                                    "bit, so the game ignores the collision (every vanilla file with collision has "
+                                    "it, e.g. 130). Exporting again with the add-on sets it."))
+        except struct.error:
+            pass
     return out
 
 

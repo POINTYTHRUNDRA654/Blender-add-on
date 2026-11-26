@@ -609,7 +609,12 @@ def _convex_hull_for_havok(collision_obj, sf):
         bm.from_mesh(mesh_data)
         bm.transform(collision_obj.matrix_world)
         res = bmesh.ops.convex_hull(bm, input=bm.verts[:])
-        bmesh.ops.delete(bm, geom=res.get("geom_interior", []) + res.get("geom_unused", []), context='VERTS')
+        # 2026-11-23 (greenhouse dome, 259 hand-made hull pieces): an input that is already a convex
+        # hull can list the same element in both geom_interior and geom_unused, and the delete then
+        # failed ("found the same (BMVert/BMEdge/BMFace) used multiple times") -- no collision at
+        # all. Each element once; with no duplicates the list is unchanged.
+        _gone = list(dict.fromkeys(list(res.get("geom_interior", [])) + list(res.get("geom_unused", []))))
+        bmesh.ops.delete(bm, geom=_gone, context='VERTS')
         bmesh.ops.triangulate(bm, faces=bm.faces[:])
         bm.verts.index_update()
         out = ([tuple(v.co / sf) for v in bm.verts], [[v.index for v in f.verts] for f in bm.faces])
@@ -725,6 +730,15 @@ def _nif_texture_path(p: str) -> str:
     if not p:
         return p
     if "/" not in p:
+        # Added case 2026-11-25 (Billy: glow slots kept coming out 'Landscape\Plants\X_g.dds'): a BACKSLASH path
+        # with a folder but no Textures\ prefix, or with a leading backslash. Full vanilla scan (3,386,658 paths):
+        # hand-made meshes write 'textures\...'; folder paths without it occur only in CK-generated PreCombined /
+        # SCOL / FaceGen files; a leading backslash occurs 0 times. Bare file names stay untouched as before.
+        if "\\" in p:
+            q = p.lstrip("\\")
+            if q.lower().endswith(".dds") and not q.lower().startswith(("textures\\", "data\\")):
+                q = "Textures\\" + q
+            return q
         return p
     q = p.replace("/", "\\").lstrip("\\")
     if q.lower().endswith(".dds") and not q.lower().startswith("textures\\"):

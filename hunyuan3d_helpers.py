@@ -295,6 +295,51 @@ def check_hunyuan3d_availability():
     return result
 
 
+def _meshlab_clean_snippet() -> str:
+    """Script lines for the inference subprocess (added 2026-11-23): when MeshLab's simplifier is
+    installed (tool_installers.install_pymeshlab), clean Hunyuan3D's raw shape -- duplicate
+    vertices and faces, specks under 2% of the model's size, non-manifold edges and vertices,
+    holes up to 30 edges -- and simplify it to HY3D_TARGET_POLYS with MeshLab's quadric edge
+    collapse, before the paint pipeline textures it. Without MeshLab the lines print why and the
+    script's own trimesh simplify runs as before."""
+    try:
+        from .tool_installers import _ML_LIB_DIR
+        ml_dir = str(_ML_LIB_DIR)
+    except Exception:
+        ml_dir = ""
+    return (
+        "try:\n"
+        f"    sys.path.append({ml_dir!r})\n"
+        "    import pymeshlab, numpy as _np, trimesh as _tm\n"
+        "    _ms = pymeshlab.MeshSet()\n"
+        "    _ms.add_mesh(pymeshlab.Mesh(vertex_matrix=_np.asarray(mesh.vertices, dtype=_np.float64),\n"
+        "                                face_matrix=_np.asarray(mesh.faces, dtype=_np.int32)))\n"
+        "    _n0 = _ms.current_mesh().face_number()\n"
+        "    _ms.meshing_remove_duplicate_vertices(); _ms.meshing_remove_duplicate_faces(); _ms.meshing_remove_null_faces()\n"
+        "    _ms.meshing_remove_connected_component_by_diameter(mincomponentdiag=pymeshlab.PercentageValue(2))\n"
+        "    _ms.meshing_repair_non_manifold_edges(); _ms.meshing_repair_non_manifold_vertices()\n"
+        "    try:\n"
+        "        _ms.meshing_close_holes(maxholesize=30)\n"
+        "    except Exception as _he:\n"
+        "        print(f'MESHLAB: hole closing skipped ({_he})')\n"
+        "    _ms.meshing_remove_unreferenced_vertices()\n"
+        "    _t = int(os.environ.get('HY3D_TARGET_POLYS', '30000'))\n"
+        "    if _ms.current_mesh().face_number() > _t:\n"
+        "        _ms.meshing_decimation_quadric_edge_collapse(targetfacenum=_t, qualitythr=0.5, preservenormal=True,\n"
+        "                                                    optimalplacement=True, planarquadric=True,\n"
+        "                                                    preservetopology=True, autoclean=True)\n"
+        # tested on a real 1,174,088-face Hunyuan shape (2026-11-23): without preservetopology the
+        # collapse left 217-407 non-manifold edges; with it and a repair pass after: 0, and 0 open edges
+        "    _ms.meshing_repair_non_manifold_edges(); _ms.meshing_repair_non_manifold_vertices()\n"
+        "    _ms.meshing_remove_unreferenced_vertices()\n"
+        "    _m = _ms.current_mesh()\n"
+        "    mesh = _tm.Trimesh(vertices=_m.vertex_matrix(), faces=_m.face_matrix(), process=False)\n"
+        "    print(f'MESHLAB: cleaned and simplified {_n0:,} -> {len(mesh.faces):,} faces')\n"
+        "except Exception as _mle:\n"
+        "    print(f'MESHLAB: not used ({_mle}); trimesh simplify instead')\n"
+    )
+
+
 def generate_mesh_from_text(prompt, output_path=None, resolution=256):
     """
     Generate a 3D mesh from a text prompt using Hunyuan3D-2.
@@ -364,6 +409,7 @@ def generate_mesh_from_text(prompt, output_path=None, resolution=256):
             "pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(\n"
             "    'tencent/Hunyuan3D-2')\n"
             "mesh = pipeline(prompt=prompt)[0]\n"
+            + _meshlab_clean_snippet() +
             "try:\n"
             "    _raw_fc = len(mesh.faces)\n"
             "    _target_fc = int(os.environ.get('HY3D_TARGET_POLYS', '30000'))\n"
@@ -515,9 +561,13 @@ def generate_mesh_from_image(image_path, output_path=None, resolution=256, targe
             f"os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'\n"
             f"os.environ['HF_HUB_OFFLINE'] = '1'\n"   # use cache only — never ping HF to verify
             f"os.environ['HY3D_TARGET_POLYS'] = '{int(target_polys)}'\n"
+            f"HY_ROOT = {repr(hunyuan_path)}\n"
             + _ipv4_patch +
             f"sys.path.insert(0, {repr(hunyuan_path)})\n"
-            f"sys.path.insert(0, {repr(_addon_lib)})\n"
+            # Add-on pip folder goes LAST (2026-11-25): in Blender 5.3 it holds a CPU-only torch and
+            # huggingface_hub 2.x pulled in by other tools; put first, they shadowed the CUDA torch and
+            # transformers refused the hub version. Last, it still supplies anything missing (rembg etc.).
+            f"sys.path.append({repr(_addon_lib)})\n"
             + _dll_fix +
             "from PIL import Image\n"
             "from hy3dgen.rembg import BackgroundRemover\n"
@@ -525,14 +575,19 @@ def generate_mesh_from_image(image_path, output_path=None, resolution=256, targe
             f"image_path = {repr(image_path)}\n"
             f"out_file = {repr(out_file)}\n"
             "image = Image.open(image_path).convert('RGBA')\n"
-            "if image.mode != 'RGBA':\n"
+            # 2026-11-23: the check was `image.mode != 'RGBA'` right after convert('RGBA') -- never
+            # true, so a normal photo kept its background and Hunyuan modelled it too. Remove the
+            # background unless the picture already has real transparency.
+            "if image.getchannel('A').getextrema()[0] >= 250:\n"
+            "    print('Removing background...')\n"
             "    rembg = BackgroundRemover()\n"
-            "    image = rembg(image)\n"
+            "    image = rembg(image.convert('RGB'))\n"
             "print('Loading shape pipeline...')\n"
             "pipeline_shape = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(\n"
             "    'tencent/Hunyuan3D-2')\n"
             "print('Generating shape...')\n"
             "mesh = pipeline_shape(image=image)[0]\n"
+            + _meshlab_clean_snippet() +
             # Simplify before texture so texgen works on a manageable mesh and
             # the exported GLB is already within FO4's 65,535-triangle limit.
             "print('Simplifying mesh for FO4...')\n"
@@ -549,7 +604,24 @@ def generate_mesh_from_image(image_path, output_path=None, resolution=256, targe
             # Texture (Hunyuan3D-Paint) pipeline. Failures are non-fatal but are
             # now reported loudly with a TEXGEN: prefix so the reason a mesh came
             # out untextured is visible in the System Console instead of silent.
+            # 2026-11-23: diffusers 0.39 refuses to run the paint pipeline's own pipeline.py unless
+            # told to trust it ("contains custom code ... must be executed"). Trust it only when it is
+            # the local hunyuanpaint folder inside this Hunyuan3D install -- never downloaded code.
+            "def _trust_local_hunyuanpaint():\n"
+            "    try:\n"
+            "        import diffusers as _df\n"
+            "        _base = os.path.normcase(os.path.abspath(HY_ROOT))\n"
+            "        _orig = _df.DiffusionPipeline.from_pretrained.__func__\n"
+            "        def _fp(cls, *a, **k):\n"
+            "            _cp = k.get('custom_pipeline')\n"
+            "            if _cp and os.path.isdir(_cp) and os.path.normcase(os.path.abspath(_cp)).startswith(_base):\n"
+            "                k.setdefault('trust_remote_code', True)\n"
+            "            return _orig(cls, *a, **k)\n"
+            "        _df.DiffusionPipeline.from_pretrained = classmethod(_fp)\n"
+            "    except Exception as _te:\n"
+            "        print(f'TEXGEN: could not allow the local paint pipeline code ({_te})')\n"
             "def _load_paint():\n"
+            "    _trust_local_hunyuanpaint()\n"
             "    from hy3dgen.texgen import Hunyuan3DPaintPipeline\n"
             "    try:\n"
             "        return Hunyuan3DPaintPipeline.from_pretrained('tencent/Hunyuan3D-2')\n"
@@ -559,6 +631,14 @@ def generate_mesh_from_image(image_path, output_path=None, resolution=256, targe
             "        print(f'TEXGEN: offline load failed ({_e_off}); retrying online to fetch paint weights...')\n"
             "        import os as _os2\n"
             "        _os2.environ['HF_HUB_OFFLINE'] = '0'\n"
+            # 2026-11-23: huggingface_hub reads HF_HUB_OFFLINE once at import, so setting the
+            # variable here changed nothing and the retry stayed offline ("IncompleteSnapshotError ...
+            # offline mode is enabled", one paint VAE file missing). Switch its constant too.
+            "        try:\n"
+            "            import huggingface_hub.constants as _hfc\n"
+            "            _hfc.HF_HUB_OFFLINE = False\n"
+            "        except Exception:\n"
+            "            pass\n"
             "        return Hunyuan3DPaintPipeline.from_pretrained('tencent/Hunyuan3D-2')\n"
             "try:\n"
             "    print('TEXGEN: loading texture (paint) pipeline...')\n"
@@ -908,6 +988,61 @@ def clear_availability_cache():
 
 
 
+_HY3D_MIN_FREE_MB = 6000   # the paint pipeline filled 7,985 of 8,192 MB on an RTX 2070 (2026-11-25)
+
+
+def _pick_inference_gpu(smi_output=None, environ=None):
+    """Choose the graphics card for a Hunyuan3D-2 job (added 2026-11-25).
+
+    With CUDA's default order the job landed on the card driving the monitor, sharing it with the desktop and
+    Blender's viewport, while a second card sat idle. Returns (gpu_index, reason) to pin the job to a card that
+    is NOT driving a display and has at least _HY3D_MIN_FREE_MB free; when no such card exists, the card with
+    the most free memory. Returns (None, reason) -- leave the job exactly as before -- when the user already set
+    CUDA_VISIBLE_DEVICES, nvidia-smi is unavailable, or there is only one card.
+    Indices are nvidia-smi's, which follow PCI bus order: pair them with CUDA_DEVICE_ORDER=PCI_BUS_ID."""
+    env = os.environ if environ is None else environ
+    if env.get("CUDA_VISIBLE_DEVICES", "").strip():
+        return None, f"CUDA_VISIBLE_DEVICES already set to {env['CUDA_VISIBLE_DEVICES']!r}, left as is"
+    if smi_output is None:
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,display_active,memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode != 0:
+                return None, "nvidia-smi failed, default card used"
+            smi_output = r.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None, "nvidia-smi not found, default card used"
+    cards = []
+    for line in smi_output.strip().splitlines():
+        p = [x.strip() for x in line.split(",")]
+        try:
+            cards.append((int(p[0]), p[1].lower() == "enabled", int(float(p[2]))))
+        except (ValueError, IndexError):
+            continue
+    if len(cards) < 2:
+        return None, "one graphics card, default used"
+    free_spare = [c for c in cards if not c[1] and c[2] >= _HY3D_MIN_FREE_MB]
+    if free_spare:
+        i, _, mb = max(free_spare, key=lambda c: c[2])
+        return i, f"GPU {i}: not driving a display, {mb:,} MB free"
+    i, disp, mb = max(cards, key=lambda c: c[2])
+    return i, f"GPU {i}: most free memory ({mb:,} MB){', drives a display' if disp else ''}"
+
+
+def _inference_env():
+    """Environment for the inference subprocess: a copy of Blender's, pinned to _pick_inference_gpu's card."""
+    idx, why = _pick_inference_gpu()
+    print(f"[Hunyuan3D] graphics card: {why}")
+    if idx is None:
+        return None          # Popen(env=None) = inherit Blender's environment, exactly as before
+    env = dict(os.environ)
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = str(idx)
+    return env
+
+
 def _run_inference_subprocess(script_path: str, label: str, timeout: int = 3600) -> tuple:
     """Run a Python inference script as a subprocess, streaming output to System Console.
 
@@ -922,6 +1057,7 @@ def _run_inference_subprocess(script_path: str, label: str, timeout: int = 3600)
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=_inference_env(),
     )
     lines = []
     deadline = _time.monotonic() + timeout
